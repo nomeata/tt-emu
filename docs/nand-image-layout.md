@@ -1,0 +1,534 @@
+# NAND image layout — on-flash content the firmware expects
+
+This document describes **what bytes live where** on the tiptoi 2N ("MT") pen's
+512 MiB NAND: every structure the firmware's boot and mount paths read, and how the
+layers stack — boot blob, system bins, metadata, flash-translation layer (NFTL), and
+the two FAT filesystems. It is the specification for **building a NAND image the
+unmodified firmware will boot from and mount**.
+
+Companion documents (by name, same directory):
+
+- `nand-and-nfc-controller.md` — the chip/controller model, the runtime geometry
+  descriptor, and the **row/AU address decode** (§4 there). This doc uses its units and
+  never repeats the decode.
+- `memory-map-and-boot.md` — the boot chain (mask ROM → boot blob/SPL → PROG) and what
+  is loaded to RAM.
+
+**Units** (from `nand-and-nfc-controller.md` §2): sector = 512 B; page = 2048 B
+(4 sectors); **AU (allocation unit) = 4096 B = 8 sectors = 2 pages**; block =
+128 KiB = 64 pages = 32 AU = 256 sectors; device = 4096 blocks. Row numbers follow
+the `block<<8 | au` convention of the controller doc. Each page carries an 8-byte
+tag in its spare area (one tag per program unit).
+
+Facts are tagged **Observed** (read from factory artifacts, a live pen, or firmware
+behaviour under emulation) or **Inferred** (reconstruction choices that are
+self-consistent but not confirmed against a physical dump).
+
+---
+
+## 1. Overall image map
+
+The image has three content regions plus metadata, low to high:
+
+```
+block 0        boot pages (SPL image, mask-ROM page format)      ─┐
+               + metadata pages at the TOP of block 0 (§2)        │  "low region"
+blocks 1..~5   ASA bad-block-table replicas (factory pens, §2.5)  │  raw, no NFTL
+blocks ~64..   the "bins": PROG (main firmware) + codepage        ─┘
+blocks fs_start..4095   the FS area: ONE NFTL medium carrying two
+                        partitions, A: (system) then B: (user),
+                        each a bare FAT16 volume (§3–§5)
+```
+
+Everything below `fs_start` is addressed **raw/linearly** (boot loader and bin
+loader); everything from `fs_start` up is addressed **through the NFTL layer** (§4).
+`fs_start` itself is a field in the zone/partition table (§2.4) — it is
+**host-chosen at factory time** (the block cursor after the last bin), not a
+constant.
+
+### 1.1 Factory layout (Observed, from factory-programmer behaviour)
+
+| block(s) | content | spare tags |
+|---|---|---|
+| 0, low pages | SPL/boot blob (`0x7e80` B) in the mask-ROM boot-page format | (boot format) |
+| 0, pages 59–63 | metadata: per-bin maps ×2, bin-info array, bin-info header, **zone/partition table** (§2) | 4-B magics `0x12121212`/`0x34343434`/`0x56565656`/`0x5a5a5a5a` |
+| 1–5 (+1 spare) | ASA (bad-block bitmap) replicas, magic `"ANYKAASA"` | u32 copy counter 1..5 |
+| ≥64 (host cursor) | bins, **each 128-KiB chunk written TWICE** (RB/UB block pairs): PROG (28 chunks) then codepage (7 chunks) → 70 blocks, e.g. 64–133 | u32 `0` (data page), `0x11235813` (all-FF page), `0x12345678` (boot-overflow data) |
+| `fs_start` (= cursor after bins, e.g. 134) … 4095 | FS area: NFTL medium → partitions A + B → FAT16 volumes; **freshly formatted = all-0xFF** | 8-B NFTL tags on written pages only (§4.1) |
+
+### 1.2 Emulator layout (the recipe target, §6 — Inferred/simplified, boots Observed)
+
+A clean emulated chip has no bad blocks and never self-updates, so single copies
+suffice and the ASA can be omitted. The metadata is served at its **row numbers**
+(§2.1) rather than reconstructed byte-for-byte inside block 0.
+
+| block(s) | content |
+|---|---|
+| 0 | metadata rows only (§2.1); rest erased |
+| 1 | SPL/boot blob, single copy |
+| 8–35 | PROG (`0x380000` B = 28 blocks, flat, single copy) |
+| 36–42 | codepage (`0xd6ccc` B = 7 blocks, flat) |
+| 134–613 | **partition A** span (480 blocks): FAT16 superfloppy image, written blocks only |
+| 614–1637 | **partition B** span (1024 blocks): FAT16 superfloppy image, written blocks only |
+| all other blocks | erased (`0xFF` data, blank tags) |
+
+`fs_start = 134` and the bin start block 8 are **Inferred** (safe reconstruction;
+the real pen's values are host-chosen and unverified) — but the firmware reads
+`fs_start` from the zone table in the image itself, so any self-consistent choice
+works.
+
+---
+
+## 2. Metadata (top of block 0)
+
+Five small structures, written by the factory programmer as the **top pages of
+block 0** and refreshed by every firmware self-update. The boot loader and the
+mount read them via fixed **metadata row numbers** derived from the device
+geometry.
+
+### 2.1 Positions, rows, magic tags
+
+| structure | factory position (Observed) | read at row (Observed in boot/mount code) | 4-B spare magic |
+|---|---|---|---|
+| per-bin log2phy map, bin *i* (of n) | block 0, page `61−n+i` (n=2 → pages 59, 60) | per-bin **map row** named in the entry table (§2.3); emulator uses rows 200+i (Inferred, free choice) | `0x12121212` |
+| bin-info array | block 0, page 61 | row `dev[0x14]−3` = **253** (entry table form, §2.3) | `0x34343434` |
+| bin-info header | block 0, page 62 | row `dev[0x14]−2` = **254** (header form, §2.3) | `0x56565656` |
+| **zone/partition table** | block 0, page 63 | row `dev[0x14]−1` = **255** | `0x5a5a5a5a` |
+
+`dev[0x14]` = 256 (row stride per block — see `nand-and-nfc-controller.md` §3).
+Reads at these rows fetch a **0x1000-byte payload**. The exact correspondence
+between "row 255" and "page 63 of block 0" in the authentic AU row space is an
+open point (§7); an emulator sidesteps it by serving these specific row numbers
+with the payloads below — Observed to satisfy both the boot loader and the mount.
+
+The 4-byte magics double as the payload prefix for the map/bin-info pages (the
+page data begins with the same u32 as its spare tag). The metadata pages the NFTL
+layer itself writes later use tag `[2:4] = 0xfffa` (§4.1) — a different mechanism.
+
+### 2.2 Zone/partition table (row 255) — what the mount reads ★
+
+This is the structure `fs_storage_mount_init` parses to find the FS area and size
+the two partitions. Layout (all multi-byte fields **little-endian**; an earlier
+big-endian reading of the same bytes was a misgrouping — Observed):
+
+**Information header** (0x10 B at offset 0):
+
+| off | type | field | notes |
+|---|---|---|---|
+| +0x00 | u32 | **TotalLen** | length of header + zone records = `0x10 + 0x10·nzones`; **also the offset of the fake-zone map region** — the mount reads word[0] and seeks there |
+| +0x04 | u32 | **fs_start_block** | first block of the FS area ("fs Bootblock"); the medium is built over `[fs_start, 4096)` |
+| +0x08 | u16 | reserved-size arg | consumed as a reserved-sector count; 0 works |
+| +0x0a | u8 | **nzones** | count of Zone_Group records |
+| +0x0b | u8 | 0 | |
+
+**Zone_Group records** (0x10 B each, at 0x10, 0x20, …):
+
+| off | type | field | notes |
+|---|---|---|---|
+| +0x00 | u32 | StartAddr | written by the factory; **NOT consumed by the mount** (B's base is derived from A's AddrCnt, §3) |
+| +0x04 | u32 | **AddrCnt** | partition span. **UNIT: allocation units (AU, 4096 B)** — see box below |
+| +0x08 | u8 | Subarea_Flag | 1 |
+| +0x09 | u8 | Open_Flag | |
+| +0x0a | u8 | Type | 0 MMI, 1 MMIBACKUP, 2 UNSTANDARD, 3 UNSTANDARDBACKUP, 4 STANDARD, 5 FAKE |
+| +0x0b | u8 | **Symbol** | drive letter − 'A' (0 = A:, 1 = B:) — **the mount's lookup key** |
+| +0x0c | u8 | Nand_NO | fake-zone ordinal |
+| +0x0d | u8 | Partition_NO | running index |
+| +0x0e/+0x0f | u8 | Nand_Char / Medium_Char | protection byte ×2 |
+
+**Fake-zone / bad-block map** (at offset `TotalLen`): compensates the linear
+address space for reserved/bad blocks. The FS area (`4096 − fs_start` blocks) is
+split into groups of 0x2000 blocks (→ exactly **1 group** on this pen); per group
+one u16 = the number of blocks **withheld** from the medium's logical capacity.
+Record stream:
+
+```
+u16  fake_group_count            (1)
+then per record:
+  u16  len        = 2·ngroups + 4   (the mount memcpys len−4 bytes of groups)
+  u16  zone_idx   (0)
+  u16  groups[ngroups]              (reserved/bad blocks per group; 0 = none)
+```
+
+Medium capacity = `256 · (4096 − fs_start − Σgroups)` sectors. With no bad blocks
+(emulator): `groups[0] = 0` → full capacity. (Observed semantics from the mount's
+medium builder; the factory writes good-block-walk results here.)
+
+> **★ AddrCnt units.** The mount looks up a Zone_Group by Symbol, takes its raw
+> `AddrCnt`, and scales it by `f = (dev[0x18]·dev[0x1c]) / 512` — the AU size in
+> sectors — before creating the partition: `span_sectors = f·AddrCnt`. With the
+> authentic geometry (`dev[0x1c] = 0x1000`, AU = 4096 B) **f = 8**, so:
+>
+> - `span_sectors = 8·AddrCnt`, `span_blocks = AddrCnt / 32` (32 AU per block)
+> - A: `AddrCnt = 0x3C00` → 480 blocks (60 MiB span)
+> - B: `AddrCnt = 0x8000` → 1024 blocks (128 MiB span)
+>
+> The **byte values** `0x3C00`/`0x8000` are Observed (factory-programmer output,
+> read back LE by the firmware). The AU unit is forced by the Observed live-pen
+> device struct. Beware the classic trap (also flagged in
+> `nand-and-nfc-controller.md` §3): with the inauthentic `dev[0x1c]=0x200`
+> fiction, f = 1 and an 8×-inflated AddrCnt appears to work because the two errors
+> cancel — but then nothing matches real hardware. Emit AddrCnt in AU and use the
+> authentic geometry.
+
+Observed factory table (3 zones — a synthetic FAKE zone whose AddrCnt is the A+B
+**physical block** span, then A, then B):
+
+```
+Information: TotalLen=0x40  fs_start=<host cursor>  nzones=3
+Zone[0] FAKE: Start=0       AddrCnt=0x2F0 (blocks)  Type5
+Zone[1] A   : Start=0       AddrCnt=0x3C00 (AU)     Type2 UNSTANDARD  Symbol 0
+Zone[2] B   : Start=0x3C00  AddrCnt=0x8000 (AU)     Type4 STANDARD    Symbol 1
+```
+
+A **2-zone table (A and B only) also mounts** — the lookup matches on Symbol, and
+the FAKE record is not consulted by the mount (Observed under emulation). Exact
+emulator payload in §6 step 5.
+
+### 2.3 Bin-info: header, entry table, per-bin maps
+
+These let the **boot loader** (and the self-updater) locate the bins by name. Two
+encodings exist; the one below is what the boot-stage reader consumes (Observed:
+the boot loader executes it; serving it boots):
+
+**Header (row 254)**, 0x1000-B payload:
+
+| off | type | field |
+|---|---|---|
+| +0x04 | u32 | entry count (loop bound) |
+| +0x08 | u32 | start block of the bin region |
+| +0x0c | u32 | total block count of all bins |
+
+**Entry table (row 253)** — one 0x24-B record per bin, at `+0, +0x24, …`:
+
+| off | type | field |
+|---|---|---|
+| +0x00 | u32 | bin size in **512-B sectors** (`nblocks·256`) |
+| +0x08 | u32 | **map row** — the row holding this bin's log2phy map |
+| +0x14 | char[15] | bin name, NUL-terminated, matched by strcmp (`"PROG"`, `"codepage"`); no match is fatal |
+
+**Per-bin map (at the entry's map row)** — one u32 per 128-KiB chunk *j* of the bin:
+
+```
+{ u16 origin_physical_block ; u16 backup_physical_block }
+```
+
+The loader reads chunk *j* from `origin`; `backup` is the second (RB/UB) copy,
+consulted only when the origin block is marked bad in the ASA bitmap (Observed on
+a live pen: consecutive chunks map to origins 2 apart — the dual-copy pairing).
+With a single-copy image, set **both u16 = the same physical block** and never 0.
+
+Factory-side equivalent (Observed from the factory programmer, page 61/62 forms):
+bin-info records are `{u32 len_bytes; u32 load_addr; u32 map_page; u32 start_block;
+u32 0; char name[16]}` with a `{3,0,0,nbins}` header page — same stride and name
+offset; the field-for-field correspondence to the row-253/254 form is not fully
+reconciled (§7). Emulators should serve the row form above.
+
+### 2.4 System-bin region
+
+- **PROG** (main firmware, `0x380000` B = exactly 28 blocks) then **codepage**
+  (font/character data, `0xd6ccc` B → 7 blocks), laid **flat** (no relocation, no
+  compression) from the bin start block. The runtime addresses this region through
+  the **linear** resolver: physical = start + logical, no wear-levelling
+  (Observed: the device flags word has the wear bit clear).
+- Factory pens hold each chunk twice (RB/UB); a single copy with a maplist whose
+  two u16 agree is equivalent on a bad-block-free chip (Inferred, boots Observed).
+
+### 2.5 ASA (Anyka Special Area) — factory pens only
+
+Blocks 1..5 (+1 tracked spare): replicated bad-block tables. Per block: page 0 =
+header `"ANYKAASA"` + a small directory, pages 1.. = bad-block bitmap (one bit per
+block, MSB-first within each byte) ×2 copies, last page = header copy; every page's
+spare u32 = a running copy/"times" counter — the mounter picks the replica with the
+highest counter. Consumed by the boot loader's bad-block fallback (§2.3) and the
+self-update path. **An emulated chip with no bad blocks boots without any ASA**
+(Observed); model it only if emulating factory programming or self-update.
+
+---
+
+## 3. The two partitions: A: (system) and B: (user)
+
+The FS area is **one** NFTL medium; partitions A and B are contiguous sector
+ranges carved from it:
+
+- `part_A = [0, 8·AddrCnt_A)` sectors, `part_B = [8·AddrCnt_A, 8·(AddrCnt_A+AddrCnt_B))`.
+- **B's base = A's span** — the Zone_Group StartAddr field is ignored; contiguity
+  is by construction (Observed in the mount code).
+
+| | physical blocks (fs_start=134) | span | drive | role |
+|---|---|---|---|---|
+| **A:** Symbol 0, Type 2 UNSTANDARD | 134–613 | 480 blocks (AddrCnt 0x3C00 AU) | drive 0, `a:` | **SYSTEM** |
+| **B:** Symbol 1, Type 4 STANDARD | 614–1637 | 1024 blocks (AddrCnt 0x8000 AU) | drive 1, `b:` | **USER — the `.gme` games live here** |
+
+Make no mistake about the split (Observed, three independent ways — mount order,
+USB LUN wiring, path constants):
+
+- **A: = system drive.** Holds `VOIMG/` (system voice archive), `Language/`
+  (update/battery prompt WAVs), `SYSTEM/profile.dat`, the firmware log, and the
+  discovery-written index **`a:/oidfilelist.lst`**. Never visible over USB in
+  normal operation. If A's FAT fails to mount, the firmware **formats A in place**
+  (and hangs only if even that fails) — A is the mandatory medium the pen creates
+  for itself.
+- **B: = user drive.** The USB mass-storage LUN exposes **only partition B** to
+  the PC (volume label `tiptoi`), so user-copied `.gme` files land on B: by
+  construction; firmware updates (`*.upd`) and `LanguageInfoMT.txt` are also
+  dropped there. The firmware never auto-formats B — a failed B mount just sets an
+  error flag and drive `b:` stays unregistered. Nothing in the boot path ever
+  writes B:.
+- **Game discovery** scans `B:\` recursively for `*.gme` first, then repeats the
+  scan on A:, appending full paths to `a:/oidfilelist.lst` (written on A:). So a
+  game on either drive is found, but B: is the authentic home.
+
+Each partition contains a **bare FAT16 volume at its partition-relative sector 0**
+(§5). The FAT layer sees only the NFTL logical sector space — no tags, no ECC, no
+block boundaries.
+
+---
+
+## 4. The NFTL layer
+
+Between the raw blocks of the FS area and the FAT volumes sits a flash-translation
+layer. Its **entire persistent state is the per-page 8-byte spare tags**; every
+RAM structure (maps, chains, free pool) is rebuilt from tags at each mount.
+
+### 4.1 The spare tag (8 bytes, one per program unit)
+
+| bytes | field | semantics |
+|---|---|---|
+| [0] | seq | `seq & 0x7f` = version counter (ordering/display only); **bit 0x80 = this page's copy is OBSOLETE** — a fold treats such a page as blank and discards its data |
+| [1] | sector index | index within the program unit; **not load-bearing** — write 0 |
+| [2:4] | **chain-next / status** | `0xfffd` = chain end (single/last block — a valid head with no older copy); a value `< 0x8000` = physical block number of the next-older chain member; `0xffff` = FREE/erased; `0xfffa` = NFTL-internal metadata page; `0xfffc` = bad; `0xfff7` = strong-danger |
+| [4:6] | **logical block \| 0x8000** | low 15 bits = the **LOGICAL block number** (partition-medium-relative); bit 15 = head-valid. The mount scan inverts this into `map[logical] = physical` |
+| [6:8] | own/id | **ignored by every consumer** (the firmware writes `0xffff` here) |
+
+Load-bearing for a static image: `[2:4]`, `[4:6]`, and bit 7 of `[0]` (must be
+**clear** on placed content, or the first garbage-collection fold silently discards
+it). `[1]` and `[6:8]` are don't-cares. (Observed: all four tag-writing paths and
+all scan consumers traced; the `[4:6]=logical` split additionally confirmed by the
+live scan building both partitions from it.)
+
+### 4.2 Mount-time scan
+
+`mtd_init` reads the **page-0 tag of every block** in the partition range:
+
+- tag `[2:4] == 0xffff` (blank) → the block joins the **free pool** (COW
+  allocations draw from here);
+- `0xfffa` → NFTL metadata (a persisted-map cache; erased and rebuilt each mount —
+  never needed in a fresh image);
+- `0xfffc`/`0xfff7` → bad/danger bookkeeping;
+- otherwise the block is *used*: a block is a **head** iff no other block's
+  `[2:4]` points at it; heads are inverted into the logical→physical map via
+  `[4:6] & 0x7fff`. Two heads claiming one logical block are arbitrated by chain
+  length (longer wins, loser freed).
+
+**A fresh/erased FS area is a legitimate state**: all-0xFF data + blank tags = an
+empty medium with a full free pool. Tags are written lazily, by the first write to
+each block. (This is exactly what the factory format step leaves behind — it only
+erases.)
+
+### 4.3 Writes: append and copy-on-write
+
+The FAT layer's 512-B sector writes arrive as 2-KiB-page programs. For logical
+block L, page p:
+
+- **Append**: if some block of L's chain still has page p (and everything above
+  its write pointer) erased, the page is programmed there in place. Tag:
+  `{[0]=0, [2:4]=that block's existing chain-next, [4:6]=L, [6:8]=0x0001}`.
+- **Copy-on-write**: if every chain block already programmed page p, a fresh block
+  N is popped from the free pool and page p is written there with tag
+  `{[0]=old_seq+1, [2:4]=H (the old head — making N the new head), [4:6]=L}`
+  (`|0x8000` and `[2:4]=0xfffd` when L had no head). If p > 0, page 0 of N is
+  first stamped with the same tag `|0x80` (obsolete marker) so the next scan can
+  classify N. **No erase happens** — the old head H stays in the chain serving all
+  pages ≠ p.
+- **Fold** (chain > 10 blocks, low free pool, or read-danger): all live pages of
+  the chain are merged into one fresh block (per page, tag
+  `{[2:4]=0xfffd, [4:6]=L|0x8000}`; in-flash **copy-back** is used where
+  eligible), then every old chain block is **erased** and returned to the free
+  pool.
+
+Consequences for an image builder:
+
+1. The identity mapping `logical L ↔ physical fs_start+L` created by static
+   placement holds **only until the first COW write to L** — after that L's head
+   is wherever the allocator put it. This is why an emulator must model the flash
+   at the physical program/erase level (`nand-and-nfc-controller.md` §10 —
+   overlay + erased-set + copy-back, keyed by physical row) and must **not** try
+   to track logical content: the firmware maintains all NFTL state itself through
+   those seams, and its own writes then round-trip and rescan correctly.
+2. Every block not deliberately placed **must read fully erased** (0xFF data,
+   blank tag) — those blocks are the free pool the firmware writes into.
+3. Placed blocks must carry a valid head tag on **every** written page
+   (`[2:4]=0xfffd`, `[4:6]=logical|0x8000`, seq bit 7 clear) — a blank tag would
+   classify the block as free and its content would be ignored *and eventually
+   overwritten*; pages of a placed block beyond the placed content must read
+   blank (the append probe scans for them).
+
+### 4.4 Linear resolver
+
+The pen's chip flags select the **linear** block resolver for the whole FS area
+(no wear-levelled zone map): partition-relative block → absolute block is a pure
+offset add. All wear behaviour comes from the tag/chain machinery above, not from
+an address-scrambling layer.
+
+---
+
+## 5. The FAT filesystems
+
+Each partition holds a **bare FAT16 "superfloppy"**: the VBR/BPB at
+partition-relative sector 0. **No MBR, no partition table** inside the partition —
+this is the format the firmware itself writes when it formats A, and the reason a
+real pen enumerates on a PC as `sda` with a filesystem directly on it. (An
+MBR-at-0 + FAT-at-LBA image is *also* accepted via a fallback parse, but it is the
+non-native layout — don't use it.)
+
+The mount's sector-0 checks (Observed, instruction-level):
+
+| requirement | detail |
+|---|---|
+| dispatch heuristic | u32 at VBR offset **0x1c6** must be `0` or `> 0x100` (values 1..0x100 force the MBR-only parse and the superfloppy is never tried). The firmware's own formatter explicitly zeroes these 4 bytes; **zero them in built images** |
+| FS type label | `"FAT"` at offset 0x36 (FAT12/16) or 0x52 (FAT32) — the *only* superfloppy-path check |
+| bytes/sector | u16 at 0x0b must be **512** (hard reject) |
+| cluster count | must be **≥ 4085** (FAT12-sized volumes rejected). Pick sectors/cluster accordingly: ≤ 8 for a 30 MiB volume, ≤ 16 for 64 MiB; 4 is safe for both |
+| 0x55AA at 0x1fe | not checked on the superfloppy path, but keep it (MBR fallback, USB hosts, convention) |
+
+### 5.1 A: content (system)
+
+Factory-fresh content — all **optional for booting** (each has a graceful
+fallback: missing FAT → auto-format, missing voices → silence, missing prompts →
+skipped):
+
+```
+A:/VOIMG/Chomp_Voice.bin        system-voice archive: u32 offset table [0..48]
+                                (word[0]=0xC4 = table size, word[48] = file size)
+                                + 48 concatenated RIFF/WAVE (PCM mono 16 kHz 16-bit)
+                                — every beep/jingle/system prompt
+A:/Language/Update{DUTCH,FRENCH,GERMAN}.wav        "update running" prompts
+A:/Language/BatLowUpdate{DUTCH,FRENCH,GERMAN}.wav  "battery low" prompts
+```
+
+Created by the firmware itself at runtime (leave room; do not pre-create):
+`A:/SYSTEM/profile.dat` (0x21B0-byte settings record), **`a:/oidfilelist.lst`**
+(the discovery index of all found `.gme` paths, rewritten each boot; vestigial
+`musiclist.lst`/`voicelist.lst` siblings), `A:/Firmware log file.bin`.
+
+An **empty formatted A:** (or even an erased A: — the firmware formats it) boots
+and discovers games; the authentic files only add audible system feedback.
+
+### 5.2 B: content (user)
+
+```
+B:/<name>.gme                   the game file(s) — this is what the pen plays
+B:/LanguageInfoMT.txt           optional: language table (update prompts, names)
+```
+
+Volume label `tiptoi` (what users see on the PC). B: is where the PC-visible USB
+drive lives and where firmware updates are dropped; the firmware treats it as
+read-only outside USB/update sessions.
+
+---
+
+## 6. ★ Emulator recipe — building a bootable image
+
+Inputs: the boot blob/SPL (`0x7e80` B), `PROG` (`0x380000` B), `codepage`
+(`0xd6ccc` B) — see `memory-map-and-boot.md` for where these come from — plus a
+host directory of A: files (may be empty) and one of B: files (the `.gme`(s)).
+
+Constants used below (Inferred placement, Observed to boot):
+`BOOT_BLOCK=1`, `SYS_START=8`, `FS_START=134`, `A_BLOCKS=480`, `B_BLOCKS=1024`,
+`AU_PER_BLOCK=32`, `BLK=0x20000`.
+
+**Step 1 — base image.** 4096 blocks × 128 KiB of `0xFF`; all tags blank
+(`FF×8`). Sparse/lazy storage is fine — unwritten means erased.
+
+**Step 2 — boot blob.** Place the SPL at block `BOOT_BLOCK`, padded with 0xFF.
+(If emulating the mask ROM's boot-page reads, serve them from the SPL bytes
+directly; the mask-ROM page format is out of scope here.)
+
+**Step 3 — system bins.** Place `PROG ‖ codepage` flat from block `SYS_START`:
+PROG → blocks 8–35, codepage → blocks 36–42. Tag every placed page of block *b*
+in this range with the identity head tag
+`{seq=1, [1]=0, [2:4]=0xfffd, [4:6]=(b−8)|0x8000, [6:8]=b}`.
+
+**Step 4 — FAT images.** Build two FAT16 superfloppies (e.g.
+`mkfs.fat -F 16 -s 4 -R 4 -r 512 -f 2 -n <label>` + `mcopy -s` of the host dir):
+
+- A: total 60 MiB (≤ `A_BLOCKS` blocks — hard limit), label anything, content §5.1;
+- B: e.g. 64 MiB (≤ `B_BLOCKS`), label `tiptoi`, content §5.2;
+- **zero the u32 at VBR offset 0x1c6** in both; verify cluster count ≥ 4085.
+
+**Step 5 — place the FAT images.** A: at block `FS_START` (VBR = block 134,
+sector 0), B: at block `FS_START + A_BLOCKS` (= 614). For each 128-KiB slice of an
+image: if it is all-0x00 or all-0xFF, **skip it** (an unallocated cluster on a
+real pen is erased with no tag; FatLib never reads unallocated clusters, and the
+free pool needs those blocks). Otherwise store the slice at its physical block *b*
+and tag its written pages `{seq=1, [2:4]=0xfffd, [4:6]=(b−FS_START)|0x8000}` —
+note the logical number is relative to `FS_START` for **both** partitions (B's
+first block is logical 480), which is exactly what the identity rule produces.
+
+**Step 6 — metadata rows** (0x1000-byte payloads, zero-filled unless stated):
+
+- **Row 255 — zone/partition table:**
+
+  ```
+  u32 @0x000 = 0x200            TotalLen / offset of the fake-zone region
+  u32 @0x004 = 134              fs_start_block
+  u8  @0x00a = 2                nzones
+  u32 @0x014 = 0x3C00           Zone_Group[0].AddrCnt  (A = 480 blocks · 32 AU)
+  u8  @0x01b = 0                Zone_Group[0].Symbol   ('A')
+  u32 @0x024 = 0x8000           Zone_Group[1].AddrCnt  (B = 1024 blocks · 32 AU)
+  u8  @0x02b = 1                Zone_Group[1].Symbol   ('B')
+  u16 @0x200 = 1                fake_group_count
+  u16 @0x202 = 6                record len (= 2·1 + 4)
+  u16 @0x204 = 0                zone_idx
+  u16 @0x206 = 0                groups[0]: reserved/bad blocks (none)
+  ```
+
+  (Optionally fill Type/flags bytes per §2.2 for fidelity; the mount matches on
+  Symbol and reads AddrCnt + fs_start + the fake map only.)
+
+- **Row 254 — bin header:** `u32@4 = 2` (bins), `u32@8 = 8` (start block),
+  `u32@0xc = 35` (total blocks).
+- **Row 253 — bin entry table:** record 0 (offset 0): `u32@0 = 28·256`,
+  `u32@8 = 200` (map row), `"PROG"` at +0x14; record 1 (offset 0x24):
+  `u32@0 = 7·256`, `u32@8 = 201`, `"codepage"` at +0x14.
+- **Rows 200/201 — maplists:** row 200 = 28 entries `{u16 8+j, u16 8+j}`;
+  row 201 = 7 entries `{u16 36+j, u16 36+j}`. Both u16 identical (single copy);
+  never 0.
+
+**Step 7 — runtime write model.** Implement program/erase/copy-back layering per
+`nand-and-nfc-controller.md` §10: programs overlay static content; an erase
+**shadows** static content and tags (must win — otherwise a recycled placed block
+resurrects stale FAT sectors and the scan sees two heads for one logical block);
+copy-back moves data+tag verbatim. That is all — every higher NFTL/FAT structure
+is firmware RAM state rebuilt through these seams.
+
+Boot outcome (Observed under emulation): the boot loader finds PROG via rows
+254/253/200, the mount reads row 255, builds the medium over blocks 134–4095,
+mounts A (drive `a:`) and B (drive `b:`), discovery enumerates the `.gme` on B:
+and writes `B:/<name>.gme` into `a:/oidfilelist.lst`, and the firmware's own
+writes (log, profile, `.lst`) COW into free blocks and read back consistently.
+
+---
+
+## 7. Gaps / open questions
+
+- **Real-pen values of `fs_start` and the bin start block** — host-chosen at the
+  factory, never read off a physical pen; 134/8 are self-consistent choices, and
+  the firmware derives everything from the image's own zone table, so this is
+  cosmetic until a physical dump is compared.
+- **Row ↔ block-0-page correspondence for the metadata** (row 255 vs "page 63"):
+  the factory tool addresses pages of block 0; the runtime reads fixed row
+  numbers whose decode in the authentic AU row space is unresolved. Serving the
+  row numbers works; reconstructing the metadata byte-exactly *inside* block 0
+  awaits a physical dump.
+- **Bin-info encodings**: the factory page-61/62 record form vs the row-253/254
+  form the boot loader consumes are not field-for-field reconciled (plausibly the
+  same bytes under the unit question above).
+- **Real pen's zone-table AddrCnt bytes**: `0x3C00`/`0x8000` are from a factory
+  programmer run; whether a production pen carries the same values (and hence a
+  60 MiB A: span under AU units) is unverified.
+- **ECC parity bytes and the mask-ROM boot-page format** are out of scope here
+  (controller-level; see `nand-and-nfc-controller.md` §6/§9 — an emulator stores
+  no parity).
+- **ASA and RB/UB dual copies** are documented but not modelled; needed only for
+  bad-block or self-update emulation.

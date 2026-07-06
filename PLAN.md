@@ -12,7 +12,7 @@ but each file stands alone (no external references).
 - [x] `docs/system-control-and-clock.md` — SoC system-control block: chip-ID gate, clock/PLL, reset
 - [x] `docs/interrupts-and-timers.md` — interrupt controller (pending/enable/mask), CPSR delivery, the periodic timer(s)
 - [x] `docs/nand-and-nfc-controller.md` — NAND chip geometry + the NAND flash controller: command interface, DMA, SRAM buffer, spare/ECC
-- [ ] `docs/nand-image-layout.md` — the on-flash image the firmware expects to boot: boot blob / PROG / codepage placement, zone/partition table, NFTL tag format, the A:/B: FAT filesystems
+- [x] `docs/nand-image-layout.md` — the on-flash image the firmware expects to boot: boot blob / PROG / codepage placement, zone/partition table, NFTL tag format, the A:/B: FAT filesystems
 - [ ] `docs/oid-sensor.md` — the optical-ID sensor: 2-wire serial capture, the frame format, how an OID "tap" is injected
 - [ ] `docs/audio-dac-dma.md` — the audio DAC + DMA path: registers, the done-interrupt, ring buffering, volume, sample format/rate
 - [ ] `docs/gpio-buttons-led.md` — the GPIO block: input/output latches, the physical pin map (buttons, USB-detect, amp, power-hold, LED, sensor/auth pins)
