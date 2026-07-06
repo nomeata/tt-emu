@@ -14,7 +14,7 @@ but each file stands alone (no external references).
 - [x] `docs/nand-and-nfc-controller.md` — NAND chip geometry + the NAND flash controller: command interface, DMA, SRAM buffer, spare/ECC
 - [x] `docs/nand-image-layout.md` — the on-flash image the firmware expects to boot: boot blob / PROG / codepage placement, zone/partition table, NFTL tag format, the A:/B: FAT filesystems
 - [x] `docs/oid-sensor.md` — the optical-ID sensor: 2-wire serial capture, the frame format, how an OID "tap" is injected
-- [ ] `docs/audio-dac-dma.md` — the audio DAC + DMA path: registers, the done-interrupt, ring buffering, volume, sample format/rate
+- [x] `docs/audio-dac-dma.md` — the audio DAC + DMA path: registers, the done-interrupt, ring buffering, volume, sample format/rate
 - [ ] `docs/gpio-buttons-led.md` — the GPIO block: input/output latches, the physical pin map (buttons, USB-detect, amp, power-hold, LED, sensor/auth pins)
 - [ ] `docs/usb-musb-device.md` — the USB device controller (MUSB): registers, enumeration, BOT/SCSI mass-storage, LUN→partition mapping
 - [ ] `docs/battery-and-power.md` — battery ADC + power management: thresholds, auto-off, charger/USB-detect
