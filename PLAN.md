@@ -19,7 +19,7 @@ but each file stands alone (no external references).
 - [x] `docs/usb-musb-device.md` — the USB device controller (MUSB): registers, enumeration, BOT/SCSI mass-storage, LUN→partition mapping
 - [x] `docs/battery-and-power.md` — battery ADC + power management: thresholds, auto-off, charger/USB-detect
 - [x] `docs/zc90b-auth.md` — the anti-clone authentication chip: 2-wire challenge/response protocol and algorithm
-- [ ] `docs/index.md` — finalize: accurate per-file summaries + quick-reference tables (memory map, register blocks, IRQ lines, GPIO pins)
+- [x] `docs/index.md` — finalized: per-file summaries + 6 quick-reference tables
 
 ## Step 2 — The emulator (`src/tt_emu/`)
 
