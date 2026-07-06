@@ -17,7 +17,7 @@ but each file stands alone (no external references).
 - [x] `docs/audio-dac-dma.md` — the audio DAC + DMA path: registers, the done-interrupt, ring buffering, volume, sample format/rate
 - [x] `docs/gpio-buttons-led.md` — the GPIO block: input/output latches, the physical pin map (buttons, USB-detect, amp, power-hold, LED, sensor/auth pins)
 - [x] `docs/usb-musb-device.md` — the USB device controller (MUSB): registers, enumeration, BOT/SCSI mass-storage, LUN→partition mapping
-- [ ] `docs/battery-and-power.md` — battery ADC + power management: thresholds, auto-off, charger/USB-detect
+- [x] `docs/battery-and-power.md` — battery ADC + power management: thresholds, auto-off, charger/USB-detect
 - [ ] `docs/zc90b-auth.md` — the anti-clone authentication chip: 2-wire challenge/response protocol and algorithm
 - [ ] `docs/index.md` — finalize: accurate per-file summaries + quick-reference tables (memory map, register blocks, IRQ lines, GPIO pins)
 
