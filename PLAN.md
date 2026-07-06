@@ -25,7 +25,7 @@ but each file stands alone (no external references).
 
 Implemented from **only** `docs/`. High-quality, cross-platform Python.
 
-- [ ] CPU + memory map skeleton (Unicorn ARMv5), MMIO dispatch framework
+- [x] CPU + memory map skeleton (Unicorn ARMv5), MMIO dispatch framework, .upd loader, boot recipe, ZC90B; boots to the storage-mount checkpoint (16 tests)
 - [ ] Each hardware peripheral as a model (one module per component doc)
 - [ ] Boot: present an authentic NAND image; run the real firmware to a running state
 - [ ] Headless / scripted mode (load a GME, inject taps, capture audio → WAV)
