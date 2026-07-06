@@ -31,7 +31,7 @@ statements are Observed. Registers are 32-bit, little-endian, at
 | off | name | access | reset/expected | meaning |
 |---|---|---|---|---|
 | `0x00` | `REG_CHIP_ID` | R (const) | **`0x30393031`** = ASCII "1090" | Chip identification. **Boot gates on this exact value** (§2). Writes occur once from the mask ROM during init (config use, Inferred) — ignoring writes is proven safe. |
-| `0x04` | `REG_CLK_DIV` | R/W, self-clearing bits 13/14/21 | seed `0x0000004D` (faithful) or `0` (works) | PLL multiplier + system-clock dividers + sleep request + VBAT-ADC mode (§3). |
+| `0x04` | `REG_CLK_DIV` | R/W, self-clearing bits 12/13/14/21 | seed `0x0000004D` (faithful) or `0` (works) | PLL multiplier + system-clock dividers + sleep request + VBAT-ADC mode (§3). |
 | `0x08` | `REG_CLK_AUDIO` | R/W | 0 | Audio/DAC and ADC-path clock dividers and enables (§4). |
 | `0x0C` | `REG_CLK_GATE` | R/W | ROM writes `0x63` at reset | Per-module clock gate, bit=1 → module clock **off** (§5). **Not a watchdog — the SoC has no watchdog anywhere; there is nothing to kick.** |
 | `0x10` | `REG_ANALOG_PD` | R/W, self-clearing bit 8 | 0 | Analog power-down + DAC clock-apply strobe (§4). bit9: 1 = DAC powered down. |
@@ -117,7 +117,7 @@ Effective CPU/system clock = `PLL / 2^A / (B+1)`.
 ### 3.3 Emulator contract for 0x04000004
 
 - Back it with RAM (writes stored, reads return the stored value), **except** bits
-  **13, 14, 21 always read 0** (self-clearing latch/busy semantics). That single rule
+  **12, 13, 14, 21 always read 0** (self-clearing latch/busy semantics). That single rule
   satisfies every latch poll, the early-boot spin, and the standby handshake.
 - **Faithful seed: `0x0000004D`** (M=13, A=1, B=0 → PLL 232 MHz, sysclk 116 MHz —
   matches the live pen). **Reads-as-0 also boots** (firmware computes PLL = 180 MHz and

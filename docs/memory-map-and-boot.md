@@ -311,6 +311,14 @@ a value the skipped stage would have produced (not a behaviour patch):
    size 0x800, +0x14 = 256 sectors/block, +0x18 = 1, +0x1c = 0x1000 (allocation-unit
    4 KiB), +0x20.. = read/write/erase leaf pointers into the resident blob.
 
+   > **Caveat — byte `+1` (`0x08008ca9`) must be seeded `0`, not the dumped `1`.** The
+   > first word above is `04010100`, so the dump has byte `+1 = 0x01`. That byte is
+   > *driver state*, not a geometry constant (the 96 bytes are a **post-boot** dump). The
+   > resident blob's NAND-clock-init leaf reads it and, **if it is nonzero, takes a "give
+   > up" branch that drives GPIO15→0 (power-off)** ~230k instructions in; with `0` it
+   > initialises normally and writes the `1` the dump shows. So seed the 96 bytes above
+   > but clear byte `+1` to `0`.
+
 2. **QHsm initial-frame byte `0x08007e80` = 1** (state leaf 1 = splash; 3 = standby
    also works but skips the splash-time OID-subsystem init). The real cold boot's
    startup pre-sets this so the *initial* statechart entry lands directly in
