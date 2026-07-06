@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tt-emu"
+version = "0.0.1"
+description = "A hardware-level emulator of the Ravensburger tiptoi pen"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Joachim Breitner", email = "mail@joachim-breitner.de" }]
+keywords = ["tiptoi", "emulator", "arm", "unicorn"]
+
+dependencies = [
+    "unicorn>=2.0",
+    "capstone>=5.0",
+    "numpy>=1.24",
+    "textual>=0.60",
+    "sounddevice>=0.4",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "ruff", "mypy"]
+
+[project.scripts]
+tt-emu = "tt_emu.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tt_emu"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+
+# Editors / OS
+*.swp
+.DS_Store
+.idea/
+.vscode/
+
+# Build artifacts from the in-repo test-firmware toolchain
+*.o
+*.elf
+*.bin.tmp
+tests/firmware/build/
+
+# Emulator scratch output
+/scratch/
+*.wav
+!tests/**/*.wav
