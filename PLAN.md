@@ -21,7 +21,7 @@ but each file stands alone (no external references).
 - [x] `docs/zc90b-auth.md` — the anti-clone authentication chip: 2-wire challenge/response protocol and algorithm
 - [x] `docs/index.md` — finalized: per-file summaries + 6 quick-reference tables
 
-## Step 2 — The emulator (`src/tt_emu/`)
+## Step 2 — The emulator (`tt_emu/`)
 
 Implemented from **only** `docs/`. High-quality, cross-platform Python.
 

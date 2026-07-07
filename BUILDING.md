@@ -11,7 +11,7 @@ their own) and keeps the emulator faithful to the hardware rather than to any on
    hardware component (memory map & boot, NAND + NFC, the OID sensor, audio DAC/DMA, GPIO,
    the ZC90B auth chip, …), written to be sufficient on their own to implement the emulator.
    Start at [`docs/index.md`](docs/index.md).
-2. **`src/tt_emu/`** — the emulator, implemented from the docs: a Unicorn ARM926 core, a
+2. **`tt_emu/`** — the emulator, implemented from the docs: a Unicorn ARM926 core, a
    memory-map + MMIO/peripheral framework, per-peripheral models, the boot recipe, headless
    scripted operation, and the Textual TUI.
 3. **`tests/`** — a headless test suite, including tiny purpose-built firmware/GME blobs
@@ -32,7 +32,8 @@ their own) and keeps the emulator faithful to the hardware rather than to any on
 |------|----------|
 | `docs/` | hardware-interface documentation (start at [`docs/index.md`](docs/index.md)) |
 | `docs/firmware-2n-mt.md` | the specific firmware build the debugger understands |
-| `src/tt_emu/` | the emulator implementation |
+| `tt_emu/` | the emulator implementation |
+| `tt-emu`, `tt-emu-tui` | executable wrappers to run straight from a checkout |
 | `tests/` | test suite + the in-repo test-firmware toolchain (`tests/firmware/`) |
 | `scripts/` | tooling — e.g. `screenshot.py`, which regenerates the README screenshot |
 | `PLAN.md` | roadmap / build plan |
@@ -46,11 +47,17 @@ pip install -e ".[dev]"                        # or: uv pip install -e ".[dev]"
 pytest                                         # the test suite (ruff + mypy are dev deps too)
 ```
 
-After the editable install, the `tt-emu` / `tt-emu-tui` commands — and `python -m tt_emu`
-/ `python -m tt_emu.tui` — work from the activated venv. This is a `src/`-layout package,
-so those `-m` invocations require the install (or `PYTHONPATH=src`); the `pyproject.toml`
-`pythonpath = ["src"]` setting only puts `src/` on the path for the pytest run, not for the
-CLI.
+The package sits at the repo root (`tt_emu/`, a flat layout), so you can run it straight
+from a checkout as long as the dependencies are in your active environment — no editable
+install of the package needed:
+
+```sh
+python -m tt_emu.tui --game game.gme     # or: python -m tt_emu … (headless)
+./tt-emu-tui --game game.gme             # the executable wrappers, equivalently
+```
+
+The editable install above additionally puts the `tt-emu` / `tt-emu-tui` console commands
+on your PATH; it's a convenience, not a requirement for running the code.
 
 ## The test-firmware toolchain
 
@@ -74,5 +81,5 @@ exports the SVG.
 
 tt-emu takes the pen's firmware as an input, like a ROM for a console emulator; it is not
 distributed with the tool. By default it downloads the official `update3202MT.upd` and
-verifies it against a pinned SHA-256 (see `src/tt_emu/firmware_fetch.py`); an explicit
+verifies it against a pinned SHA-256 (see `tt_emu/firmware_fetch.py`); an explicit
 `--firmware`/path argument bypasses the download.

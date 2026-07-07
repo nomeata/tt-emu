@@ -20,8 +20,8 @@ import sys
 import time
 from pathlib import Path
 
-# Make src/ importable when run straight from a checkout.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+# Make the package importable when run straight from a checkout.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tt_emu.firmware_fetch import ensure_firmware  # noqa: E402
 from tt_emu.tui import EmulatorSession, TtEmuApp  # noqa: E402

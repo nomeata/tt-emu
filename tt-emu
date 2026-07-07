@@ -1,0 +1,9 @@
+#!/usr/bin/env python3
+"""Run tt-emu (headless) straight from a checkout: `./tt-emu --game game.gme …`.
+
+Needs the dependencies available (e.g. an active venv after `pip install -e .`).
+Equivalent to `python -m tt_emu` or the installed `tt-emu` console command.
+"""
+from tt_emu.cli import main
+
+raise SystemExit(main())
