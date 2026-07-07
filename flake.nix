@@ -2,7 +2,7 @@
   description = "tt-emu — a hardware-level emulator of the Ravensburger tiptoi® pen";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
     flake-utils.url = "github:numtide/flake-utils";
   };
 
