@@ -26,7 +26,7 @@ but each file stands alone (no external references).
 Implemented from **only** `docs/`. High-quality, cross-platform Python.
 
 - [x] CPU + memory map skeleton (Unicorn ARMv5), MMIO dispatch framework, .upd loader, boot recipe, ZC90B; boots to the storage-mount checkpoint (16 tests)
-- [ ] Each hardware peripheral as a model (one module per component doc)
+- [x] Hardware peripherals modelled: syscon, interrupts/timer, GPIO, battery, ZC90B, NAND+NFC, OID, audio DAC/DMA (USB = default dead-bus per its doc)
 - [x] Boot: authentic NAND image + NAND/NFC controller; firmware mounts A:, reads codepage, passes auth, reaches the event-pump statechart (39 tests)
 - [x] Headless / scripted mode: load a GME, boot via FLAG.bin resume, tap product+content, capture audio → WAV (byte-identical media)
 - [x] Interactive TUI (Textual): background emulation thread, tap OIDs, real-time audio (sounddevice), state/audio/log panels, buttons (tt-emu-tui)
@@ -46,57 +46,6 @@ Implemented from **only** `docs/`. High-quality, cross-platform Python.
 - Clean-room: Step-1 agents may read `../firmware-re/`; Step-2 agents read **only** `tt-emu/docs/`.
 - Commit after every deliverable (conventional commits; no internal session URLs).
 
-## Doc corrections to fold in (found during Step 2, code already handles them)
+## Doc corrections
 
-Applied to docs already: 2a's clock bit-12 self-clear; the geometry seed byte +1 = 0.
-
-Deferred (fold into docs in a final pass — the emulator code already accounts for them):
-- **nand-and-nfc-controller.md** — the row-address-cycle count: the boot blob's static
-  value is **2** (blob offset 0x79E0), not the probe's 3; a from-entry boot must seed it
-  to 3, else rows ≥256 truncate to 16 bits, the NFTL scan sees duplicate chain heads, and
-  the system bins get erased. (A §5.6-class seed the docs omit.)
-- **nand-image-layout.md** — the factory **bad-block bitmap at row 2**: `mtd_init` reads a
-  0x1000-byte bitmap (1 bit/block, set = bad) before partition build; an erased (0xFF) page
-  marks every block bad → the mount loops forever. Zero-fill a bitmap at row 2 = no bad
-  blocks. (Runtime home of the ASA data; "omittable" is true for the boot loader, not the mount.)
-- **nand-and-nfc-controller.md §7** — streaming record size: the boot loader's metadata/scan
-  reads use **1024-byte** ECC records (payload from the ECC config word), not a fixed 512.
-
-Found during Step 2c/2d (code fixed or precisely characterized):
-- **zc90b-auth.md** — the challenge is delimited by the **GPIO5 direction** (output = start /
-  discard stale bits, input = complete → compute), NOT a raw 24-edge count. A spurious
-  pre-challenge clock fall exists; an edge-counting model shifts the challenge by one, fails
-  auth, and the pen powers off — easily misread as a "standby auto-off". (Fixed in code.)
-- **nand-image-layout.md §7.2** — the A: FAT/NFTL **write/create path must commit a directory
-  entry that round-trips**: discovery creates a:/oidfilelist.lst (+ log/profile); currently the
-  writes reach NAND but a re-read shows no new dir entry, so discovery persists 0 games. (Open —
-  the milestone blocker.)
-- **oid-sensor.md §7.3** — the standby **decode-vs-(+0x1d re-arm) timing**: the model must
-  deliver pen-down and the classified OID in one dispatch (or classify on the first gameplay
-  poll), else the first-load gate loses the fresh-standby race. (Open.)
-
-Found during the write-round-trip fix (gap 1, code fixed — fold into docs):
-- **nand-and-nfc-controller.md §7/§10** — the runtime FAT driver programs **1024-byte** records
-  staged through the 512-B SRAM window as two 512-B slabs (one drain poll each); a model must
-  capture each slab at its poll, not only at the final flush (else the last slab is duplicated
-  and every FS program is corrupted `data[:512]==data[512:]`).
-- **nand-image-layout.md §4** — the NFTL **logical block is 1 MiB (8 physical blocks)**: COW head
-  tags carry the 1-MiB-block number and row addressing is linear across the 8-block span (row
-  carries from `base<<8|0xFF` into the next block; unit reaches 255). Tag each span's base block
-  (head `logical=(base−FS_START)/8`); key tags by the **raw row** `block<<8|unit`, not a flattened
-  sector base (which aliases neighbour page-0 tags and destroys the span). This closes the old
-  "B: enumerates 0 entries" issue.
-- **memory-map-and-boot.md §2/§5** — the SVC/IRQ **stacks must live inside `[0x08000000,0x08400000)`**;
-  `Utl_UStr*` validates every pointer against that range and silently no-ops out-of-range strings,
-  so a stack above `0x08400000` makes discovery build garbage `"B:/"/"A:/"` paths. Use SVC top
-  `0x08400000`, IRQ top `0x083F0000`.
-
-Found while closing the play milestone (code fixed — fold into docs):
-- **audio-dac-dma.md §8** — the DMA source-window base: firmware writes `(cpu_ptr − 0x4000) & 0x3ffff`
-  to `0x04010004` (resolves the open item; capture is fully hook-free during real playback).
-- **audio-dac-dma.md** — DAC rate divider: live playback programs **0x28 → 22050 Hz** (idle 0x74 →
-  8000 Hz bring-up); the doc's `0x46→22050` point does not reproduce. This firmware builds the
-  **0x6000 (24 KiB) PCM ring** (read the size from ring `+0x40`, don't assume 0x3000).
-- **memory-map-and-boot.md / statechart** — `g_state` (`0x081db904`) lags on the FLAG.bin auto-descent
-  (stays 3 in book). The authoritative leaf is the **QHsm frame stack at `0x08007e80`** (12-byte frames,
-  deepest non-zero frame → e.g. [3,12,13]).
+All build-discovered doc corrections have been folded into docs/ (see git history).

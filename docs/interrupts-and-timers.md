@@ -120,7 +120,7 @@ mode** (mode != 0x12). The firmware's handler is not written to nest.
 SPSR_irq := CPSR
 CPSR     := (CPSR & ~0x3F) | 0x12 | 0x80     # mode = IRQ (0x12), I = 1, T = 0 (ARM state)
 LR_irq   := interrupted_PC + 4
-SP_irq   := IRQ-mode banked stack (0x0841f000 on first delivery — see below)
+SP_irq   := IRQ-mode banked stack (0x083F0000 on first delivery — see below)
 PC       := 0x08000018
 ```
 
@@ -132,9 +132,12 @@ PC       := 0x08000018
 - **IRQ stack:** on real hardware the boot code's reset handler sets the per-mode banked
   stacks; an emulator that enters at the firmware's main entry (see
   `memory-map-and-boot.md` §5.2) skips that and must set `SP_irq` itself —
-  **`0x0841f000`** (below the main SVC stack top `0x08420000`) is the proven choice; the
+  **`0x083F0000`** (below the main SVC stack top `0x08400000`) is the proven choice; the
   exact hardware value is unverified (**Inferred**). The handler's push/pop is balanced,
-  so any sane top inside RAM works as long as it is stable.
+  so any stable top works **as long as it lies inside `[0x08000000, 0x08400000)`**
+  (Observed): the firmware's `Utl_UStr*` helpers silently reject pointers outside
+  that range, so an out-of-range stack breaks discovery's on-stack path building —
+  see the stack-placement rule in `memory-map-and-boot.md` §5.2.
 
 **Handler prologue/epilogue** (what the firmware's own code does — the contract the entry
 state above satisfies): the entry stub `0x08000110` does `push {r0-r12, lr}`, reads
@@ -283,7 +286,7 @@ item 3 must hold regardless.
 ### 7.3 Delivery
 
 Per §3: gate on `(pending & enable) != 0`, CPSR.I == 0, mode != IRQ; then the
-architectural entry sequence to PC = `0x08000018` with `SP_irq = 0x0841f000`; the
+architectural entry sequence to PC = `0x08000018` with `SP_irq = 0x083F0000`; the
 firmware returns via `subs pc, lr, #4`. Between the latch and the ACK the level stays up;
 because delivery is gated on "not already in IRQ mode", a still-pending line simply
 re-delivers after the return — which is exactly how the firmware expects a level-triggered
@@ -329,7 +332,8 @@ An emulator is rarely cycle-accurate; what matters is the *ratios*:
   measurement (§7.1).
 - **Timer input clock** — 12 MHz is inferred from reload 240000 = 20 ms, not measured.
 - **IRQ-mode stack location on real hardware** — set by boot code not exercised in the
-  from-entry boot; `0x0841f000` is an emulator choice that works.
+  from-entry boot; `0x083F0000` is an emulator choice that works (it must lie below
+  `0x08400000` — see `memory-map-and-boot.md` §5.2).
 - **`0x04000038`** semantics (write-0-only companion register).
 - Whether the entry stub re-reads `PENDING & ENABLE` in a loop before returning or
   services one snapshot per exception — both behaviours are compatible with a

@@ -114,6 +114,15 @@ Driver state block `0x08008CA8` (Observed, live pen):
 Also seeded by the probe: a global row-address-cycle count (**3** for this device
 class) used when emitting address cycles (§5.2).
 
+> **Caveat — the row-cycle count is a §5.6-class seed the boot recipe must not skip
+> (Observed the hard way in emulation):** the boot blob's *static* value of this
+> global (blob offset `0x79E0`) is **2**, not the probe's 3. A from-entry boot that
+> skips the probe therefore emits only 2 row cycles, and every row ≥ 256 is silently
+> truncated to 16 bits: the NFTL mount scan then sees duplicate chain heads (blocks
+> 256 apart alias each other), head arbitration frees the "losers", and the **system
+> bins get erased**. Either run the probe (option (a) below), which seeds 3, or
+> pre-seed the global to **3** explicitly (option (b)).
+
 > **Warning to implementers (Observed the hard way):** the values above must match
 > real hardware, not a self-consistent fiction. `dev[0x1c]` **is `0x1000`**, not
 > `0x200`. An emulator can appear to work with `dev[0x1c] = 0x200` (AU = 1 sector) if
@@ -155,6 +164,18 @@ sector index and *not* a 2-KiB-page index. Each block therefore occupies a windo
 4-KiB AU); rows 32..255 of a block's window are never addressed. Concretely, for
 block 134 the firmware reads AU 0 at row `0x8600`, AU 1 at row `0x8601`, … AU 31 at
 row `0x861F`; block 135 starts at row `0x8700`.
+
+> **Observed correction (NFTL FS area):** the "only 32 rows used" picture holds for
+> the raw/bin region, but the flash-translation layer addresses its **1-MiB logical
+> blocks** (spans of 8 physical blocks — see `nand-image-layout.md` §4) with the
+> unit byte running the **full 0..255 range under the span's *base* block**: the
+> §4.2 decode is linear, so rows `base<<8 | 32 .. base<<8 | 255` land in physical
+> blocks `base+1 .. base+7` (the row "carries" from `base<<8|0xFF` into the next
+> block). Consequently the model's **tag store must be keyed by the raw row
+> (`block<<8 | unit`)**, never by a flattened sector base — flattening makes row
+> `base<<8|32` collide with row `(base+1)<<8|0` (a neighbour block's page-0 tag) and
+> destroys the span at the next mount scan (demonstrated in emulation; this was the
+> cause of the historical "B: enumerates 0 entries" failure).
 
 Erase and the block-scan tag read address a whole block via its window base
 `row = 256 · block`. Copy-back gets two rows, `256·src_block + off` and
@@ -204,9 +225,12 @@ byte_offset  = phys_sector · 512                     # offset into the flat dat
 One transaction then covers `transfer_bytes / 512` consecutive sectors starting
 there (8 for a full AU, 1 for a sub-sector read), plus the row's 8-byte tag.
 
-**Tags are keyed by the row base, never by sub-sector**: the tag served/stored for
-`(row, col)` is the tag of `256·block + AU_secs·au` (in 2-KiB-page terms: the spare
-tag of the page containing that sector; one 8-B tag per program unit).
+**Tags are keyed by the raw row, never by sub-sector**: the tag served/stored for
+`(row, col)` is the tag of row `block<<8 | au`, independent of `sub` (one 8-B tag
+per program unit). Key the tag store by this **raw row value**, not by the
+flattened sector base `256·block + AU_secs·au` — in the NFTL FS area `au` runs
+0..255 (§4.1 correction box), so the flattened key aliases neighbour blocks'
+page-0 tags (Observed).
 
 Erase decodes as `block = row >> 8` (low 8 bits ignored) and clears the whole
 128-KiB block (data → `0xFF`, tags dropped).
@@ -295,6 +319,12 @@ the SRAM window**. One page/AU operation is a sequence of per-record phases: for
 record { clear bit14 → write ECC engine config (§6) → write the single data micro-op
 at `+0x100` → GO → move bytes through the window → poll ready → wait/check ECC }.
 
+**The record size is not a fixed 512 (Observed):** always take `payload_len` from the
+ECC config word (§6, bits[18:7]). The boot loader's metadata/scan reads use
+**1024-byte** records, and the runtime FAT driver *programs* **1024-byte** records;
+only the AU data path and the tag record use 512/8. See §7 for how a 1024-B record
+crosses the 512-B SRAM window.
+
 ---
 
 ## 6. ECC engine `0x0405B000`
@@ -342,6 +372,17 @@ boot-SRAM address space (buffers 0–4 at `0x08006000/0x6200/0x6400/0x6600/0x680
 plus 64-B buffers at `0x08006A00..`); keep it mapped as plain RAM and have the model
 read/write it directly.
 
+> **1024-B records cross the window as two 512-B slabs (Observed in emulation):**
+> on the program path the firmware stages a 1024-B record (the runtime FAT driver's
+> record size, §5.3) as: memcpy 512 B into the window → **poll BUF_STATUS drained
+> (`== 0`)** → memcpy the next 512 B → poll drained again → fire the **flush strobe
+> once** for the record. One drain poll per slab, one flush per record. A model must
+> **capture each slab at its drain poll**, not only at the final flush: both slabs
+> occupy the same 512 window bytes, so a capture-at-flush model records the last
+> slab twice and **every FS program is corrupted with `data[:512] == data[512:]`**
+> (the write path then never round-trips — e.g. discovery's directory entries
+> vanish on re-read).
+
 ---
 
 ## 8. Primitive operations
@@ -386,6 +427,10 @@ just the tag.
 5  CMD_LIST[0] = cmd 0x10 + LAST · GO · poll bit31
 6  status read (§8.4): bit0 set = program FAIL
 ```
+
+For records longer than the 512-B window (the FAT driver's 1024-B records, §5.3),
+step 4c loops per 512-B slab — memcpy, drain poll — and step 4d's flush strobe fires
+once after the last slab; capture per slab, not per flush (§7).
 
 **Image mapping:** capture each 512-B record into
 `byte_offset(row, 0) + 512·record_index`, the tag record into the tag store keyed by
@@ -452,7 +497,8 @@ Both: don't model.
 - The physical spare is 64 B/page, but the firmware's only spare payload is the
   **8-byte tag per program unit** moved as the tag record of read/program
   transactions (its content/format is `nand-image-layout.md` §NFTL). Model the tag
-  store as a map `row_base → 8 bytes`, default `0xFF…` (erased/free).
+  store as a map **raw row → 8 bytes** (`block<<8 | unit`, the sub-sector column
+  stripped — see §4.2; never flatten the key), default `0xFF…` (erased/free).
 - **ECC parity never enters the SRAM window** and is computed/checked entirely
   inside the engine. With the §6 always-pass status, the emulator neither computes
   nor stores parity: **treat all data as ECC-clean**. The only behavioural remnant
@@ -487,14 +533,22 @@ and `0x04010000` as MMIO; keep `0x08006000..0x08006FFF` plain RAM. State:
   Address cycles: first 2 bytes → `col`, rest (LSB first) → `row`. A `0x119` data op
   → deposit `payload_len` bytes (from the engine word, bits[18:7]) at
   `0x08006800 + (i & 0x1FF)`: ≥ 512 → the next data record from
-  `byte_offset(row,col) + 512·record_idx++`; < 512 → the row's tag; set
+  `byte_offset(row,col) + 512·record_idx`, then `record_idx += payload_len/512`
+  (the boot loader's metadata/scan reads use 1024-B records, which wrap circularly
+  in the window — §5.3/§7); < 512 → the row's tag; set
   `l2_level = 8`. A `0x129` data op → `pend_prog = payload_len`, `l2_level = 0`.
   Wait/delay ops → skip.
 - `+0x158` read → constant `0x80000000` (ready).
 - `0x0405B000` write → latch `engine_word`; read → constant `0x7000040` (§6).
-- `0x04010000` write with op==1, buf==4, `pend_prog` set → **capture**: read
-  `min(pend_prog, 512)` bytes at `0x08006800`; ≥ 512 → program the next record at
-  the decoded offset (`record_idx++`); < 512 → set the row's tag; clear `pend_prog`.
+- Program capture — **one 512-B slab per drain poll (Observed-required, §7)**: on a
+  `0x04010010` read with `pend_prog` set (the program path's drain poll), read
+  `min(pend_prog, 512)` bytes at `0x08006800`: ≥ 512 → program the next 512-B
+  sector at the decoded offset (`record_idx++`), `pend_prog -= 512`; < 512 → set
+  the row's tag, `pend_prog = 0`. Do **not** defer capture to the `0x04010000`
+  op==1 flush strobe — a 1024-B record's two slabs share the window and a
+  capture-at-flush model programs the last slab twice
+  (`data[:512]==data[512:]`, every FS program corrupted). The flush strobe then
+  needs no data action.
 - `0x04010010` read → `l2_level << 16`; rule: **8 while a read deposit is
   outstanding, else 0** (satisfies the read `!=0`/`==8` waits and the program-drain
   `==0` wait simultaneously); cleared by the next GO or BUF_CTRL write.

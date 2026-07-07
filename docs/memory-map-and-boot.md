@@ -76,7 +76,7 @@ size (safe covers of what the firmware touches), not a hardware property.
 | `0x06000000` | 128 KiB* | MMIO | Same as above (second config block). RAM-like stub suffices. |
 | `0x07ff0000` | 64 KiB | RAM | **Resident HAL / boot-SRAM window.** The boot blob's HAL entry points live at `0x07ff8000 + off`; PROG makes ~1800 `bl` calls to 72 targets here (hottest: `0x07ffa1d0`, `0x07ffe740`). Map the **boot blob (nandboot.bin, 0x7e80 bytes) at `0x07ff8000`**. |
 | `0x08000000` | 4 MiB | RAM | Main RAM, low part. `0x08000000–0x08009000` = **resident boot blob + low globals** (map nandboot.bin at `0x08000000` too — same bytes as the HAL alias; its PC-relative code is coherent at both addresses). `0x08009000+` = **PROG, flat**. |
-| `0x08400000` | 256 KiB* | RAM | Stack/heap headroom above the PROG image. Main SVC stack top `0x08420000`, IRQ stack top `0x0841f000` (emulator-chosen tops inside real RAM — the from-entry boot must supply SP itself, §5.2). |
+| `0x08400000` | 256 KiB* | RAM | Headroom above the main 4-MiB region (keep mapped). **Stacks must NOT live here** (Observed): the firmware's `Utl_UStr*` string helpers validate every pointer against `[0x08000000, 0x08400000)` and silently no-op out-of-range pointers — see the stack-placement rule in §5.2. Use SVC stack top `0x08400000`, IRQ stack top `0x083F0000` (both grow down into the 4-MiB region; the from-entry boot must supply SP itself, §5.2). |
 
 Total RAM: the firmware uses `[0x07ff0000, ~0x08440000)`. The physical SDRAM is at
 least ~4.5 MiB; exact chip size unconfirmed (**Inferred**: 8 MiB in-package, window
@@ -98,10 +98,10 @@ this is proven to work.
 | `0x08000000–0x08007e80` | Boot blob code (resident: pre-inits, HAL leaves, IRQ plumbing, NAND/NFC driver, OID shifter, timer dispatch). Vector table at `0x08000000` (reset `b` at +0, **IRQ vector at +0x18** → low-level entry `0x08000110`). |
 | `0x08004000`, `0x08004400` | MMU section-table area built by the boot blob (unused if you skip the MMU — safe to leave as the blob wrote it). |
 | `0x08006000–0x08006aff` | NAND L2-buffer staging SRAM (plain RAM; the NAND driver DMA-stages page data here). |
-| `0x08007000–0x08009000` | Early heap + **low globals** (zeroed by the boot blob's reset handler): QHsm frame byte `0x08007e80`; active-object (AO) `0x08008874`; AO event ring `0x08008898` (16 × 12-byte records, head u16 @+0xC0, tail @+0xC2); game context base `0x080089a4` (OID buffer ptr @+0x20 = `0x080089c4`); OID sensor struct `0x08008c08`; **NAND chip/geometry struct `0x08008ca8` (device object `0x08008cc4`)**; system tick `0x08008d24`; audio-output singleton ptr `0x08008d2c`. |
+| `0x08007000–0x08009000` | Early heap + **low globals** (zeroed by the boot blob's reset handler): QHsm frame stack base `0x08007e80` (12-byte frames, state number in byte 0; the deepest non-zero frame is the authoritative statechart leaf — §5.8); active-object (AO) `0x08008874`; AO event ring `0x08008898` (16 × 12-byte records, head u16 @+0xC0, tail @+0xC2); game context base `0x080089a4` (OID buffer ptr @+0x20 = `0x080089c4`); OID sensor struct `0x08008c08`; **NAND chip/geometry struct `0x08008ca8` (device object `0x08008cc4`)**; system tick `0x08008d24`; audio-output singleton ptr `0x08008d2c`. |
 | `0x08009000–0x08389000` | **PROG image, flat** (file offset = address − 0x08009000). Dense code/data to ~`0x0812xxxx`, then .data/.bss. |
-| `0x0811e000–0x081ec000` (within PROG span) | High .data/.bss: statechart state-descriptor table `0x08121d44` (static .data, in the image); booklist head `0x081da080`; GME-engine globals `0x081da0xx`; `g_state` `0x081db904`; codepage-active flag byte `0x081db730`; **mem-driver vtable ("keystone") `0x081db984`** (.bss — built at runtime by the firmware itself, §5.6). |
-| `0x08420000` | Main stack top (grows down). IRQ stack top `0x0841f000`. |
+| `0x0811e000–0x081ec000` (within PROG span) | High .data/.bss: statechart state-descriptor table `0x08121d44` (static .data, in the image); booklist head `0x081da080`; GME-engine globals `0x081da0xx`; `g_state` `0x081db904` (lags — not the authoritative leaf, §5.8); codepage-active flag byte `0x081db730`; **mem-driver vtable ("keystone") `0x081db984`** (.bss — built at runtime by the firmware itself, §5.6). |
+| `0x08400000` | Main SVC stack top (grows down — the stack bytes live *below* `0x08400000`, inside the `Utl_UStr*`-validated range, §5.2). IRQ stack top `0x083F0000`. |
 
 ### 2.2 MMIO sub-blocks (bases + one-line purpose)
 
@@ -215,10 +215,19 @@ zeroes it in a from-entry boot).
 | Register | Value |
 |---|---|
 | PC | **`0x08039100`** (PROG entry; ARM state) |
-| SP (SVC) | `0x08420000` |
+| SP (SVC) | `0x08400000` |
 | CPSR | SVC mode, ARM, IRQs initially enabled (the firmware masks/unmasks itself via `0x04000034` and CPSR.I) |
 | Other regs | don't-care (the real handoff leaves garbage too) |
-| SP (IRQ bank) | set `0x0841f000` when delivering the first IRQ (the from-entry boot skips the blob's per-mode stack setup) |
+| SP (IRQ bank) | set `0x083F0000` when delivering the first IRQ (the from-entry boot skips the blob's per-mode stack setup) |
+
+> **Stack-placement rule (Observed the hard way):** both stacks must lie **inside
+> `[0x08000000, 0x08400000)`**. The firmware's `Utl_UStr*` wide-string helpers
+> validate every pointer against exactly that range and **silently no-op** on
+> out-of-range strings; with a stack top above `0x08400000`, discovery's on-stack
+> path buffers fail the check and it builds garbage `"B:/"`/`"A:/"` paths — no
+> error, no crash, just an empty booklist. SVC top `0x08400000` (stack bytes below
+> it) and IRQ top `0x083F0000` are the proven values; earlier drafts' `0x08420000`/
+> `0x0841f000` are exactly this failure.
 
 ### 5.3 Minimum MMIO contract for boot
 
@@ -279,7 +288,7 @@ working cadence):
 1. Latch pending: `0x040000cc` bit10 + `0x0400004c` bit17 (gate on enable `0x04000034`
    bit10 and on CPSR.I).
 2. Exception entry: `SPSR_irq = CPSR`; switch to IRQ mode (CPSR.I=1, ARM state);
-   `LR_irq = interrupted_PC + 4`; `SP_irq = 0x0841f000`; `PC = 0x08000018` — the
+   `LR_irq = interrupted_PC + 4`; `SP_irq = 0x083F0000`; `PC = 0x08000018` — the
    **loaded image's IRQ vector** (nandboot `b 0x08000110` → aggregate handler
    `0x08005534` → 2nd-level timer dispatch `0x08005c8c` → registered timer-slot
    callbacks: tick `0x08008d24`++, OID poll, event posting).
@@ -400,6 +409,15 @@ the NAND/NFC documents. No RAM-side seeding substitutes for it.
 | Standby truly entered | booklist head `*0x081da080` != 0 (written unconditionally by the standby entry action) |
 | Discovery ran | `a:/oidfilelist.lst` opened/created + booklist count (u16 at iterator +0) > 0 — see `nand-image-layout.md` §7.2/§7.4 |
 | Book plays | product tap ×2 then a content tap → header match (magic 0x238B, product-id@+0x14) → media decodes (`nand-image-layout.md` §7.3) |
+
+> **Reading the statechart leaf (Observed):** `g_state` (`0x081db904`) is **not
+> authoritative** — it lags on autonomous descents (on the `B:/FLAG.bin` resume
+> descent it stays 3 while the pen is already in book mode). The authoritative
+> current leaf is the **QHsm frame stack at `0x08007e80`**: 12-byte frames, state
+> number in the first byte of each frame; the current leaf is the **deepest
+> non-zero frame** (e.g. frames `[3, 12, 13]` = standby→mount→book, leaf 13).
+> Diagnostics and checkpoints should read the frame stack, using `g_state` only as
+> a cross-check.
 
 ---
 

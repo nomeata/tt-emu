@@ -94,6 +94,7 @@ geometry.
 | bin-info array | block 0, page 61 | row `dev[0x14]−3` = **253** (entry table form, §2.3) | `0x34343434` |
 | bin-info header | block 0, page 62 | row `dev[0x14]−2` = **254** (header form, §2.3) | `0x56565656` |
 | **zone/partition table** | block 0, page 63 | row `dev[0x14]−1` = **255** | `0x5a5a5a5a` |
+| **factory bad-block bitmap** | ASA replicas, blocks 1–5 (§2.5) | row **2** | — |
 
 `dev[0x14]` = 256 (row stride per block — see `nand-and-nfc-controller.md` §3).
 Reads at these rows fetch a **0x1000-byte payload**. The exact correspondence
@@ -104,6 +105,14 @@ with the payloads below — Observed to satisfy both the boot loader and the mou
 The 4-byte magics double as the payload prefix for the map/bin-info pages (the
 page data begins with the same u32 as its spare tag). The metadata pages the NFTL
 layer itself writes later use tag `[2:4] = 0xfffa` (§4.1) — a different mechanism.
+
+> **Row 2 — the factory bad-block bitmap (Observed in emulation; a §6 must-have):**
+> before building the partitions, `mtd_init` reads a **0x1000-byte bitmap at
+> row 2** — 1 bit per block, **set = bad** — the runtime home of the ASA data
+> (§2.5). An **erased (0xFF) page marks every block bad and the mount loops
+> forever**; serve a **zero-filled** 0x1000-byte payload at row 2 = no bad blocks.
+> §2.5's "omittable without any ASA" holds for the *boot loader*, not for the
+> mount.
 
 ### 2.2 Zone/partition table (row 255) — what the mount reads ★
 
@@ -242,6 +251,9 @@ spare u32 = a running copy/"times" counter — the mounter picks the replica wit
 highest counter. Consumed by the boot loader's bad-block fallback (§2.3) and the
 self-update path. **An emulated chip with no bad blocks boots without any ASA**
 (Observed); model it only if emulating factory programming or self-update.
+**Caveat (Observed):** omitting the ASA *blocks* satisfies only the boot loader —
+the mount still consumes the bad-block **bitmap via row 2** (§2.1) and loops
+forever on an erased answer; always serve a zero-filled page at row 2.
 
 ---
 
@@ -290,6 +302,20 @@ Between the raw blocks of the FS area and the FAT volumes sits a flash-translati
 layer. Its **entire persistent state is the per-page 8-byte spare tags**; every
 RAM structure (maps, chains, free pool) is rebuilt from tags at each mount.
 
+> **★ The NFTL logical block is 1 MiB = 8 physical blocks (Observed in emulation —
+> this closed the historical "B: enumerates 0 entries" issue).** The mapping unit
+> is a **1-MiB logical block** spanning 8 consecutive physical 128-KiB blocks.
+> Row addressing inside a logical block is **linear across the whole span** under
+> the span's *base* physical block: rows `base<<8 | 0 .. base<<8 | 255` — the unit
+> byte reaches **255**, and the controller decode carries rows past unit 31 into
+> physical blocks `base+1 .. base+7` (the row "carries" from `base<<8|0xFF` into
+> the next block; `nand-and-nfc-controller.md` §4). Head tags carry the **1-MiB
+> block number**: for a span with base physical block `base`,
+> `logical = (base − fs_start) / 8`. Placed spans therefore carry their tags in the
+> *base* block's row window; and an emulator's tag store must be keyed by the
+> **raw row** `block<<8 | unit` — a flattened sector base aliases a span's
+> unit-32.. tags onto neighbour blocks' page-0 tags and destroys the span.
+
 ### 4.1 The spare tag (8 bytes, one per program unit)
 
 | bytes | field | semantics |
@@ -297,7 +323,7 @@ RAM structure (maps, chains, free pool) is rebuilt from tags at each mount.
 | [0] | seq | `seq & 0x7f` = version counter (ordering/display only); **bit 0x80 = this page's copy is OBSOLETE** — a fold treats such a page as blank and discards its data |
 | [1] | sector index | index within the program unit; **not load-bearing** — write 0 |
 | [2:4] | **chain-next / status** | `0xfffd` = chain end (single/last block — a valid head with no older copy); a value `< 0x8000` = physical block number of the next-older chain member; `0xffff` = FREE/erased; `0xfffa` = NFTL-internal metadata page; `0xfffc` = bad; `0xfff7` = strong-danger |
-| [4:6] | **logical block \| 0x8000** | low 15 bits = the **LOGICAL block number** (partition-medium-relative); bit 15 = head-valid. The mount scan inverts this into `map[logical] = physical` |
+| [4:6] | **logical block \| 0x8000** | low 15 bits = the **LOGICAL block number** (medium-relative, in **1-MiB units** — `(base − fs_start)/8`, see the box above); bit 15 = head-valid. The mount scan inverts this into `map[logical] = physical span base` |
 | [6:8] | own/id | **ignored by every consumer** (the firmware writes `0xffff` here) |
 
 Load-bearing for a static image: `[2:4]`, `[4:6]`, and bit 7 of `[0]` (must be
@@ -308,7 +334,10 @@ live scan building both partitions from it.)
 
 ### 4.2 Mount-time scan
 
-`mtd_init` reads the **page-0 tag of every block** in the partition range:
+`mtd_init` reads the **head tag of every logical block** in the partition range
+(with the 1-MiB logical block of the box above, that is one tag per 8-block span,
+read at the span base's row window — placed spans carry tags only there, and the
+mount accepts this; Observed under emulation):
 
 - tag `[2:4] == 0xffff` (blank) → the block joins the **free pool** (COW
   allocations draw from here);
@@ -348,7 +377,8 @@ block L, page p:
 
 Consequences for an image builder:
 
-1. The identity mapping `logical L ↔ physical fs_start+L` created by static
+1. The identity mapping `logical L ↔ physical span [fs_start+8L, fs_start+8L+8)`
+   (L in 1-MiB units) created by static
    placement holds **only until the first COW write to L** — after that L's head
    is wherever the allocator put it. This is why an emulator must model the flash
    at the physical program/erase level (`nand-and-nfc-controller.md` §10 —
@@ -357,10 +387,12 @@ Consequences for an image builder:
    those seams, and its own writes then round-trip and rescan correctly.
 2. Every block not deliberately placed **must read fully erased** (0xFF data,
    blank tag) — those blocks are the free pool the firmware writes into.
-3. Placed blocks must carry a valid head tag on **every** written page
-   (`[2:4]=0xfffd`, `[4:6]=logical|0x8000`, seq bit 7 clear) — a blank tag would
-   classify the block as free and its content would be ignored *and eventually
-   overwritten*; pages of a placed block beyond the placed content must read
+3. Placed content must carry a valid head tag on **every** written program unit
+   (`[2:4]=0xfffd`, `[4:6]=logical|0x8000` with logical the **1-MiB block number**,
+   seq bit 7 clear), keyed at the unit's raw row `base<<8 | unit` in the *span
+   base's* row window (box above; recipe in §6 step 5) — a blank tag would
+   classify the span as free and its content would be ignored *and eventually
+   overwritten*; rows of a placed span beyond the placed content must read
    blank (the append probe scans for them).
 
 ### 4.4 Linear resolver
@@ -460,13 +492,28 @@ in this range with the identity head tag
 sector 0), B: at block `FS_START + A_BLOCKS` (= 614). For each 128-KiB slice of an
 image: if it is all-0x00 or all-0xFF, **skip it** (an unallocated cluster on a
 real pen is erased with no tag; FatLib never reads unallocated clusters, and the
-free pool needs those blocks). Otherwise store the slice at its physical block *b*
-and tag its written pages `{seq=1, [2:4]=0xfffd, [4:6]=(b−FS_START)|0x8000}` —
-note the logical number is relative to `FS_START` for **both** partitions (B's
-first block is logical 480), which is exactly what the identity rule produces.
+free pool needs those blocks). Otherwise store the slice at its physical block *b*.
+**Tagging (corrected — Observed working; §4 box):** tags follow the **1-MiB span**,
+not the physical block. For a written AU at physical block *b*, AU index *a*, let
+
+```
+base = FS_START + 8·⌊(b − FS_START) / 8⌋      # span base block
+unit = 32·(b − base) + a                       # 0..255, AU offset in the span
+```
+
+and write the head tag `{seq=1, [1]=0, [2:4]=0xfffd,
+[4:6]=((base−FS_START)/8)|0x8000}` keyed at the **raw row** `base<<8 | unit`.
+The logical number is the **1-MiB block index** relative to `FS_START` for
+**both** partitions (B's first span, base 614, is logical 60) — exactly what the
+identity rule produces. (The pre-correction recipe — per-physical-block tags
+`(b−FS_START)|0x8000` on every written page — made the mounted B: enumerate 0
+entries and FS writes mis-scan; do not use it.)
 
 **Step 6 — metadata rows** (0x1000-byte payloads, zero-filled unless stated):
 
+- **Row 2 — factory bad-block bitmap:** 0x1000 **zero** bytes = no bad blocks
+  (§2.1). Mandatory: leaving it erased (0xFF = every block bad) makes the mount
+  loop forever.
 - **Row 255 — zone/partition table:**
 
   ```
@@ -506,12 +553,12 @@ Boot outcome: the boot loader finds PROG via rows 254/253/200, the mount reads
 row 255, builds the medium over blocks 134–4095, and registers **both** drives —
 A (`a:`) and B (`b:`) — when both FAT images are valid (Observed under emulation).
 The firmware's own writes (log, profile, `.lst`) COW into free blocks and read
-back consistently (Observed). **Caveat:** the *end-to-end play chain* (discovery →
-booklist → tap-mount → media) is Observed with the `.gme` reachable on **A:**
-(discovery's second pass); the B:-pass *directory enumeration* of placed B:
-content returned 0 entries in the reference validation and is an **open issue**
-(§7.5, §8) — until it is proven, place the `.gme` on A: as well. The full runtime
-chain and its failure signatures are in §7.
+back consistently (Observed). **Resolved caveat:** an earlier reference validation
+saw the B:-pass directory enumeration return 0 entries; the cause was the
+pre-correction per-physical-block tagging. With the 1-MiB-span tagging of step 5
+(and raw-row tag keying), B: enumerates and plays placed content — the `.gme` can
+live on B: alone (Observed; §7.5). The full runtime chain and its failure
+signatures are in §7.
 
 ---
 
@@ -527,8 +574,9 @@ doc's convention: 1 = splash, 3 = standby, 12 = mount, 13 = book.
 
 `fs_storage_mount_init` (from `app_init_main`), in order:
 
-1. Reads the zone table (row 255) and builds the ONE FS-area medium over
-   `[fs_start, 4096)`.
+1. Reads the zone table (row 255) and the factory bad-block bitmap (row 2 —
+   must answer **zero-filled**, not erased; §2.1) and builds the ONE FS-area
+   medium over `[fs_start, 4096)`.
 2. Carves partition A = sectors `[0, 8·AddrCnt_A)` and B = `[8·AddrCnt_A,
    8·(AddrCnt_A+AddrCnt_B))` from the medium (AddrCnt in AU; §2.2).
 3. **Loads the codepage bin** (by physical row, below the FS area). A valid load is
@@ -546,8 +594,8 @@ doc's convention: 1 = splash, 3 = standby, 12 = mount, 13 = book.
 So **B: mounts iff** the image provides: a Symbol-1 `Zone_Group` record with a sane
 AU `AddrCnt` (§2.2), and a valid FAT16 superfloppy VBR at B's partition-relative
 sector 0 = physical block `fs_start + AddrCnt_A/32` (= 614 with the §6 constants),
-whose placed blocks carry valid head tags (`logical = physical − fs_start`, i.e.
-B's first block is logical 480).
+whose placed spans carry valid 1-MiB head tags (`logical = (base − fs_start)/8`,
+i.e. B's first span, base 614, is logical 60 — §4 box, §6 step 5).
 
 **Signature of an unregistered `b:`** (Observed mechanism): path resolution maps
 `toupper(path[0]) − 'A'` into the registered-drive array and rejects out-of-range
@@ -730,6 +778,7 @@ decode has latched it (`akoid_buf+4 == N`, or code word `0x400000|N` at
 | booklist count 0 → tap 2 yields voice 0x2D | discovery ran but wrote no records (combine with the rows above) |
 | tap 1 decodes (`akoid_buf+4` = the OID) but the statechart stays at standby(3) | first-load gate failed and the 0x1060 was silently dropped. **Expected cause: `+0x1d == 8`** — the normal steady state one heartbeat after standby entry (§7.3.1); apply the scoped gate presentation. If `+0x1d` reads 2, check `akoid_buf[0x21] == 0xFF` (root-exit clobber → frame seed missing), then `0x08008C0D != 0xFF` / `akoid_buf[0xB3] == 0` |
 | tap 2 never reaches the mount | book-entry audio never reached EOF — the pre-mount audio-stop spins (audio completion model) |
+| discovery's writes reach NAND but a re-read shows **no new directory entry** (`.lst`/log created "successfully", persists 0 games); or a mounted drive enumerates 0 entries over placed content | NAND-model corruption of the FS write/scan path: 1024-B program records captured only at the final flush (`data[:512]==data[512:]` — `nand-and-nfc-controller.md` §7), or the tag store keyed by a flattened sector base instead of the raw row / per-physical-block head tags instead of 1-MiB spans (§4 box, §6 step 5) |
 
 ### 7.5 Verification status
 
@@ -742,13 +791,14 @@ decode has latched it (`akoid_buf+4 == N`, or code word `0x400000|N` at
   unmodified firmware.
 - **Observed:** two-FAT image (A: system + B: game) → both drives register; B's
   VBR at physical 614 is read and accepted; mount returns success.
-- **NOT yet Observed (open):** the discovery B: pass *enumerating* placed B:
-  content — in the reference validation the directory enumeration over the mounted
-  `b:` returned 0 entries (cause unresolved; possibly a translation-layer detail
-  for logical blocks ≥ 480, possibly a reference-model artifact). Until proven,
-  ship the `.gme` on **A:** (alone or in addition to B:) — the A: pass finds it
-  through exactly the same firmware path, and a `.gme` on A: is also found on a
-  real pen.
+- **Resolved (Observed):** the discovery B: pass initially enumerated 0 entries
+  over placed B: content. The root cause was the image builder's tag model — a
+  translation-layer detail indeed: per-physical-block head tags instead of the
+  NFTL's **1-MiB logical blocks**, plus flattened tag keys aliasing neighbour
+  page-0 tags (§4 box). With 1-MiB-span tagging keyed by raw row (§6 step 5), the
+  B: pass enumerates placed `.gme`s and the end-to-end chain runs with the game on
+  B: alone. (A `.gme` on A: is still found through the same path, as on a real
+  pen.)
 
 ---
 
@@ -774,8 +824,6 @@ decode has latched it (`akoid_buf+4 == N`, or code word `0x400000|N` at
   no parity).
 - **ASA and RB/UB dual copies** are documented but not modelled; needed only for
   bad-block or self-update emulation.
-- **B:-pass discovery enumeration** (§7.5): with a two-FAT image both drives
-  mount, but the reference validation's directory enumeration over `b:` returned
-  0 entries where the same enumeration over `a:` works. Unresolved whether this is
-  a firmware-side translation subtlety for partition-B logical blocks (≥ 480) or a
-  reference-model artifact. Workaround (fully authentic): keep the `.gme` on A:.
+- **B:-pass discovery enumeration** — *resolved*, kept for history (§7.5): the
+  0-entries symptom was the tag mis-model (per-physical-block head tags instead of
+  1-MiB spans; flattened tag keys). See §4 box and §6 step 5; no workaround needed.

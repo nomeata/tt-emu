@@ -22,7 +22,7 @@ pins), `system-control-and-clock.md` (clock registers the DAC rate divider lives
 ```
 decoder (OGG/WAV/…)                                 software
   └─ mixer: ×volume (Q10), mono→stereo dup          software
-      └─ PCM ring buffer in RAM (12 KB)             software
+      └─ PCM ring buffer in RAM (24 KB, §5)         software
           └─ DMA engine 0x04010000                  hardware  ← emulator boundary
               └─ internal DAC 0x04080000            hardware
                   └─ external amp (GPIO16 enable)   hardware
@@ -68,7 +68,7 @@ All **Observed** from the firmware's submit routine and its interrupt handler.
 | register | role |
 |---|---|
 | `0x04010000` | **Control.** Written `0x00620024` once at HAL init. **bit16 = kick/GO** for peripheral-port transfers: the submit routine sets it (`|= 0x10000`) after programming the other registers; the DMA-done interrupt handler clears it (`&= ~0x10000`) — that clear is the interrupt ACK. |
-| `0x04010004` | **Source address.** Memory addresses are written as `phys & 0x3ffff` (an 18-bit offset into a physical window — see the caveat below); peripheral-port codes as `port_addr \| 0x08080000`. |
+| `0x04010004` | **Source address.** Memory addresses are written as **`(cpu_ptr − 0x4000) & 0x3ffff`** — an 18-bit offset into a source window based at CPU address `0x08004000` (see the note below); peripheral-port codes as `port_addr \| 0x08080000`. |
 | `0x04010008` | **Destination address**, same encoding. For playback: **port 1 = DAC**, i.e. the value `0x6200 \| 0x08080000 = 0x08086200`. |
 | `0x0401000c` | **Word count + START/BUSY.** Written `((len_bytes / 4) & 0x7ff) \| 0x2000`: an 11-bit word count with **bit13 = START/BUSY**. The submit routine polls `while (reg & 0x2000)` *before* programming (slot free); memory-to-memory transfers also spin on it afterwards for completion. Must read with bit13 **clear** when the engine is idle, or the firmware hangs in the pre-submit poll. |
 | `0x04010010` | Per-port status word (read by an internal poll helper). |
@@ -95,11 +95,12 @@ For audio, the caller is `hal_ao_submit_tick` (runtime `0x08003a74`): dequeue th
 ring chunk (§5) → translate the chunk's virtual address to physical → `hal_dma_submit(phys,
 1, len)` → mark the chain active (flag byte, §4).
 
-> **Caveat — the 18-bit source encoding (Inferred / open).** The firmware writes
-> `phys & 0x3ffff` into `0x04010004`, i.e. the engine addresses a 256 KB physical window
-> whose base has not been pinned down. A practical emulator therefore should **not** try
-> to decode `0x04010004` back to a CPU address; instead capture the chunk's virtual
-> pointer at submit time (§7).
+> **The 18-bit source encoding — resolved (Observed in emulation during real
+> playback).** The firmware writes **`(cpu_ptr − 0x4000) & 0x3ffff`** into
+> `0x04010004`: the engine's 256-KiB source window is based at CPU address
+> **`0x08004000`** (for buffers in main RAM, `cpu_ptr = 0x08004000 + reg_value`).
+> The PCM ring is allocated inside this window, so decoding the register back to
+> the chunk's CPU address is exact and **capture is fully hook-free** (§7).
 
 ---
 
@@ -188,7 +189,7 @@ All **Observed** unless noted. Byte offsets from `0x08008d30`:
 | +0x34 | underrun **zero-fill flag**: when set, a partial final chunk is padded with silence to a full 0x400 bytes |
 | +0x38 | **read pointer** (byte offset into the ring; advanced by the DMA-side dequeue) |
 | +0x3c | **write pointer** (advanced by the mixer) |
-| +0x40 | **ring size = 0x3000** (12 KB = 12 chunks ≈ 139 ms @ 22050 stereo S16) |
+| +0x40 | **ring size** — Observed **0x6000 (24 KB = 24 chunks ≈ 279 ms @ 22050 stereo S16)** during live playback under this firmware; never assume a constant — **read +0x40** (see the size note below) |
 | +0x44 | **ring base** (pointer to the PCM buffer, allocated from a physically contiguous pool) |
 | +0x48/+0x4a (u16) | source channels / source bits (from the media header) |
 
@@ -202,11 +203,12 @@ All **Observed** unless noted. Byte offsets from `0x08008d30`:
   transaction, advancing +0x38 with wraparound at +0x40. A final partial chunk is either
   zero-padded to 0x400 (flag +0x34) or submitted at its true length; when nothing is
   left the chain stops and flag `0x08008c60` bit0 is set.
-- **Generation note (benign):** a later firmware generation builds the same structure
-  with **ring size 0x6000 (24 KB)** instead of 0x3000. The layout and protocol are
-  identical; only +0x40 (and the wrap point) differ. An emulator must not hard-code the
-  size — read +0x40 if it ever needs it. **Observed** (live RAM dump of a pen running the
-  later generation vs. this firmware's construction code).
+- **Size note (corrected):** this firmware builds the ring with **size 0x6000
+  (24 KB)** at runtime — **Observed** in emulation during live playback (and matching
+  a live RAM dump of a pen on a later generation). An earlier static reading of
+  0x3000 (12 KB) from one construction path does **not** reproduce in the running
+  system. The layout and protocol are identical either way; only +0x40 (and the wrap
+  point) differ. An emulator must not hard-code the size — **read +0x40**.
 
 **DAC / rate registers** (needed only for read-back defaults and, optionally, authentic
 rate derivation; details of the clock tree in `system-control-and-clock.md`):
@@ -214,7 +216,7 @@ rate derivation; details of the clock tree in `system-control-and-clock.md`):
 | register | audio-relevant fields |
 |---|---|
 | `0x04080000` | bit0 = DAC enable (pulsed 0→1 around a rate change) |
-| `0x04000008` | bit24 = DAC-clock enable; **bits[20:13] = rate divider code** (+ latch bit21). Observed data point: 22050 Hz → divider code 0x46 |
+| `0x04000008` | bit24 = DAC-clock enable; **bits[20:13] = rate divider code** (+ latch bit21). Observed data points (live playback in emulation): **22050 Hz → divider code 0x28**; the idle/bring-up 8000 Hz path programs **0x74**. (An earlier static data point "0x46 → 22050 Hz" does **not** reproduce — do not key rate detection on it.) |
 | `0x04000064` | bit13 = DAC analog enable; **bits[16:14] = OSR index** into the table `{256, 272, 264, 248, 240, 136, 128, 120}` (rate ≈ master_clock/(div+1)/OSR, master clock ≤ 14 MHz) |
 | `0x04000010` | bit9 = DAC power-down; **bit8 = rate-apply busy — the firmware sets it and spins until it reads back clear**, so model it self-clearing (or reads-as-written-except-bit8) |
 | `0x04036000/+4` | audio clock block: after the firmware writes `[0] \|= 0x10000000; [4] \|= 0x10010`, it spins until `[4] & 0x80000` — the model must present bit19 set once enabled |
@@ -250,12 +252,13 @@ same with a ring/callback instead of a file):
 1. **RAM-back the register window** `0x04010000..0x0401001c`. Defaults: everything 0;
    in particular `0x0401000c` bit13 clear (else the first submit hangs) and `0x0401001c`
    = 0 always (else the ISR treats every interrupt as spurious).
-2. **Record the chunk source at submit.** Because `0x04010004` holds only `phys &
-   0x3ffff` (window base unresolved, §2), grab the source as a CPU pointer instead:
-   either hook the ring dequeue's return (chunk ptr = `ring[+0x44] + ring[+0x38]` just
-   before it advances) or — the more hook-free variant once the window base is confirmed —
-   decode the register. Track the *last* recorded pointer plus a flag saying whether the
-   current submit came from the ring (to handle §6 correctly).
+2. **Record the chunk source at submit — hook-free (proven).** Decode the register:
+   `src_cpu = 0x08004000 + [0x04010004]` (the firmware wrote
+   `(cpu_ptr − 0x4000) & 0x3ffff`, §2 — Observed exact during real playback).
+   Alternative (older, hook-based): capture the ring dequeue's return
+   (chunk ptr = `ring[+0x44] + ring[+0x38]` just before it advances). Track the
+   *last* recorded pointer plus a flag saying whether the current submit came from
+   the ring (to handle §6 correctly).
 3. **On the START write to `0x0401000c`** (value has bit13 and a nonzero word count)
    while the destination is the DAC port (`0x04010008 == 0x08086200`):
    - read `word_count × 4` bytes from the recorded source pointer — these are final,
@@ -302,10 +305,11 @@ same with a ring/callback instead of a file):
 
 ## 8. Open items
 
-- **Inferred:** the physical window base behind the 18-bit `0x04010004` encoding —
-  confirm at runtime (read the register after a live submit on hardware) to make the
-  source decoding fully hook-free.
+- ~~The physical window base behind the 18-bit `0x04010004` encoding~~ — **resolved
+  (Observed):** the firmware writes `(cpu_ptr − 0x4000) & 0x3ffff`; window base
+  `0x08004000`, source decoding is fully hook-free during real playback (§2/§7).
 - **Inferred:** which init path sets `INT_ENABLE` bit0 initially (see
   `interrupts-and-timers.md` for the enable-register default that sidesteps this).
 - The exact divider search arithmetic for arbitrary rates (only the inverse table lookup
-  and the 22050 → 0x46 data point are needed for emulation).
+  and the observed data points — 22050 Hz → 0x28 live, 8000 Hz → 0x74 bring-up — are
+  needed for emulation).

@@ -49,6 +49,13 @@ GPIO10/GPIO5 is Observed).
 
 - **Bit order: MSB-first.** For a byte `v`, bit `i` (i = 0..7) is `(v >> (7 - i)) & 1`.
 - 8 clocks per byte. **3 challenge bytes out, 3 response bytes back** = 24 clocks each direction.
+- **Delimit by GPIO5 *direction*, never by edge count (Observed — demonstrated in emulation).** The
+  firmware emits at least one **spurious GPIO10 falling edge before the challenge proper** (before it
+  switches GPIO5 to an output). A model that instead counts 24 falling edges from an arbitrary start
+  captures the challenge shifted by one bit, computes a wrong response, fails auth — and on the quiet
+  boot path the pen powers off, a failure easily misread as a "standby auto-off". The correct
+  delimiters: GPIO5 direction switched to **output** = challenge start (discard any stale bits);
+  switched back to **input** = challenge complete → compute the response.
 - The whole exchange runs with CPU interrupts masked (the firmware masks IRQs before it and unmasks
   after), so a functional emulator model must not depend on interrupts firing mid-exchange.
 
@@ -150,11 +157,14 @@ fidelity — only correct bit order and response order.
 **Startup:** read the three S-boxes from the firmware image:
 `tableA = image[0x080b0078 .. +256]`, `tableB = 0x080b0178`, `tableC = 0x080b0278`.
 
-**During the challenge phase** GPIO5 is a firmware *output*. On each GPIO10 falling edge (1→0),
-shift the current GPIO5 output level into a bit buffer, MSB-first. Keep the last 24 bits (`c1,c2,c3`).
+**During the challenge phase** GPIO5 is a firmware *output*. Begin capture at the direction-register
+write that makes GPIO5 an output (**clearing any previously shifted bits** — this discards the
+spurious pre-challenge clock edge, §2 Framing). On each GPIO10 falling edge (1→0), shift the current
+GPIO5 output level into a bit buffer, MSB-first. Keep the last 24 bits (`c1,c2,c3`).
 
 **When the challenge is complete** (the firmware switches GPIO5 to an input after 24 bits — detect
-this via the direction-register write that sets GPIO5 to input, or simply after 24 clocked bits),
+this **via the direction-register write** that sets GPIO5 to input; do **not** end the phase by
+counting 24 clocked bits, which mis-frames the challenge on the spurious edge, §2 Framing),
 compute the response:
 
 ```
@@ -180,8 +190,9 @@ Implementation notes from a working model:
   clock's falling edge (the firmware's last write before the edge is the intended bit).
 - During the response, present each bit around the clock's rising edge and hold it through the
   firmware's low-phase sample.
-- Require 24 *fresh* challenge bits per exchange (clear the buffer after each response) so a second
-  boot-time exchange is handled correctly.
+- Require 24 *fresh* challenge bits per exchange: clear the bit buffer on the GPIO5
+  direction-to-output write (challenge start) and after each response — this both handles a second
+  boot-time exchange and immunizes against the spurious pre-challenge clock edge (§2 Framing).
 - The firmware masks interrupts across the exchange; the model must work purely from the GPIO
   edges, independent of interrupt delivery.
 
