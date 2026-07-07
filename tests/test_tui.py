@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 import pytest
+from _pilot import run_app, wait_for
 
 from tt_emu.audio_capture import AudioCapture
 from tt_emu.runner import gme_product_code
@@ -155,13 +156,16 @@ def test_app_builds_and_injects_taps_via_pilot() -> None:
     async def scenario() -> None:
         fake = _FakeSession()
         app = TtEmuApp(fake, audio=None)
-        async with app.run_test(size=(100, 40)) as pilot:
+        async with run_app(app, size=(100, 40)) as pilot:
             assert fake.started  # the emulation "thread" was started on mount
+            # Wait for the tap panel to be mounted before driving it.
+            await wait_for(pilot, app, "#oid-input")
             # Type an OID into the tap input and submit it.
             await pilot.press("t")  # binding: focus the tap input
             await pilot.press(*"4716", "enter")
             assert fake.taps == [4716]
             # Quick-tap button for the product code.
+            await wait_for(pilot, app, "#tap-42")
             await pilot.click("#tap-42")
             assert fake.taps == [4716, 42]
             # Out-of-range input is rejected gracefully (no crash).
@@ -182,8 +186,14 @@ def test_app_runs_without_audio_output() -> None:
         fake = _FakeSession()
         out = AudioOutput(fake.ring)  # on a machine with no device this degrades
         app = TtEmuApp(fake, audio=out)
-        async with app.run_test(size=(100, 40)):
-            await asyncio.sleep(0.15)  # let a refresh tick render both panels
+        async with run_app(app, size=(100, 40)) as pilot:
+            # Wait until a refresh has actually rendered both panels.
+            await wait_for(
+                pilot, app, "#state-body", ready=lambda w: str(w.content).strip() != ""
+            )
+            await wait_for(
+                pilot, app, "#audio-body", ready=lambda w: str(w.content).strip() != ""
+            )
         out.close()
 
     asyncio.run(scenario())

@@ -20,6 +20,7 @@ import time
 from pathlib import Path
 
 import pytest
+from _pilot import run_app, wait_for
 
 from tt_emu.firmware import detect, mt
 from tt_emu.firmware.symbols import (
@@ -255,41 +256,45 @@ def test_app_debug_panels_populate_and_toggle() -> None:
     async def scenario() -> None:
         fake = _FakeDebugSession()
         app = TtEmuApp(fake, audio=None)
-        async with app.run_test(size=(120, 50)) as pilot:
-            from textual.widgets import Static
-
-            # The debug row is revealed + populated by the app's periodic refresh;
-            # pump the event loop until it lands (avoids a one-pause timing race).
-            for _ in range(50):
-                await pilot.pause()
-                try:
-                    if app.query_one("#debug-panels").display is True and "book (13)" in str(
-                        app.query_one("#statechart-body", Static).content
-                    ):
-                        break
-                except Exception:  # noqa: BLE001 - panel not mounted yet on early iterations
-                    pass
-            # Recognized firmware: the debug row is revealed and populated.
-            assert app.query_one("#debug-panels").display is True
-            statechart = str(app.query_one("#statechart-body", Static).content)
+        async with run_app(app, size=(120, 50)) as pilot:
+            # Recognized firmware: the debug row is revealed and populated by
+            # the app's periodic refresh — wait for each panel's content to
+            # land instead of racing it with a single pause.
+            await wait_for(pilot, app, "#debug-panels", ready=lambda w: w.display is True)
+            statechart_body = await wait_for(
+                pilot, app, "#statechart-body",
+                ready=lambda w: "book (13)" in str(w.content),
+            )
+            statechart = str(statechart_body.content)
             assert "book (13)" in statechart and "standby (3)" in statechart
             assert "active" in statechart  # the leaf is highlighted
-            gme = str(app.query_one("#gme-body", Static).content)
+            gme_body = await wait_for(
+                pilot, app, "#gme-body",
+                ready=lambda w: "42 — Ein akustischer Taschenrechner" in str(w.content),
+            )
+            gme = str(gme_body.content)
             assert "42 — Ein akustischer Taschenrechner" in gme
             assert "$eingabe=8" in gme and "$zahl=8" in gme
-            oid = str(app.query_one("#oid-body", Static).content)
+            oid_body = await wait_for(
+                pilot, app, "#oid-body", ready=lambda w: "acht" in str(w.content)
+            )
+            oid = str(oid_body.content)
             assert "4716" in oid and "acht" in oid
             assert "line 1/1" in oid
             assert "Inc($eingabe,8)" in oid
             # The transition log received the drained lines.
-            transitions = app.query_one("#transitions")
+            transitions = await wait_for(
+                pilot, app, "#transitions",
+                ready=lambda w: w.display is True
+                and any("book_mount" in str(line) for line in w.lines),
+            )
             assert transitions.display is True
             assert any("book_mount" in str(line) for line in transitions.lines)
             # 'd' toggles the debug row off (and back on).
             await pilot.press("d")
-            assert app.query_one("#debug-panels").display is False
+            await wait_for(pilot, app, "#debug-panels", ready=lambda w: w.display is False)
             await pilot.press("d")
-            assert app.query_one("#debug-panels").display is True
+            await wait_for(pilot, app, "#debug-panels", ready=lambda w: w.display is True)
 
     asyncio.run(scenario())
 
@@ -302,10 +307,13 @@ def test_app_without_debug_stays_generic() -> None:
 
         fake = _FakeSession()
         app = TtEmuApp(fake, audio=None)
-        async with app.run_test(size=(100, 40)) as pilot:
-            await pilot.pause()
-            assert app.query_one("#debug-panels").display is False
-            assert app.query_one("#transitions").display is False
+        async with run_app(app, size=(100, 40)) as pilot:
+            # Wait until the layout is mounted (a single pause can race the
+            # mount); the debug row must then be hidden and stay hidden.
+            debug_panels = await wait_for(pilot, app, "#debug-panels")
+            transitions = await wait_for(pilot, app, "#transitions")
+            assert debug_panels.display is False
+            assert transitions.display is False
             await pilot.press("d")  # toggling without a debugger is a no-op + log line
             assert app.query_one("#debug-panels").display is False
 
