@@ -219,6 +219,34 @@ def _peak_level(data: bytes) -> float:
     return min(peak, 32768) / 32768.0
 
 
+#: Keeps the ctypes ALSA error-handler callback alive (libasound holds a pointer).
+_ALSA_HANDLER_REF: list[object] = []
+
+
+def _silence_alsa_error_output() -> None:
+    """Mute libasound's own diagnostics (e.g. "underrun occurred") so they don't
+    scribble on the terminal Textual owns.
+
+    This is **not** a file-descriptor redirect: it installs a no-op handler via
+    ALSA's public ``snd_lib_error_set_handler`` hook, silencing only libasound's
+    chatter. Python tracebacks and PortAudio errors on stderr are untouched, so
+    nothing else is hidden. A no-op on non-ALSA systems / if libasound is absent.
+    """
+    if _ALSA_HANDLER_REF:  # already installed
+        return
+    try:
+        import ctypes
+
+        handler_t = ctypes.CFUNCTYPE(
+            None, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p
+        )
+        handler = handler_t(lambda *_: None)
+        ctypes.CDLL("libasound.so.2").snd_lib_error_set_handler(handler)
+        _ALSA_HANDLER_REF.append(handler)  # prevent GC while ALSA holds it
+    except Exception:  # noqa: BLE001 — not ALSA / no libasound: nothing to silence
+        pass
+
+
 class AudioOutput:
     """Real-time audio out via sounddevice, draining an :class:`AudioRing`.
 
@@ -252,16 +280,13 @@ class AudioOutput:
         try:
             import sounddevice as sd  # type: ignore[import-untyped]
 
+            _silence_alsa_error_output()  # keep ALSA's underrun chatter off the tty
             # RawOutputStream: the callback gets a raw interleaved S16LE byte
-            # buffer — the exact layout the ring already holds. latency="high"
-            # asks PortAudio for a generous buffer (~100 ms+): the emulation
-            # thread hogs the GIL, so the Python callback often lands late, and a
-            # big buffer absorbs that jitter instead of letting ALSA underrun.
+            # buffer — the exact layout the ring already holds.
             stream = sd.RawOutputStream(
                 samplerate=self.rate,
                 channels=2,
                 dtype="int16",
-                latency="high",
                 callback=self._callback,
             )
             stream.start()
