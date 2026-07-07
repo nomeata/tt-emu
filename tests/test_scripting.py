@@ -16,20 +16,21 @@ import wave
 from pathlib import Path
 
 import pytest
+from _data import firmware_path, game_dir
 
 from tt_emu import Clip, Emulator, ExpectationError
 
-UPD_PATH = Path("/home/jojo/tiptoi/update3202MT.upd")
-GAME_DIR = Path("/home/jojo/tiptoi/tiptoi-taschenrechner")
-GME_PATH = GAME_DIR / "taschenrechner.gme"
-YAML_PATH = GAME_DIR / "taschenrechner.yaml"
+UPD_PATH = firmware_path()
+GAME_DIR = game_dir()
+GME_PATH = GAME_DIR / "taschenrechner.gme" if GAME_DIR is not None else None
+YAML_PATH = GAME_DIR / "taschenrechner.yaml" if GAME_DIR is not None else None
 
 #: The OID code assigned to the "acht" (eight) script (taschenrechner.codes.yaml).
 ACHT_OID = 4716
 
 pytestmark = pytest.mark.skipif(
-    not (UPD_PATH.exists() and GME_PATH.exists() and YAML_PATH.exists()),
-    reason="firmware .upd / taschenrechner.gme / .yaml not present",
+    UPD_PATH is None or GME_PATH is None or YAML_PATH is None,
+    reason="firmware .upd / taschenrechner game not available",
 )
 
 

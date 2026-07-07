@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import time
-from pathlib import Path
 
 import pytest
+from _data import firmware_path, game_dir
 from _pilot import run_app, wait_for
 
 from tt_emu.audio_capture import AudioCapture
@@ -25,8 +25,9 @@ from tt_emu.tui import (
     gme_content_oids,
 )
 
-UPD_PATH = Path("/home/jojo/tiptoi/update3202MT.upd")
-GME_PATH = Path("/home/jojo/tiptoi/tiptoi-taschenrechner/taschenrechner.gme")
+_GAME_DIR = game_dir()
+UPD_PATH = firmware_path()
+GME_PATH = _GAME_DIR / "taschenrechner.gme" if _GAME_DIR is not None else None
 
 
 # --- audio ring / queue plumbing -----------------------------------------------------
@@ -101,7 +102,7 @@ def test_gme_content_oids_rejects_garbage() -> None:
     assert gme_content_oids(b"\xff" * 8) == []
 
 
-@pytest.mark.skipif(not GME_PATH.exists(), reason="taschenrechner.gme not present")
+@pytest.mark.skipif(GME_PATH is None, reason="taschenrechner.gme not available")
 def test_gme_content_oids_taschenrechner() -> None:
     data = GME_PATH.read_bytes()
     oids = gme_content_oids(data, limit=3)
@@ -203,8 +204,8 @@ def test_app_runs_without_audio_output() -> None:
 
 
 @pytest.mark.skipif(
-    not (UPD_PATH.exists() and GME_PATH.exists()),
-    reason="firmware .upd / taschenrechner.gme not present",
+    UPD_PATH is None or GME_PATH is None,
+    reason="firmware .upd / taschenrechner.gme not available",
 )
 def test_emulator_session_thread_boots_and_stops() -> None:
     session = EmulatorSession(UPD_PATH, [GME_PATH])

@@ -26,12 +26,13 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from _data import firmware_path
 
 from tt_emu.boot import BootedMachine
 from tt_emu.machine import Machine
 from tt_emu.runner import gme_product_code, run_session
 
-UPD_PATH = Path("/home/jojo/tiptoi/update3202MT.upd")
+UPD_PATH = firmware_path()
 GME_PATH = Path(__file__).parent / "data" / "main_binary" / "minimal_mb.gme"
 
 # --- Firmware addresses on the load/launch path (firmware-2n-mt.md §8) --------------
@@ -46,7 +47,7 @@ MARK_ADDR = 0x0814_1F00
 STATE_SEPARATE_BINARY = 69
 
 pytestmark = pytest.mark.skipif(
-    not UPD_PATH.exists(), reason="firmware .upd not present"
+    UPD_PATH is None, reason="firmware .upd not available"
 )
 
 

@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import logging
 import struct
-from pathlib import Path
 
 import pytest
+from _data import firmware_path
 
 from tt_emu.loader import CODEPAGE_SIZE, load_upd
 from tt_emu.machine import IRQ_VECTOR, Machine, MachineConfig
@@ -22,7 +22,7 @@ from tt_emu.peripherals.intc import IntcTimer, NOMINAL_RELOAD, TIMER1_CTRL
 from tt_emu.peripherals.syscon import CHIP_ID, SysCon
 from tt_emu.peripherals.zc90b import PIN_CLOCK, PIN_DATA, Zc90bAuth
 
-UPD_PATH = Path("/home/jojo/tiptoi/update3202MT.upd")
+UPD_PATH = firmware_path()
 
 
 # --- WordRegisterPeripheral -------------------------------------------------------
@@ -304,7 +304,7 @@ def _set_out(g: GpioBlock, pin: int, level: int) -> None:
 # --- Loader -----------------------------------------------------------------------
 
 
-@pytest.mark.skipif(not UPD_PATH.exists(), reason="update3202MT.upd not present")
+@pytest.mark.skipif(UPD_PATH is None, reason="firmware .upd not available")
 def test_loader_artifacts() -> None:
     fw = load_upd(UPD_PATH)
     assert fw.build_id == "N0038MT"
@@ -324,7 +324,7 @@ def test_loader_artifacts() -> None:
     assert table_a[0] == 0xD3
 
 
-@pytest.mark.skipif(not UPD_PATH.exists(), reason="update3202MT.upd not present")
+@pytest.mark.skipif(UPD_PATH is None, reason="firmware .upd not available")
 def test_boot_reaches_app_init_main() -> None:
     from tt_emu.runner import boot_firmware
 

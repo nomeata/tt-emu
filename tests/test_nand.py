@@ -5,9 +5,9 @@ per ``nand-and-nfc-controller.md`` §8)."""
 from __future__ import annotations
 
 import struct
-from pathlib import Path
 
 import pytest
+from _data import firmware_path
 
 from tt_emu.fat16 import build_fat16
 from tt_emu.machine import Machine, MachineConfig
@@ -31,7 +31,7 @@ from tt_emu.peripherals.nand import (
     tag_key,
 )
 
-UPD_PATH = Path("/home/jojo/tiptoi/update3202MT.upd")
+UPD_PATH = firmware_path()
 
 #: eccsize for ECC mode 2: 512 + (7*2+7) = 0x215 (§4.1 worked example).
 ECCSIZE = 0x215
@@ -390,7 +390,7 @@ def test_nfc_copy_back_moves_data_and_tag() -> None:
 # --- Image builder ------------------------------------------------------------------
 
 
-@pytest.mark.skipif(not UPD_PATH.exists(), reason="update3202MT.upd not present")
+@pytest.mark.skipif(UPD_PATH is None, reason="firmware .upd not available")
 def test_image_builder_layout() -> None:
     from tt_emu.loader import load_upd
     from tt_emu.nand_image import build_nand_image
@@ -440,7 +440,7 @@ def test_image_builder_layout() -> None:
 # --- Boot smoke test: the mount checkpoint ------------------------------------------
 
 
-@pytest.mark.skipif(not UPD_PATH.exists(), reason="update3202MT.upd not present")
+@pytest.mark.skipif(UPD_PATH is None, reason="firmware .upd not available")
 def test_boot_mounts_storage() -> None:
     """The storage-mount done-criteria (memory-map-and-boot.md §5.7/§5.8):
 

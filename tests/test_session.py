@@ -17,18 +17,20 @@ import wave
 from pathlib import Path
 
 import pytest
+from _data import firmware_path, game_dir
 
 from tt_emu.runner import STATE_BOOK, gme_product_code, run_session
 
-UPD_PATH = Path("/home/jojo/tiptoi/update3202MT.upd")
-GME_PATH = Path("/home/jojo/tiptoi/tiptoi-taschenrechner/taschenrechner.gme")
+_GAME_DIR = game_dir()
+UPD_PATH = firmware_path()
+GME_PATH = _GAME_DIR / "taschenrechner.gme" if _GAME_DIR is not None else None
 
 #: A content OID inside the taschenrechner GME's script range.
 CONTENT_OID = 4716
 
 pytestmark = pytest.mark.skipif(
-    not (UPD_PATH.exists() and GME_PATH.exists()),
-    reason="firmware .upd / taschenrechner.gme not present",
+    UPD_PATH is None or GME_PATH is None,
+    reason="firmware .upd / taschenrechner game not available",
 )
 
 

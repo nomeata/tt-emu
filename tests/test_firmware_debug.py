@@ -17,9 +17,9 @@ from __future__ import annotations
 
 import asyncio
 import time
-from pathlib import Path
 
 import pytest
+from _data import firmware_path, game_dir
 from _pilot import run_app, wait_for
 
 from tt_emu.firmware import detect, mt
@@ -32,14 +32,15 @@ from tt_emu.firmware.symbols import (
 from tt_emu.loader import load_upd
 from tt_emu.tui import EmulatorSession, EmuSnapshot, TtEmuApp
 
-UPD_PATH = Path("/home/jojo/tiptoi/update3202MT.upd")
-GME_PATH = Path("/home/jojo/tiptoi/tiptoi-taschenrechner/taschenrechner.gme")
-YAML_PATH = Path("/home/jojo/tiptoi/tiptoi-taschenrechner/taschenrechner.yaml")
+_GAME_DIR = game_dir()
+UPD_PATH = firmware_path()
+GME_PATH = _GAME_DIR / "taschenrechner.gme" if _GAME_DIR is not None else None
+YAML_PATH = _GAME_DIR / "taschenrechner.yaml" if _GAME_DIR is not None else None
 
-needs_upd = pytest.mark.skipif(not UPD_PATH.exists(), reason="firmware .upd not present")
+needs_upd = pytest.mark.skipif(UPD_PATH is None, reason="firmware .upd not available")
 needs_game = pytest.mark.skipif(
-    not (GME_PATH.exists() and YAML_PATH.exists()),
-    reason="taschenrechner .gme/.yaml not present",
+    GME_PATH is None or YAML_PATH is None,
+    reason="taschenrechner .gme/.yaml not available",
 )
 
 
