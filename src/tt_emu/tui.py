@@ -3,9 +3,10 @@
 Architecture (all cross-platform, no firmware hooks — observation only):
 
 * :class:`EmulatorSession` — a background **emulation thread**. It builds the
-  machine exactly like :func:`tt_emu.runner.run_session` (the authentic
-  ``B:/FLAG.bin`` resume route, ``nand-image-layout.md`` §7.3.1, so the pen
-  descends into book mode and a game can mount), then runs
+  machine exactly like :func:`tt_emu.runner.run_session` (the power button is
+  held through the app-init sample, ``nand-image-layout.md`` §7.3.1a, so the
+  pen descends into book mode as on a real power-on and a game can mount),
+  then runs
   :meth:`~tt_emu.machine.Machine.run` continuously. The UI talks to it only
   through thread-safe surfaces: a command deque (taps / buttons / quit are
   *applied on the emulation thread* between chunks), an immutable
@@ -38,14 +39,15 @@ scripted runner. Buttons follow ``gpio-buttons-led.md`` §8 item 4: drive the
 pin to its active level for ~2 scan periods (short press) or past the ~600 ms
 hold threshold (power-off needs a hold), then release.
 
-Run it: ``tt-emu-tui path/to/update3202MT.upd --game game.gme`` or
-``python -m tt_emu.tui …``.
+Run it: ``tt-emu-tui --game game.gme`` (the firmware is auto-downloaded and
+cached when no path is given) or ``python -m tt_emu.tui …``.
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+import sys
 import struct
 import threading
 import time
@@ -64,6 +66,7 @@ from .boot import BootedMachine, build_machine
 from .firmware import detect as detect_firmware
 from .firmware import mt as fw_mt
 from .firmware.symbols import GmeScripts, TttoolSymbols, derive_media_names, load_tttool_yaml
+from .firmware_fetch import FirmwareDownloadError, FirmwareIntegrityError, ensure_firmware
 from .loader import load_upd
 from .machine import Machine, MachineConfig
 from .runner import (
@@ -72,12 +75,13 @@ from .runner import (
     BOOK_ENTRY_TAIL_PC,
     CHECKPOINTS,
     CURRENT_PRODUCT_ADDR,
+    EVENT_RING_HEAD_ADDR,
+    EVENT_RING_TAIL_ADDR,
     FATAL_ADDRS,
-    FLAG_BIN_CONTENT,
-    FLAG_BIN_NAME,
     RESUME_BYTE_ADDR,
     SESSION_INSTRUCTIONS_PER_TICK,
     SETTLE_INSTRUCTIONS,
+    STATE_BOOK,
     STATE_NAMES,
     gme_product_code,
     statechart_leaf,
@@ -335,10 +339,11 @@ class EmuSnapshot:
 class EmulatorSession:
     """Owns the emulator worker thread and its thread-safe control surfaces.
 
-    The worker builds the machine (FLAG.bin resume route + the provided
-    ``.gme`` files on B:), then runs continuously. All mutation of emulator
-    state happens **on the worker thread**: public methods only enqueue
-    commands, which the run loop's per-chunk callback applies.
+    The worker builds the machine (the power-on descent boot of
+    ``nand-image-layout.md`` §7.3.1a + the provided ``.gme`` files on B:),
+    then runs continuously. All mutation of emulator state happens **on the
+    worker thread**: public methods only enqueue commands, which the run
+    loop's per-chunk callback applies.
     """
 
     def __init__(
@@ -347,7 +352,6 @@ class EmulatorSession:
         game_paths: Iterable[str | Path] = (),
         *,
         yaml_path: str | Path | None = None,
-        flag_resume: bool = True,
         instructions_per_tick: int = SESSION_INSTRUCTIONS_PER_TICK,
         max_instructions: int = 1_000_000_000_000,
     ) -> None:
@@ -363,8 +367,6 @@ class EmulatorSession:
             if self.product_code is None:
                 self.product_code = gme_product_code(data)
                 self.content_oids = gme_content_oids(data)
-        if flag_resume:
-            self._b_files.setdefault(FLAG_BIN_NAME, FLAG_BIN_CONTENT)
 
         # tttool YAML symbols (optional; --yaml). Failure degrades to raw numbers.
         self.symbols: TttoolSymbols | None = None
@@ -378,8 +380,6 @@ class EmulatorSession:
             # Join media names: align the YAML's P(...) args with the matching
             # game's binary playlists (firmware-2n-mt.md §5).
             for name, data in self._b_files.items():
-                if name == FLAG_BIN_NAME:
-                    continue
                 try:
                     scripts = GmeScripts(data)
                 except (ValueError, struct.error, IndexError):
@@ -407,6 +407,7 @@ class EmulatorSession:
         self._pending_taps: deque[int] = deque()
         self._held: tuple[int, int, int] | None = None  # (oid, press clock, gameplay base)
         self._last_lift = 0
+        self._book_tail_at: int | None = None  # set by the book-entry-tail hook
         self._button_releases: list[tuple[int, str, int]] = []  # (clock, name, pin)
         self._last_snapshot_clock = 0
         self._last_leaf = -1
@@ -489,18 +490,16 @@ class EmulatorSession:
             self.post_event(f"FAILED to build the machine: {exc}")
             return
         self.booted = booted
-        games = [n for n in self._b_files if n != FLAG_BIN_NAME]
         self.post_event(
             f"machine built (build {firmware.build_id}); B: = "
-            f"{', '.join(games) or '(no games)'}"
-            + (" + FLAG.bin resume marker" if FLAG_BIN_NAME in self._b_files else "")
+            f"{', '.join(self._b_files) or '(no games)'}"
         )
 
         # Firmware-aware debugger: only after positively recognizing the image
         # (firmware-2n-mt.md §1). Unrecognized firmware -> generic panels only.
         self._firmware_label = detect_firmware(firmware.prog.data) or ""
         if self._firmware_label:
-            game_blobs = [d for n, d in self._b_files.items() if n != FLAG_BIN_NAME]
+            game_blobs = list(self._b_files.values())
             self.debugger = fw_mt.MtDebugger(
                 booted.machine,
                 gme_files=game_blobs,
@@ -529,6 +528,7 @@ class EmulatorSession:
         booted.machine.on_code(
             BOOK_ENTRY_TAIL_PC, self._make_checkpoint("book entry finished (§7.3.2)")
         )
+        booted.machine.on_code(BOOK_ENTRY_TAIL_PC, self._note_book_tail)
         booted.audio.capture.listener = self._on_audio_chunk
 
         self.snapshot = replace(self.snapshot, power="running")
@@ -567,6 +567,28 @@ class EmulatorSession:
         clock = booted.machine.clock if booted is not None else 0
         self.post_event(f"[{clock:>12,}] {message}")
 
+    def _note_book_tail(self, machine: Machine) -> None:
+        """Record when book entry's tail ran (§7.3.2) — the earliest a tap mounts."""
+        if self._book_tail_at is None:
+            self._book_tail_at = machine.clock
+
+    def _ready_for_tap(self, machine: Machine, now: int) -> bool:
+        """Gate the product tap on book readiness (mirrors runner._TapSession's
+        book-wait): a tap pressed during the book-entry jingle is captured and
+        discarded without mounting. Once a product is mounted we are in-game, so
+        content taps proceed on the settle gap alone."""
+        if self._book_tail_at is None:
+            return False
+        if machine.read_u32(CURRENT_PRODUCT_ADDR) != 0:
+            return True  # already mounted -> in-game, content taps are receptive
+        if statechart_leaf(machine) != STATE_BOOK:
+            return False
+        if now - self._book_tail_at < SETTLE_INSTRUCTIONS:
+            return False
+        if machine.read_u8(AUDIO_FLAGS_ADDR) & AUDIO_CHAIN_ACTIVE:
+            return False  # book-open jingle still draining
+        return machine.read_u16(EVENT_RING_HEAD_ADDR) == machine.read_u16(EVENT_RING_TAIL_ADDR)
+
     def _on_chunk(self, machine: Machine) -> None:
         """Per-chunk callback on the emulation thread: apply commands, observe."""
         if self._stop.is_set():
@@ -593,7 +615,11 @@ class EmulatorSession:
                 self._held = None
                 self._last_lift = now
                 self.post_event(f"[{now:>12,}] tap {oid}: never latched — pen lifted (timeout)")
-        elif self._pending_taps and now - self._last_lift >= SETTLE_INSTRUCTIONS:
+        elif (
+            self._pending_taps
+            and now - self._last_lift >= SETTLE_INSTRUCTIONS
+            and self._ready_for_tap(machine, now)
+        ):
             oid = self._pending_taps.popleft()
             self._held = (oid, now, booted.oid.gameplay_frames_served)
             booted.oid.hold(oid)
@@ -1004,7 +1030,7 @@ class TtEmuApp(App[None]):
         else:
             speed = "…"
         mounted = str(snap.mounted_product) if snap.mounted_product else "(none)"
-        resume = "FLAG.bin resume armed" if snap.resume_byte == 1 else f"{snap.resume_byte}"
+        resume = "power-on descent (+0x24=1)" if snap.resume_byte == 1 else f"{snap.resume_byte}"
         return (
             f"[b]Statechart[/b]  {snap.leaf_name} ({snap.leaf})\n"
             f"[b]Power[/b]       {snap.power}\n"
@@ -1118,7 +1144,15 @@ def build_parser() -> argparse.ArgumentParser:
         prog="tt-emu-tui",
         description="Interactive tiptoi 2N ('MT') pen emulator — tap OIDs, hear the audio.",
     )
-    parser.add_argument("firmware", help="path to update3202MT.upd")
+    parser.add_argument(
+        "firmware", nargs="?", default=None,
+        help="path to the .upd firmware (optional — downloads + caches the "
+        "official update3202MT.upd if omitted)",
+    )
+    parser.add_argument(
+        "--firmware-cache", metavar="DIR", default=None,
+        help="directory for the downloaded-firmware cache (default: platform cache dir)",
+    )
     parser.add_argument(
         "--game", metavar="GME", action="append", default=[],
         help=".gme file placed on partition B: (repeatable; the first one's "
@@ -1129,11 +1163,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="tttool source .yaml of the game: joins symbolic names (register "
         "$-names, script/OID labels, media names) into the debugger panels; a "
         "sibling <book>.codes.yaml supplies the script→OID codes",
-    )
-    parser.add_argument(
-        "--no-flag-resume", action="store_true",
-        help="do not provision B:/FLAG.bin (the pen then stays at standby; "
-        "the resume route is what lets a game mount — nand-image-layout.md §7.3.1)",
     )
     parser.add_argument(
         "--instructions-per-tick", type=int, default=SESSION_INSTRUCTIONS_PER_TICK,
@@ -1148,11 +1177,15 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     logging.getLogger().setLevel(logging.WARNING)  # no console handler: TUI owns the tty
+    try:
+        firmware = str(ensure_firmware(args.firmware, cache_dir=args.firmware_cache))
+    except (FirmwareDownloadError, FirmwareIntegrityError) as exc:
+        print(f"tt-emu-tui: {exc}", file=sys.stderr)
+        return 1
     session = EmulatorSession(
-        args.firmware,
+        firmware,
         args.game,
         yaml_path=args.yaml,
-        flag_resume=not args.no_flag_resume,
         instructions_per_tick=args.instructions_per_tick,
     )
     audio = None if args.no_audio else AudioOutput(session.ring)

@@ -9,7 +9,17 @@ Implements ``gpio-buttons-led.md`` §1/§2/§8:
   per-pin overrides from attached device models (ZC90B data, OID data, buttons,
   USB detect), and bit16 mirroring the amp-enable output latch (§1.1);
 * the **GPIO15 power-hold latch**: a 1→0 transition of output bit 15 is the
-  pen's clean power-off and terminates the run (§4, ``battery-and-power.md`` §5).
+  pen's clean power-off and terminates the run (§4, ``battery-and-power.md`` §5);
+* the **boot-held power button** (``nand-image-layout.md`` §7.3.1a): on a real
+  power-on the user's finger is still on the power button (GPIO11) when the
+  early app-init samples it and latches game-context ``+0x24 = (GPIO11 == 1)``
+  — the byte that makes standby auto-descend into book(13). The model holds
+  GPIO11 = 1 from reset and releases it right after the first ``GPIO_IN`` read
+  that follows the firmware driving the power-hold latch (GPIO15 = 1): the
+  app-init sample is exactly that read ("right after configuring the
+  power-hold pin"). The release matters — after boot, GPIO11 == 1 in standby
+  idle means "power button pressed" and triggers a rescan + soft reboot
+  (§7.2's "keep GPIO11 = 0" rule applies *after* the boot-time sample).
 
 Device models (ZC90B, later OID/buttons) subscribe to output-latch and
 direction-register changes and override input pin levels.
@@ -46,6 +56,7 @@ GPIO_IN_IDLE = 0x0000_3201
 GPIO_DIR0_SEED = 0x3100
 GPIO_PULL0_SEED = 0x4
 
+PIN_POWER_BUTTON = 11  # active HIGH; held from reset through the app-init sample
 PIN_POWER_HOLD = 15  # 1 = stay powered, 0 = power off (§4)
 PIN_AMP_ENABLE = 16  # output latch mirrored into GPIO_IN (§1.1)
 
@@ -68,6 +79,12 @@ class GpioBlock(WordRegisterPeripheral):
         #: firmware's hottest poll target; the composition only changes on
         #: set_input/clear_input or an output-latch write.
         self._in_word: int | None = None
+        #: Power button still held from the press that powered the pen on
+        #: (``nand-image-layout.md`` §7.3.1a). Released right after the first
+        #: GPIO_IN read that follows the power-hold latch (GPIO15) going high —
+        #: i.e. the app-init ``+0x24 = (GPIO11 == 1)`` sample sees 1, everything
+        #: later (test chord, key scan, standby idle) sees 0.
+        self._boot_power_button = True
         self.reset()
 
     @property
@@ -87,6 +104,7 @@ class GpioBlock(WordRegisterPeripheral):
         self._regs[GPIO_PULL0] = GPIO_PULL0_SEED
         self._in_overrides.clear()
         self._in_word = None
+        self._boot_power_button = True
 
     # --- device-model API ------------------------------------------------------------
 
@@ -121,6 +139,10 @@ class GpioBlock(WordRegisterPeripheral):
         word = self._in_word
         if word is None:
             word = GPIO_IN_IDLE
+            if self._boot_power_button:
+                # The power-on press is still held (§7.3.1a); an explicit
+                # set_input(11, …) below would win, as any later press does.
+                word |= 1 << PIN_POWER_BUTTON
             for pin, level in self._in_overrides.items():
                 word = (word & ~(1 << pin)) | (level << pin)
             # bit16 mirrors the amp-enable output latch (§1.1).
@@ -148,7 +170,18 @@ class GpioBlock(WordRegisterPeripheral):
 
     def read_reg(self, offset: int) -> int:
         if offset == GPIO_IN0:
-            return self.input_word()
+            word = self.input_word()
+            if self._boot_power_button and self.out_level(PIN_POWER_HOLD):
+                # This is the first GPIO_IN read after the firmware drove the
+                # power-hold latch (GPIO15 = 1, first thing in app_init_main) —
+                # the app-init sample that latches game-context +0x24 =
+                # (GPIO11 == 1) "right after configuring the power-hold pin"
+                # (nand-image-layout.md §7.3.1a). The sample sees the button
+                # still held; the finger lifts right after.
+                self._boot_power_button = False
+                self._in_word = None
+                log.info("GPIO11 power button released after the app-init sample")
+            return word
         if offset == GPIO_IN1:
             return 0  # no bank-1 pin is used (§1)
         return super().read_reg(offset)

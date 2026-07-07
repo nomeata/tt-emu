@@ -17,7 +17,7 @@ from tt_emu.loader import CODEPAGE_SIZE, load_upd
 from tt_emu.machine import IRQ_VECTOR, Machine, MachineConfig
 from tt_emu.peripheral import WordRegisterPeripheral
 from tt_emu.peripherals.battery import ADC_DATA, ADC_DATA_HEALTHY, BatteryAdc
-from tt_emu.peripherals.gpio import GPIO_DIR0, GPIO_OUT0, GpioBlock, PIN_POWER_HOLD
+from tt_emu.peripherals.gpio import GPIO_DIR0, GPIO_IN0, GPIO_OUT0, GpioBlock, PIN_POWER_HOLD
 from tt_emu.peripherals.intc import IntcTimer, NOMINAL_RELOAD, TIMER1_CTRL
 from tt_emu.peripherals.syscon import CHIP_ID, SysCon
 from tt_emu.peripherals.zc90b import PIN_CLOCK, PIN_DATA, Zc90bAuth
@@ -78,8 +78,9 @@ def test_battery_adc_constant() -> None:
 
 def test_gpio_out_reads_back_and_in_composition() -> None:
     g = GpioBlock()
-    g.write_reg(GPIO_OUT0, 0x8000)  # power-hold high
+    g.write_reg(GPIO_OUT0, 0x8000)  # power-hold high (GPIO15)
     assert g.read_reg(GPIO_OUT0) == 0x8000
+    g.read_reg(GPIO_IN0)  # app-init sample releases the boot-held power button (§7.3.1a)
     assert g.input_word() == 0x00003201  # idle base (gpio-buttons-led.md §2)
     g.set_input(9, 0)  # OID data pulled low
     assert (g.input_word() >> 9) & 1 == 0

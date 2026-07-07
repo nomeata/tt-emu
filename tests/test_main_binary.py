@@ -81,7 +81,6 @@ def test_main_binary_gme_loads_and_executes() -> None:
     report = run_session(
         str(UPD_PATH),
         [product],  # a single product tap; the blob then launches autonomously
-        flag_resume=True,
         max_instructions=200_000_000,
         b_files={GME_PATH.name: gme},
         on_prepared=on_prepared,

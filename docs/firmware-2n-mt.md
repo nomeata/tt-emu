@@ -495,8 +495,8 @@ mandatory — otherwise the firmware treats the whole offset region as absent.
 
 ### 8.2 The load / launch path (all Observed, addresses N0038MT)
 
-On the authentic `flag_resume` + product-tap flow (§4, `nand-image-layout.md`
-§7.3) the firmware mounts the product and then, **on its own**, with no special
+On the authentic power-on descent + product-tap flow (§4, `nand-image-layout.md`
+§7.3.1a) the firmware mounts the product and then, **on its own**, with no special
 content tap:
 
 1. **`gme_oid_dispatch` @0x0803629C** (book(13) default handler, runs every
@@ -550,7 +550,7 @@ applies unchanged.
 **Nothing beyond a normal firmware run.** The load region 0x08132000 is inside
 the main-RAM mapping (`memory-map-and-boot.md` §2: `[0x08000000,0x08400000)`),
 already present; the blob's callbacks are firmware functions already executing;
-the mount + `flag_resume` + product-tap flow (§4) already reaches book(13). No
+the mount + power-on descent + product-tap flow (§4) already reaches book(13). No
 hook, no extra peripheral, no special load step is required — the firmware
 detects, loads, and jumps to the blob itself. A debugger/TUI can *observe* the
 path with read-only PC watchpoints on 0x080AADD8 (loader), 0x080AA934 (launcher)

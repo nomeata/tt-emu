@@ -9,11 +9,12 @@ event-pump idle loop, and the fatal-hang addresses of the self-tests.
 mode, inject OID taps through the sensor model (``oid-sensor.md`` §6), let the
 firmware mount the book and play, and capture the audio the DAC DMA moves
 (``audio-dac-dma.md`` §7) — the full boot → book → tap product → tap content →
-WAV chain, firmware unmodified. Book mode is reached authentically via the
-``B:/FLAG.bin`` resume marker (``nand-image-layout.md`` §7.3.1): splash sets
-the resume byte ``+0x24 = 1`` and the first standby heartbeat auto-posts the
-mount event, descending splash → standby(3) → mount(12) → book(13) with no
-tap and no ``+0x1d`` gate.
+WAV chain, firmware unmodified. Book mode is reached the way a real pen
+reaches it (``nand-image-layout.md`` §7.3.1a): the GPIO model presents the
+power button (GPIO11) still held at the app-init sample, so the firmware
+latches the resume byte ``+0x24 = 1`` and the first standby heartbeat
+auto-posts the mount event, descending splash → standby(3) → mount(12) →
+book(13) with no tap and no ``+0x1d`` gate — plus the power-on jingle.
 """
 
 from __future__ import annotations
@@ -62,7 +63,7 @@ BOOKLIST_HEAD_ADDR = 0x081D_A080
 # --- Session-observability globals (index.md RAM table; oid/audio docs) --------------
 
 #: ``g_state`` — the statechart state global of memory-map-and-boot.md §5.8.
-#: Observed to *lag* on the FLAG.bin auto-descent (stays 3 while the statechart
+#: Observed to *lag* on the power-on auto-descent (stays 3 while the statechart
 #: is in book(13)) — the QHsm frame stack below is the authoritative leaf.
 G_STATE_ADDR = 0x081D_B904
 STATE_STANDBY = 3
@@ -80,7 +81,7 @@ STATE_NAMES: dict[int, str] = {
 #: QHsm statechart frame stack: 12-byte frames at 0x08007e80 + 12·depth (the
 #: boot seed QHSM_FRAME_ADDR is frame[0]), byte 0 = the state number, 0 =
 #: unused. The current leaf is the **deepest non-zero frame** (Observed: after
-#: the FLAG.bin descent the stack reads [3, 12, 13] = standby → mount → book
+#: the power-on descent the stack reads [3, 12, 13] = standby → mount → book
 #: while ``g_state`` still says 3).
 QHSM_FRAME_BASE = 0x0800_7E80
 QHSM_FRAME_STRIDE = 12
@@ -92,8 +93,11 @@ CURRENT_PRODUCT_ADDR = 0x081D_A08C
 #: clears the pen-down flag and re-enables capture — this instruction is the
 #: "book entry finished" marker (nand-image-layout.md §7.3.2 item 2).
 BOOK_ENTRY_TAIL_PC = 0x0803_4850
-#: Game-context resume byte +0x24 (base 0x080089a4): 1 once splash saw
-#: ``B:/FLAG.bin`` (§7.3.1 "resume descent") — diagnostics only, never written.
+#: Game-context resume byte +0x24 (base 0x080089a4): latched by the early
+#: app-init as ``(GPIO11 == 1)`` — 1 on every power-on with the button still
+#: held (§7.3.1a); the first standby heartbeat then auto-descends into
+#: book(13). (FLAG.bin, the pen's post-firmware-update resume marker, is the
+#: second authentic setter of the same byte.) Diagnostics only, never written.
 RESUME_BYTE_ADDR = 0x0800_89C8
 #: Settle gap between a tap's decode and the next tap (§7.3.2: ~3 M emulated
 #: instructions, pen lifted in between).
@@ -104,8 +108,6 @@ AUDIO_CHAIN_ACTIVE = 1 << 2
 #: AO event ring head/tail (16 records; head==tail means the pump is drained).
 EVENT_RING_HEAD_ADDR = 0x0800_8958
 EVENT_RING_TAIL_ADDR = 0x0800_895A
-#: The event-pump main-loop checkpoint address (also in :data:`CHECKPOINTS`).
-EVENT_PUMP_ADDR = 0x0800_B4A4
 #: OID working-buffer pointer (game context +0x20); buf+4 = the current OID the
 #: classifier stored (oid-sensor.md §4/§5).
 AKOID_BUF_PTR_ADDR = 0x0800_89C4
@@ -113,15 +115,6 @@ AKOID_BUF_PTR_ADDR = 0x0800_89C4
 #: GME container: the product/book OID code is the little-endian u32 at file
 #: offset 0x14 (game-data format, not firmware RE).
 GME_PRODUCT_CODE_OFFSET = 0x14
-
-#: The post-update resume marker (``nand-image-layout.md`` §7.3.1 "resume
-#: descent"): when ``B:/FLAG.bin`` exists, splash sets the resume byte
-#: ``+0x24 = 1``; the first accepted standby heartbeat then posts the mount
-#: event 0x1058 itself and the pen descends into book(13) **autonomously** —
-#: no tap-1, no ``+0x1d`` gate. Only its existence is load-bearing; the
-#: content is a minimal 1-byte marker.
-FLAG_BIN_NAME = "FLAG.bin"
-FLAG_BIN_CONTENT = b"\x01"
 
 
 def gme_product_code(data: bytes) -> int:
@@ -270,7 +263,6 @@ class SessionReport(BootReport):
     taps: list[int] = field(default_factory=list)
     taps_fired: int = 0
     taps_served: int = 0
-    flag_resume: bool = False
     mounted_product: int = 0
     resume_byte: int = 0
     state_chain: list[tuple[int, int]] = field(default_factory=list)  # (clock, g_state)
@@ -289,10 +281,10 @@ class SessionReport(BootReport):
         lines = [super().format_log(), "session:"]
         chain = " -> ".join(f"{s}@{c}" for c, s in self.state_chain) or "(none)"
         lines.append(f"  statechart leaf chain (state@clock): {chain}")
-        if self.flag_resume:
-            lines.append(
-                f"  flag-resume: B:/FLAG.bin route, resume byte +0x24={self.resume_byte}"
-            )
+        lines.append(
+            f"  power-on descent: resume byte +0x24={self.resume_byte} "
+            f"(GPIO11 app-init latch, §7.3.1a)"
+        )
         lines.append(f"  mounted product: {self.mounted_product}")
         lines.append(
             f"  taps: planned {self.taps}, fired {self.taps_fired}, "
@@ -330,25 +322,18 @@ class _TapSession:
     taps reliable at standby, where the 32-bit status polls (§4.2) can consume
     frames without posting events.
 
-    Two entry routes (``nand-image-layout.md`` §7.3):
-
-    * ``flag_resume=False`` — the tap-1 route: the first tap fires at fresh
-      standby and must win the one-heartbeat ``+0x1d == 2`` window (§7.3.1) —
-      **known to lose the race**; kept for diagnosis.
-    * ``flag_resume=True`` — the authentic ``B:/FLAG.bin`` resume (§7.3.1):
-      the firmware auto-descends into book(13) with no tap; the session waits
-      for book entry to finish (the §7.3.2 tail marker + audio drained +
-      settle gap), then taps the product (the real mount) and the content
-      OIDs.
+    Entry route (``nand-image-layout.md`` §7.3.1a — the normal power-on): the
+    GPIO model holds the power button through the app-init sample, so the
+    firmware auto-descends into book(13) with no tap; the session waits for
+    book entry to finish (the §7.3.2 tail marker + audio drained + settle
+    gap), then taps the product (the real mount) and the content OIDs.
     """
 
     def __init__(
         self,
         booted: BootedMachine,
         taps: list[int],
-        checkpoint_hits: list[tuple[int, int, str]],
         *,
-        flag_resume: bool = False,
         settle_ticks: int = 8,
         quiet_ticks: int = 50,
         react_timeout_ticks: int = 250,
@@ -357,7 +342,6 @@ class _TapSession:
     ) -> None:
         self.booted = booted
         self.taps = taps
-        self.flag_resume = flag_resume
         self.settle_ticks = settle_ticks
         self.quiet_ticks = quiet_ticks
         self.react_timeout_ticks = react_timeout_ticks
@@ -368,8 +352,7 @@ class _TapSession:
         self.taps_fired = 0
         self.stall: str | None = None
 
-        self._hits = checkpoint_hits  # shared, appended by the checkpoint hooks
-        self._phase = "book-wait" if flag_resume else "standby-wait"
+        self._phase = "book-wait"
         self._tap_index = 0
         self._g_last: int | None = None
         self._g_changed_at = 0
@@ -399,9 +382,6 @@ class _TapSession:
 
     def _pump_idle(self, machine: Machine) -> bool:
         return machine.read_u16(EVENT_RING_HEAD_ADDR) == machine.read_u16(EVENT_RING_TAIL_ADDR)
-
-    def _pump_running(self) -> bool:
-        return any(addr == EVENT_PUMP_ADDR for _, addr, _ in self._hits)
 
     def _standby_entered(self, machine: Machine) -> bool:
         """True once the statechart's standby(3) ENTRY action has run — proven by
@@ -470,23 +450,8 @@ class _TapSession:
         if self._standby_at is None and self._standby_entered(machine):
             self._standby_at = now
 
-        if self._phase == "standby-wait":
-            # Fire the first tap as soon as the standby ENTRY action has run
-            # (booklist head allocated) and the event pump is idle. The window
-            # before the firmware re-arms the fresh-standby marker +0x1d from 2
-            # to 8 (~1 tick after discovery, nand-image-layout.md §7.3) is
-            # short, so tap promptly — do not wait out a settle timer.
-            if (
-                self._standby_entered(machine)
-                and self._pump_running()
-                and self._pump_idle(machine)
-            ):
-                self._press(machine)
-            elif self._ticks(machine, now) >= self.standby_timeout_ticks:
-                self._fail(machine, "standby entry action never ran (booklist head 0)")
-
-        elif self._phase == "book-wait":
-            # FLAG.bin resume (§7.3.1): the firmware descends into book(13)
+        if self._phase == "book-wait":
+            # Power-on descent (§7.3.1a): the firmware descends into book(13)
             # on its own. Tap the product only once book entry has fully run
             # (the §7.3.2 tail marker), its book-open voice drained (audio
             # chain idle + capture quiet), the pump is idle, and the settle
@@ -514,11 +479,11 @@ class _TapSession:
                 resume = machine.read_u8(RESUME_BYTE_ADDR)
                 self._fail(
                     machine,
-                    f"FLAG.bin auto-descent never reached book(13) "
+                    f"power-on auto-descent never reached book(13) "
                     f"(g_state={g}, book-entry tail "
                     f"{'hit' if self._book_tail_at is not None else 'not hit'}, "
-                    f"resume byte +0x24={resume} — expected 1 after splash saw "
-                    f"B:/FLAG.bin, nand-image-layout.md §7.3.1)",
+                    f"resume byte +0x24={resume} — expected 1 from the app-init "
+                    f"GPIO11 power-button latch, nand-image-layout.md §7.3.1a)",
                 )
 
         elif self._phase == "tap-wait":
@@ -563,22 +528,13 @@ class _TapSession:
                 elif decoded:
                     # The firmware's own capture decoded the tap (classifier
                     # holds akoid_buf+4 == our OID) but the statechart did not
-                    # advance to book(13). On the first (product) tap this is the
-                    # first-load gate losing the fresh-standby race: the OID is
-                    # classified only *after* the firmware has re-armed the
-                    # fresh-standby marker game-context +0x1d from 2 back to 8
-                    # (Observed simultaneity — see run_session's note), and the
-                    # first-load branch requires +0x1d == 2 (nand-image-layout.md
-                    # §7.3). akoid_buf[0x21] stays 0xFF (the frame seed holds),
-                    # so this is purely a decode-vs-rearm timing loss.
+                    # react — the tap fired outside book(13) (it should not:
+                    # the power-on descent reaches book before the first tap).
                     self._fail(
                         machine,
                         f"OID {oid} decoded by firmware (classifier holds it) but "
-                        f"the statechart stayed at standby — first-load gate lost the "
-                        f"fresh-standby race (game-context +0x1d re-armed 2->8 before "
-                        f"the standby OID decode completed; see report). Use the "
-                        f"authentic B:/FLAG.bin route (flag_resume/--flag-resume, "
-                        f"§7.3.1)",
+                        f"the statechart did not react (leaf at tap: "
+                        f"{self._g_at_tap})",
                     )
                 else:
                     self._fail(
@@ -628,7 +584,6 @@ def run_session(
     path: str,
     taps: list[int],
     *,
-    flag_resume: bool = False,
     wav_path: str | Path | None = None,
     max_instructions: int = 800_000_000,
     config: MachineConfig | None = None,
@@ -639,15 +594,13 @@ def run_session(
 ) -> SessionReport:
     """Boot, inject the ``taps`` sequence, capture audio, optionally write a WAV.
 
-    The full milestone chain: boot → standby → tap the product OID (the game
-    mounts) → tap content OIDs (scripts play) → the DAC DMA stream is captured
-    and written as S16LE stereo WAV. ``b_files`` (name → bytes) provisions
-    ``.gme`` files onto partition B: (``nand-image-layout.md`` §5).
-
-    ``flag_resume`` provisions the ``B:/FLAG.bin`` resume marker
-    (``nand-image-layout.md`` §7.3.1): the unmodified firmware then descends
-    into book(13) autonomously and ``taps`` should be [product, content, …] —
-    the authentic route around the one-heartbeat ``+0x1d`` standby window.
+    The full milestone chain: boot (the power button held through the app-init
+    sample, ``nand-image-layout.md`` §7.3.1a — the firmware auto-descends into
+    book(13) as on a real power-on) → tap the product OID (the game mounts) →
+    tap content OIDs (scripts play) → the DAC DMA stream is captured and
+    written as S16LE stereo WAV, so ``taps`` should be [product, content, …].
+    ``b_files`` (name → bytes) provisions ``.gme`` files onto partition B:
+    (``nand-image-layout.md`` §5).
 
     ``on_prepared`` is an optional callback invoked with the booted machine
     *before* the run starts, so a caller can attach read-only PC watchpoints
@@ -656,13 +609,10 @@ def run_session(
     """
     if config is None:
         config = MachineConfig(instructions_per_tick=SESSION_INSTRUCTIONS_PER_TICK)
-    if flag_resume:
-        b_files = dict(b_files or {})
-        b_files.setdefault(FLAG_BIN_NAME, FLAG_BIN_CONTENT)
     booted, hits = _prepare(path, config, a_dir, b_dir, b_files)
     if on_prepared is not None:
         on_prepared(booted)
-    session = _TapSession(booted, taps, hits, flag_resume=flag_resume)
+    session = _TapSession(booted, taps)
     result = booted.machine.run(max_instructions, on_chunk=session.on_chunk)
 
     machine = booted.machine
@@ -670,7 +620,6 @@ def run_session(
     _fill_report(report, booted)
     report.taps = taps
     report.taps_fired = session.taps_fired
-    report.flag_resume = flag_resume
     report.mounted_product = machine.read_u32(CURRENT_PRODUCT_ADDR)
     report.resume_byte = machine.read_u8(RESUME_BYTE_ADDR)
     report.taps_served = booted.oid.taps_served
@@ -684,49 +633,16 @@ def run_session(
     akoid_ptr = machine.read_u32(AKOID_BUF_PTR_ADDR)
     if akoid_ptr:
         report.last_oid_seen = machine.read_u32(akoid_ptr + 4)
-    # Discovery/tap diagnostic. The boot now *does* enter statechart standby (the
-    # ZC90B auth exchange passes — see peripherals/zc90b.py — so the run no longer
-    # powers off at the auth-fail hang) and the standby(3) ENTRY action runs
-    # discovery: booklist head 0x081da080 becomes non-NULL (the §5.8/§7.2 health
-    # checkpoints "standby truly entered" + "discovery ran"). Two gaps remain
-    # before audio; report whichever applies.
-    if taps and not booted.audio.capture.chunks and flag_resume:
+    # Session diagnostic: a tap session that produced no audio summarizes the
+    # power-on-descent health markers (resume byte, discovery, mount).
+    if taps and not booted.audio.capture.chunks:
         booklist = machine.read_u32(BOOKLIST_HEAD_ADDR)
         count = machine.read_u16(booklist) if booklist else 0
         report.discovery_note = (
-            f"No audio on the FLAG.bin route: resume byte +0x24="
-            f"{report.resume_byte}, booklist count={count}, mounted product="
-            f"{report.mounted_product} (see STALL for the failing step)."
-        )
-    elif taps and not booted.audio.capture.chunks:
-        booklist = machine.read_u32(BOOKLIST_HEAD_ADDR)
-        count = machine.read_u16(booklist) if booklist else 0
-        decoded = (report.last_oid_seen & 0xFFFF) == (taps[0] & 0xFFFF)
-        entered = "YES" if booklist else "NO"
-        report.discovery_note = (
-            f"No audio. Standby entered (booklist head {booklist:#x}, discovery ran="
-            f"{entered}), booklist count={count}. "
-            + (
-                "The first product tap was decoded by the unmodified firmware "
-                f"(classifier akoid_buf+4 = {report.last_oid_seen & 0xFFFF} == OID "
-                f"{taps[0]}) but the statechart did not reach book(13): the first-load "
-                "gate needs game-context +0x1d == 2, and at standby the OID decode "
-                "completes only as the firmware re-arms +0x1d 2->8 (a decode-vs-rearm "
-                "race, nand-image-layout.md §7.3). "
-                if decoded else
-                "The first product tap was not decoded in time (frames served="
-                f"{report.taps_served}). "
-            )
-            + (
-                "Discovery also found 0 games: even with the .gme on A:, the standby "
-                "entry action creates no files on A: (no a:/oidfilelist.lst, no log) — "
-                "A: writes reach NAND but no directory entry is ever committed, a "
-                "FAT/NFTL file-creation gap in the write path. "
-                if count == 0 else
-                f"Booklist has {count} entries. "
-            )
-            + "The OID and audio peripherals are unit-verified; these are "
-            "storage-write and standby-timing gaps."
+            f"No audio on the power-on descent: resume byte +0x24="
+            f"{report.resume_byte} (expected 1, §7.3.1a), booklist count={count}, "
+            f"mounted product={report.mounted_product} (see STALL for the "
+            f"failing step)."
         )
     if booted.audio.capture.chunks:
         report.audio_stats = booted.audio.capture.stats()

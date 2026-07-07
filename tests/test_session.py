@@ -40,7 +40,6 @@ def test_full_session_boot_book_tap_play_wav(tmp_path: Path) -> None:
     report = run_session(
         str(UPD_PATH),
         [product, CONTENT_OID],
-        flag_resume=True,
         wav_path=wav_path,
         b_files={GME_PATH.name: gme},
     )

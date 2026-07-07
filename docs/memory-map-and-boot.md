@@ -411,8 +411,8 @@ the NAND/NFC documents. No RAM-side seeding substitutes for it.
 | Book plays | product tap ×2 then a content tap → header match (magic 0x238B, product-id@+0x14) → media decodes (`nand-image-layout.md` §7.3) |
 
 > **Reading the statechart leaf (Observed):** `g_state` (`0x081db904`) is **not
-> authoritative** — it lags on autonomous descents (on the `B:/FLAG.bin` resume
-> descent it stays 3 while the pen is already in book mode). The authoritative
+> authoritative** — it lags on autonomous descents (on the power-on auto-descent
+> it stays 3 while the pen is already in book mode). The authoritative
 > current leaf is the **QHsm frame stack at `0x08007e80`**: 12-byte frames, state
 > number in the first byte of each frame; the current leaf is the **deepest
 > non-zero frame** (e.g. frames `[3, 12, 13]` = standby→mount→book, leaf 13).

@@ -103,6 +103,10 @@ class TestBench:
         self.ecc = EccEngine()
         self.nfc = NfcController(self.nand, self.ecc)
         self.gpio = GpioBlock()
+        # Peripheral-contract blobs test the steady GPIO, not the firmware's
+        # boot-time power-button sample (§7.3.1a); release it so GPIO_IN idles
+        # at its documented base word.
+        self.gpio._boot_power_button = False
         self.intc = IntcTimer(self.gpio)
         self.syscon = SysCon()
         self.audio = AudioDma(self.nfc, self.intc, self.syscon, self.gpio)
