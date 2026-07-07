@@ -46,7 +46,9 @@ cached when no path is given) or ``python -m tt_emu.tui …``.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
+import os
 import sys
 import struct
 import threading
@@ -54,7 +56,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Iterable, Protocol, cast
+from typing import Iterable, Iterator, Protocol, cast
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -1180,6 +1182,30 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+@contextlib.contextmanager
+def _quiet_backend_stderr(enabled: bool = True) -> Iterator[None]:
+    """Divert fd 2 (C-library diagnostics — e.g. ALSA/PortAudio "underrun
+    occurred") to ``os.devnull`` for the duration of the block.
+
+    Textual owns the terminal, so those writes corrupt the display; the TUI logs
+    through its own panel, not stderr. A no-op when ``enabled`` is False (e.g.
+    ``--no-audio``), so tracebacks stay visible when debugging without audio.
+    Python-level errors after the block use the restored stderr as usual.
+    """
+    if not enabled:
+        yield
+        return
+    saved_fd = os.dup(2)
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull, 2)
+        yield
+    finally:
+        os.dup2(saved_fd, 2)
+        os.close(devnull)
+        os.close(saved_fd)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     logging.getLogger().setLevel(logging.WARNING)  # no console handler: TUI owns the tty
@@ -1196,7 +1222,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     audio = None if args.no_audio else AudioOutput(session.ring)
     app = TtEmuApp(session, audio)
-    app.run()
+    with _quiet_backend_stderr(audio is not None):
+        app.run()
     session.shutdown()
     if audio is not None:
         audio.close()
