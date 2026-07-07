@@ -320,6 +320,10 @@ class AudioOutput:
         self.level = 0.0  #: peak of the sound currently playing, 0..1
         self.state = "off"  #: off / idle / playing
         self.sounds_played = 0  #: complete buffered sounds handed to the player
+        #: Backlog display: the sound currently accumulating, and complete
+        #: sounds queued but not yet playing (both PCM bytes).
+        self.buffering_bytes = 0
+        self.queued_bytes = 0
         #: Cap for one buffered sound (bytes of interleaved S16LE stereo PCM).
         self.max_bytes = int(self.MAX_SECONDS * rate) * FRAME_BYTES
         self._queue: queue.Queue[bytes] = queue.Queue()
@@ -393,6 +397,7 @@ class AudioOutput:
         while not self._stop.is_set():
             self._stop.wait(self._POLL_SECONDS)
             last_data_clock = self._accumulate_step(buffer, last_data_clock)
+            self.buffering_bytes = len(buffer)  # for the backlog display
 
     def _accumulate_step(self, buffer: bytearray, last_data_clock: int) -> int:
         """One accumulator iteration: drain the ring, extend/flush ``buffer``.
@@ -420,6 +425,7 @@ class AudioOutput:
 
     def _enqueue(self, pcm: bytes) -> None:
         if pcm:
+            self.queued_bytes += len(pcm)
             self._queue.put(pcm)
 
     # --- player thread: one blocking write of each complete buffer -------------
@@ -429,6 +435,7 @@ class AudioOutput:
                 pcm = self._queue.get(timeout=self._POLL_SECONDS)
             except queue.Empty:
                 continue
+            self.queued_bytes = max(0, self.queued_bytes - len(pcm))  # now playing
             if pcm:
                 self._play_one(pcm)
             if self._queue.empty():
@@ -459,6 +466,21 @@ class AudioOutput:
         except Exception as exc:  # noqa: BLE001 — a bad device must not kill the thread
             self.error = str(exc) or type(exc).__name__
         self.sounds_played += 1
+
+    @property
+    def backlog_seconds(self) -> float:
+        """Captured audio not yet played — ring + accumulating sound + queue.
+
+        How far the audio lags the emulation: everything the DAC has produced
+        that the speaker hasn't reached yet.
+        """
+        pending = self.ring.fill_bytes + self.buffering_bytes + self.queued_bytes
+        return pending / (self.rate * FRAME_BYTES)
+
+    @property
+    def buffering_seconds(self) -> float:
+        """Length of the sound currently being accumulated."""
+        return self.buffering_bytes / (self.rate * FRAME_BYTES)
 
 
 # --- The emulation thread --------------------------------------------------------------
@@ -1204,7 +1226,12 @@ class TtEmuApp(App[None]):
             filled = round(self.audio.level * 16)
             level_bar = "#" * filled + "." * (16 - filled)
             sounds = str(self.audio.sounds_played)
-            buffered = f"{self.session.ring.fill_seconds():.2f} s"
+            backlog = self.audio.backlog_seconds
+            capturing = self.audio.buffering_seconds
+            bar_n = min(20, int(round(backlog / 10.0 * 20)))  # ~10 s spans the bar
+            buffered = f"{backlog:5.1f}s behind [{'#' * bar_n}{'.' * (20 - bar_n)}]"
+            if capturing > 0.05:
+                buffered += f"  +{capturing:.1f}s capturing"
         chain = "playing (chain active)" if snap.chain_active else "idle"
         duration = snap.captured_bytes / (FRAME_BYTES * snap.capture_rate)
         last = (
@@ -1222,7 +1249,7 @@ class TtEmuApp(App[None]):
             f"{out_line}\n"
             f"[b]Status[/b]   {state}   [b]Firmware[/b] {chain}\n"
             f"[b]Level[/b]    {level_bar}\n"
-            f"[b]Buffered[/b] {buffered}   [b]Sounds[/b] {sounds}\n"
+            f"[b]Lag[/b]      {buffered}   [b]Sounds[/b] {sounds}\n"
             f"[b]Captured[/b] {snap.captured_chunks} chunks, {duration:.1f} s"
             f" @ {snap.capture_rate} Hz ({snap.dac_submits} DAC submits)\n"
             f"[b]Last[/b]     {last}"
