@@ -258,7 +258,17 @@ def test_app_debug_panels_populate_and_toggle() -> None:
         async with app.run_test(size=(120, 50)) as pilot:
             from textual.widgets import Static
 
-            await pilot.pause()
+            # The debug row is revealed + populated by the app's periodic refresh;
+            # pump the event loop until it lands (avoids a one-pause timing race).
+            for _ in range(50):
+                await pilot.pause()
+                try:
+                    if app.query_one("#debug-panels").display is True and "book (13)" in str(
+                        app.query_one("#statechart-body", Static).content
+                    ):
+                        break
+                except Exception:  # noqa: BLE001 - panel not mounted yet on early iterations
+                    pass
             # Recognized firmware: the debug row is revealed and populated.
             assert app.query_one("#debug-panels").display is True
             statechart = str(app.query_one("#statechart-body", Static).content)
