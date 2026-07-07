@@ -43,10 +43,19 @@ documents.
 ## Development
 
 ```sh
-python -m venv .venv && . .venv/bin/activate
-pip install -e ".[dev]"      # installs the package + test deps
-pytest                       # run the test suite
-python -m tt_emu path/to/firmware.upd   # headless boot
+# Install the tt-emu / tt-emu-tui commands. uv (https://docs.astral.sh/uv/) is the
+# easiest — nothing to clone; pipx or pip work too:
+uv tool install tt-emu          # or: pipx install tt-emu  /  pip install tt-emu
+
+# ...or from a source checkout, for development:
+python -m venv .venv && . .venv/bin/activate   # or: uv venv
+pip install -e ".[dev]"                        # or: uv pip install -e ".[dev]"
+pytest                                         # the test suite
+
+# The firmware argument is OPTIONAL for the headless command: omit it and tt-emu
+# downloads + caches the official update3202MT.upd (verified against a pinned
+# SHA-256; reused offline afterwards). Pass a path to use your own .upd.
+tt-emu path/to/firmware.upd   # headless boot  (equivalently: python -m tt_emu …)
 
 # interactive TUI: boot the pen, tap OID codes, hear the audio live
 tt-emu-tui path/to/firmware.upd --game path/to/game.gme
