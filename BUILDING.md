@@ -24,7 +24,6 @@ their own) and keeps the emulator faithful to the hardware rather than to any on
 - [Unicorn Engine](https://www.unicorn-engine.org/) — ARMv5 (ARM926EJ-S) CPU emulation
 - [Textual](https://textual.textualize.io/) — the interactive TUI
 - [sounddevice](https://python-sounddevice.readthedocs.io/) — real-time audio output
-- NumPy
 
 ## Repository layout
 

@@ -203,6 +203,22 @@ class AudioRing:
         return self.fill_bytes / (rate * FRAME_BYTES)
 
 
+def _peak_level(data: bytes) -> float:
+    """Peak amplitude of interleaved S16LE PCM as 0..1.
+
+    Samples sparsely (plenty for a level meter) to stay cheap in the audio
+    callback; ``memoryview.cast`` is a zero-copy typed view of the raw bytes.
+    """
+    samples = memoryview(data).cast("h")  # signed 16-bit, zero-copy
+    n = len(samples)
+    if not n:
+        return 0.0
+    step = max(1, n // 256)
+    window = samples[::step]
+    peak = max(max(window), -min(window))
+    return min(peak, 32768) / 32768.0
+
+
 class AudioOutput:
     """Real-time audio out via sounddevice, draining an :class:`AudioRing`.
 
@@ -234,10 +250,11 @@ class AudioOutput:
     def start(self) -> bool:
         """Open + start the output stream; False (with :attr:`error`) on failure."""
         try:
-            import numpy as np  # noqa: F401  (needed by the callback)
             import sounddevice as sd  # type: ignore[import-untyped]
 
-            stream = sd.OutputStream(
+            # RawOutputStream: the callback gets a raw interleaved S16LE byte
+            # buffer — the exact layout the ring already holds.
+            stream = sd.RawOutputStream(
                 samplerate=self.rate,
                 channels=2,
                 dtype="int16",
@@ -267,9 +284,10 @@ class AudioOutput:
                 pass
 
     # NB: runs on the PortAudio callback thread — keep it allocation-light.
+    # ``outdata`` is a raw writable byte buffer (RawOutputStream): interleaved
+    # S16LE stereo, exactly ``frames * FRAME_BYTES`` bytes — the same layout the
+    # ring holds, so PCM bytes copy straight in.
     def _callback(self, outdata: object, frames: int, _time: object, _status: object) -> None:
-        import numpy as np
-
         nbytes = frames * FRAME_BYTES
         if not self._playing:
             fill = self.ring.fill_bytes
@@ -278,12 +296,11 @@ class AudioOutput:
                 self.state = "playing"
             else:
                 self.state = "buffering" if fill else "idle"
-                outdata[:] = 0  # type: ignore[index]
+                outdata[:] = bytes(nbytes)  # type: ignore[index]  # silence
                 self.level = 0.0
                 return
         data, got = self.ring.pull(nbytes)
-        samples = np.frombuffer(data, dtype=np.int16).reshape(-1, 2)
-        outdata[:] = samples  # type: ignore[index]
+        outdata[:] = data  # type: ignore[index]
         if got == 0:
             self.underrun_blocks += 1
             self._silent_blocks += 1
@@ -298,7 +315,7 @@ class AudioOutput:
         else:
             self._silent_blocks = 0
             self.state = "playing"
-            self.level = float(np.abs(samples).max()) / 32768.0
+            self.level = _peak_level(data)
 
 
 # --- The emulation thread --------------------------------------------------------------

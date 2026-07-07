@@ -16,7 +16,6 @@ keywords = ["tiptoi", "emulator", "arm", "unicorn"]
 dependencies = [
     "unicorn>=2.0",
     "capstone>=5.0",
-    "numpy>=1.24",
     "textual>=0.60",
     "sounddevice>=0.4",
 ]
