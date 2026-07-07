@@ -46,6 +46,12 @@ pip install -e ".[dev]"                        # or: uv pip install -e ".[dev]"
 pytest                                         # the test suite (ruff + mypy are dev deps too)
 ```
 
+After the editable install, the `tt-emu` / `tt-emu-tui` commands — and `python -m tt_emu`
+/ `python -m tt_emu.tui` — work from the activated venv. This is a `src/`-layout package,
+so those `-m` invocations require the install (or `PYTHONPATH=src`); the `pyproject.toml`
+`pythonpath = ["src"]` setting only puts `src/` on the path for the pytest run, not for the
+CLI.
+
 ## The test-firmware toolchain
 
 `tests/firmware/` is a small, self-contained bare-metal ARM test harness: a `tt_test.h` SoC
