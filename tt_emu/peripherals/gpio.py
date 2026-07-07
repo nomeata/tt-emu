@@ -30,6 +30,8 @@ from __future__ import annotations
 import logging
 from typing import Callable
 
+from unicorn import UC_HOOK_MEM_READ
+
 from ..peripheral import MmioRegion, WordRegisterPeripheral
 
 log = logging.getLogger(__name__)
@@ -85,6 +87,12 @@ class GpioBlock(WordRegisterPeripheral):
         #: i.e. the app-init ``+0x24 = (GPIO11 == 1)`` sample sees 1, everything
         #: later (test chord, key scan, standby idle) sees 0.
         self._boot_power_button = True
+        #: A firmware write to the read-only GPIO_IN registers is pending
+        #: correction: on a RAM-backed page the raw store lands in the backing
+        #: RAM, so a one-shot read hook restores the composed word before the
+        #: next read (see :meth:`_arm_in_restore`). One flag suffices — GPIO_IN
+        #: writes are vanishingly rare (the real firmware never issues one).
+        self._in_restore_armed = False
         self.reset()
 
     @property
@@ -103,8 +111,75 @@ class GpioBlock(WordRegisterPeripheral):
         self._regs[GPIO_DIR0] = GPIO_DIR0_SEED
         self._regs[GPIO_PULL0] = GPIO_PULL0_SEED
         self._in_overrides.clear()
-        self._in_word = None
         self._boot_power_button = True
+        self._invalidate_in()
+
+    # --- RAM-backed register support (machine.py core page) ---------------------------
+
+    def read_hook_addrs(self) -> tuple[int, ...]:
+        # GPIO_IN is the firmware's hottest poll target and its read value is a
+        # pure function of state the model already tracks — it is served natively
+        # from RAM (re-``poke``d whenever an input changes; see _invalidate_in).
+        # The boot-held power button's read-once release is handled by a one-shot
+        # UC_HOOK_MEM_READ_AFTER armed when the power-hold latch is driven high.
+        return ()
+
+    def seed_ram(self, poke: Callable[[int, int], None]) -> None:
+        poke(self.base + GPIO_DIR0, self._regs.get(GPIO_DIR0, GPIO_DIR0_SEED))
+        poke(self.base + GPIO_PULL0, self._regs.get(GPIO_PULL0, GPIO_PULL0_SEED))
+        poke(self.base + GPIO_IN0, self.input_word())
+
+    def _arm_boot_release(self) -> None:
+        """Arm a brief read hook reproducing :meth:`read_reg`'s boot-button
+        release, but without a permanent callback on the 1.2M GPIO_IN reads.
+
+        The register page is RAM-backed, so ``read_reg`` never runs for GPIO_IN;
+        this hook stands in for it across the two reads where it matters. The
+        *first* GPIO_IN read after the power-hold latch went high is the
+        app-init ``+0x24`` sample (§7.3.1a): it must see the button still held —
+        the backing RAM already does, so the hook only clears the boot flag
+        (matching ``read_reg``'s "return held, then release"). The *next* read
+        pushes the released word and removes the hook, so every subsequent read
+        is native again."""
+        assert self.machine is not None
+        uc = self.machine.uc
+        addr = self.base + GPIO_IN0
+        fires = [0]
+
+        def on_read(_uc: object, _access: int, _addr: int, _size: int,
+                    _value: int, _ud: object) -> None:
+            fires[0] += 1
+            if fires[0] == 1:
+                # The sample: leave the held word the RAM already holds in place
+                # (this load reads it); latch the release for the next read.
+                self._boot_power_button = False
+            else:
+                self._invalidate_in()  # push the released word for this load on
+                log.info("GPIO11 power button released after the app-init sample")
+                uc.hook_del(handle)
+
+        handle = uc.hook_add(UC_HOOK_MEM_READ, on_read, begin=addr, end=addr + 3)
+
+    def _arm_in_restore(self) -> None:
+        """Undo a firmware write to a read-only GPIO_IN register: a one-shot read
+        hook re-pushes the composed input word (GPIO_IN0) and 0 (GPIO_IN1) to the
+        backing RAM before the next read samples them, restoring read-only
+        semantics without a permanent callback on the hot GPIO_IN read path."""
+        assert self.machine is not None
+        self._in_restore_armed = True
+        uc = self.machine.uc
+        in0 = self.base + GPIO_IN0
+
+        def restore(_uc: object, _access: int, _addr: int, _size: int,
+                    _value: int, _ud: object) -> None:
+            self.machine.poke_core_reg(in0, self.input_word())  # type: ignore[union-attr]
+            self.machine.poke_core_reg(self.base + GPIO_IN1, 0)  # type: ignore[union-attr]
+            self._in_restore_armed = False
+            uc.hook_del(handle)
+
+        # Cover both GPIO_IN words so a write to either is corrected on any read.
+        handle = uc.hook_add(UC_HOOK_MEM_READ, restore, begin=in0,
+                             end=self.base + GPIO_IN1 + 3)
 
     # --- device-model API ------------------------------------------------------------
 
@@ -119,12 +194,20 @@ class GpioBlock(WordRegisterPeripheral):
     def set_input(self, pin: int, level: int) -> None:
         """Drive input pin ``pin`` to ``level`` (device-model override of GPIO_IN)."""
         self._in_overrides[pin] = level & 1
-        self._in_word = None
+        self._invalidate_in()
 
     def clear_input(self, pin: int) -> None:
         """Stop driving ``pin``; it falls back to the idle base word."""
         self._in_overrides.pop(pin, None)
+        self._invalidate_in()
+
+    def _invalidate_in(self) -> None:
+        """Drop the memoized GPIO_IN word; when the register page is RAM-backed
+        (native reads), eagerly recompose it and push the value into the backing
+        RAM so the firmware's next native read sees the current input state."""
         self._in_word = None
+        if self.machine is not None and self.machine.ram_page_active:
+            self.machine.poke_core_reg(self.base + GPIO_IN0, self.input_word())
 
     def out_level(self, pin: int) -> int:
         """Current output-latch level of bank-0 ``pin``."""
@@ -188,12 +271,27 @@ class GpioBlock(WordRegisterPeripheral):
 
     def write_reg(self, offset: int, value: int) -> None:
         if offset == GPIO_IN0 or offset == GPIO_IN1:
-            return  # input registers are read-only
+            # Input registers are read-only. On a RAM-backed page the CPU store
+            # has already landed in the backing RAM (the write hook cannot veto
+            # it); restore the composed word before the next read.
+            if (not self._in_restore_armed and self.machine is not None
+                    and self.machine.ram_page_active):
+                self._arm_in_restore()
+            return
         old = self._regs.get(offset, GPIO_DIR0_SEED if offset == GPIO_DIR0 else 0)
         super().write_reg(offset, value)
         if offset == GPIO_OUT0 and old != value:
-            self._in_word = None  # bit16 mirrors the amp-enable latch (§1.1)
             self._notify(self._out_watchers, old, value)
+            if (old ^ value) & (1 << PIN_AMP_ENABLE):
+                self._invalidate_in()  # bit16 mirrors the amp-enable latch (§1.1)
+            if (self._boot_power_button and self.machine is not None
+                    and self.machine.ram_page_active
+                    and not (old >> PIN_POWER_HOLD) & 1
+                    and (value >> PIN_POWER_HOLD) & 1):
+                # GPIO15 0->1: the app-init just configured the power-hold pin;
+                # its GPIO11 sample is the next GPIO_IN read (§7.3.1a). Arm the
+                # one-shot that releases the boot-held button right after it.
+                self._arm_boot_release()
             if (old >> PIN_POWER_HOLD) & 1 and not (value >> PIN_POWER_HOLD) & 1:
                 # GPIO15 1->0: the pen released its own supply (§4).
                 log.info("GPIO15 power-hold released -> pen powered off")

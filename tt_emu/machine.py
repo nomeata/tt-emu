@@ -31,7 +31,9 @@ from unicorn import (
     UC_ERR_EXCEPTION,
     UC_HOOK_CODE,
     UC_HOOK_INTR,
+    UC_HOOK_MEM_READ,
     UC_HOOK_MEM_UNMAPPED,
+    UC_HOOK_MEM_WRITE,
     UC_MEM_WRITE_UNMAPPED,
     UC_MODE_ARM,
     UC_MODE_LITTLE_ENDIAN,
@@ -58,6 +60,21 @@ log = logging.getLogger(__name__)
 #: MMIO peripheral register window (datasheet 0x04000000–0x040AFFFF; safe cover).
 MMIO_BASE = 0x0400_0000
 MMIO_SIZE = 0x0020_0000
+
+#: The SoC "core" register page (SysCon, IntC/timer, GPIO, battery ADC — all at
+#: ``0x040000xx``). It holds the firmware's hottest polled registers: GPIO_IN
+#: (the button/OID input word) and the GPIO_OUT/GPIO_DIR pair the OID two-wire
+#: link bit-bangs, together ~4.3M of the ~5.5M MMIO accesses on a play session,
+#: overwhelmingly *reads*. An MMIO read costs a full C→Python callback round
+#: trip (~36× a native load, measured), so those poll loops crawl. The machine
+#: therefore backs this one page with **real memory**: reads run in TCG with no
+#: callback (the hardware model exposing the register as memory — the pen's
+#: silicon does exactly this), while writes — which carry side effects (OID
+#: clock edges, the power-hold latch) — are caught by a single
+#: ``UC_HOOK_MEM_WRITE`` and dispatched to the owning peripheral, and the few
+#: registers whose read value is *not* the last write (constants, self-clearing
+#: latches, computed status) keep a targeted ``UC_HOOK_MEM_READ``.
+CORE_PAGE_SIZE = 0x1000
 
 #: RAM / RAM-like regions: (base, size, description).  Sizes are the emulator's
 #: safe mapping cover (§2).  The two HW-config blocks are "RAM-like stub
@@ -116,6 +133,11 @@ class MachineConfig:
     trace_mmio: bool = False
     #: Max traced accesses per (address, direction) before muting.
     trace_mmio_limit: int = 8
+    #: Back the SoC core register page with real memory so the firmware's
+    #: hot busy-poll reads execute natively in TCG (see :data:`CORE_PAGE_SIZE`).
+    #: ``False`` restores the uniform all-MMIO window (the pre-optimization
+    #: model) — kept as a switch for A/B measurement and as a safe fallback.
+    ram_backed_core: bool = True
 
 
 @dataclass
@@ -171,7 +193,23 @@ class Machine:
         self.uc.ctl_set_cpu_model(UC_CPU_ARM_926)
         for base, size, _desc in RAM_REGIONS:
             self.uc.mem_map(base, size)
-        self.uc.mmio_map(MMIO_BASE, MMIO_SIZE, self._mmio_read, None, self._mmio_write, None)
+        #: MMIO callbacks receive an offset relative to the mmio_map base; when
+        #: the core page is real memory the map starts one page in, so add it
+        #: back to recover the MMIO_BASE-relative offset the dispatch uses.
+        self._mmio_off_adjust = 0
+        if self.config.ram_backed_core:
+            self.uc.mem_map(MMIO_BASE, CORE_PAGE_SIZE)  # core page = real memory
+            self.uc.mmio_map(MMIO_BASE + CORE_PAGE_SIZE, MMIO_SIZE - CORE_PAGE_SIZE,
+                             self._mmio_read, None, self._mmio_write, None)
+            self._mmio_off_adjust = CORE_PAGE_SIZE
+            # One write hook over the whole core page dispatches to the owning
+            # peripheral (side effects); the store itself lands in the backing
+            # RAM, which is exactly the read-back value for storage registers.
+            self.uc.hook_add(UC_HOOK_MEM_WRITE, self._core_write,
+                             begin=MMIO_BASE, end=MMIO_BASE + CORE_PAGE_SIZE - 1)
+        else:
+            self.uc.mmio_map(MMIO_BASE, MMIO_SIZE,
+                             self._mmio_read, None, self._mmio_write, None)
         self.uc.hook_add(UC_HOOK_INTR, self._on_intr)
         self.uc.hook_add(UC_HOOK_MEM_UNMAPPED, self._on_unmapped)
 
@@ -194,6 +232,37 @@ class Machine:
         if type(peripheral).tick is not Peripheral.tick:
             self._ticking.append(peripheral)
         peripheral.attach(self)
+        if self.config.ram_backed_core:
+            self._wire_ram_backed(peripheral)
+
+    def _in_core_page(self, addr: int) -> bool:
+        return MMIO_BASE <= addr < MMIO_BASE + CORE_PAGE_SIZE
+
+    def _wire_ram_backed(self, peripheral: Peripheral) -> None:
+        """Install read hooks + seed the backing RAM for a core-page peripheral."""
+        if not any(self._in_core_page(r.base) for r in peripheral.regions):
+            return
+        for addr in peripheral.read_hook_addrs():
+            self.uc.hook_add(UC_HOOK_MEM_READ, self._core_read_hook,
+                             begin=addr, end=addr + 3)
+        peripheral.seed_ram(self.poke_core_reg)
+
+    def poke_core_reg(self, addr: int, value: int) -> None:
+        """Write a 32-bit register value straight into the core-page backing RAM.
+
+        Used to seed power-on values and to push a *computed* native register
+        (e.g. the recomposed GPIO input word) when the model changes it without
+        a firmware write. A host-side store — it does not re-enter the write
+        hook.
+        """
+        self.uc.mem_write(addr, struct.pack("<I", value & 0xFFFFFFFF))
+
+    @property
+    def ram_page_active(self) -> bool:
+        """True when the SoC core register page is backed by real memory
+        (native reads); peripherals in that page use it to decide whether to
+        push computed read values into RAM (see :meth:`poke_core_reg`)."""
+        return self.config.ram_backed_core
 
     def _find_peripheral(self, addr: int) -> Peripheral | None:
         i = bisect_right(self._region_starts, addr) - 1
@@ -217,6 +286,7 @@ class Machine:
         return entry
 
     def _mmio_read(self, _uc: Uc, offset: int, size: int, _ud: object) -> int:
+        offset += self._mmio_off_adjust
         entry = self._mmio_cache.get(offset)
         if entry is None:
             entry = self._mmio_resolve(offset)
@@ -230,6 +300,7 @@ class Machine:
         return value
 
     def _mmio_write(self, _uc: Uc, offset: int, size: int, value: int, _ud: object) -> None:
+        offset += self._mmio_off_adjust
         entry = self._mmio_cache.get(offset)
         if entry is None:
             entry = self._mmio_resolve(offset)
@@ -240,6 +311,44 @@ class Machine:
             write(rel + offset, size, value)
         else:
             self._scratch[offset : offset + size] = value.to_bytes(size, "little")
+
+    # --- RAM-backed core page (see CORE_PAGE_SIZE) ---------------------------------
+
+    def _core_write(self, _uc: Uc, _access: int, addr: int, size: int,
+                    value: int, _ud: object) -> None:
+        """UC_HOOK_MEM_WRITE over the core page: run the peripheral's write side
+        effects. The CPU store still lands in the backing RAM afterwards (that
+        raw value is the read-back for storage registers); peripherals whose
+        read value differs keep a read hook, so what lands here is moot for them.
+        """
+        offset = addr - MMIO_BASE
+        entry = self._mmio_cache.get(offset)
+        if entry is None:
+            entry = self._mmio_resolve(offset)
+        periph, _read, write, rel = entry
+        if self.config.trace_mmio:
+            self._trace(addr, size, value, periph, is_write=True)
+        if write is not None:
+            write(rel + offset, size, value)
+
+    def _core_read_hook(self, uc: Uc, _access: int, addr: int, size: int,
+                        _value: int, _ud: object) -> None:
+        """UC_HOOK_MEM_READ for a behavioural core register (constant,
+        self-clearing, or computed): serve the model's value by writing it into
+        the backing RAM before the triggering load samples it (the read hook
+        fires ahead of the load, and a host store from the hook feeds it).
+        """
+        offset = addr - MMIO_BASE
+        entry = self._mmio_cache.get(offset)
+        if entry is None:
+            entry = self._mmio_resolve(offset)
+        periph, read, _write, rel = entry
+        if read is None:
+            return
+        value = read(rel + offset, size)
+        uc.mem_write(addr, value.to_bytes(size, "little"))
+        if self.config.trace_mmio:
+            self._trace(addr, size, value, periph, is_write=False)
 
     def _trace(self, addr: int, size: int, value: int, periph: Peripheral | None, *, is_write: bool) -> None:
         key = (addr, is_write)

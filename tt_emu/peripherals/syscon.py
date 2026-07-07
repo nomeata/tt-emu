@@ -63,6 +63,13 @@ class SysCon(WordRegisterPeripheral):
         super().reset()
         self._regs[REG_CLK_DIV] = CLK_DIV_SEED
 
+    def read_hook_addrs(self) -> tuple[int, ...]:
+        # CHIP_ID is a constant (writes ignored — a stray store must not stick);
+        # CLK_DIV and ANALOG_PD have self-clearing latch bits that read back 0.
+        # None is a busy-poll target, so keeping their read callback is free.
+        return (self.base + REG_CHIP_ID, self.base + REG_CLK_DIV,
+                self.base + REG_ANALOG_PD)
+
     def read_reg(self, offset: int) -> int:
         if offset == REG_CHIP_ID:
             return CHIP_ID

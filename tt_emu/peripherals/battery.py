@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+from typing import Callable
+
 from ..peripheral import MmioRegion, WordRegisterPeripheral
 
 ADC_CHANNEL = 0x60
@@ -45,6 +47,15 @@ class BatteryAdc(WordRegisterPeripheral):
     def reset(self) -> None:
         super().reset()
         self._regs[ADC_ENABLE] = ADC_ENABLE_SEED
+
+    def read_hook_addrs(self) -> tuple[int, ...]:
+        # ADC_DATA is a read-only constant (writes ignored); keep its callback so
+        # a stray store can't stick in the backing RAM. ADC_ENABLE reads back its
+        # last write and is served natively (seeded below).
+        return (self.base + ADC_DATA,)
+
+    def seed_ram(self, poke: Callable[[int, int], None]) -> None:
+        poke(self.base + ADC_ENABLE, self._regs.get(ADC_ENABLE, 0))
 
     def read_reg(self, offset: int) -> int:
         if offset == ADC_DATA:

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import abc
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Sequence
+from typing import TYPE_CHECKING, Callable, Sequence
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle guard
     from .machine import Machine
@@ -81,6 +81,37 @@ class Peripheral(abc.ABC):
 
     def reset(self) -> None:
         """Return the model to its power-on state."""
+
+    # --- RAM-backed register support (machine.py "core page" fast path) ---------------
+
+    def read_hook_addrs(self) -> Sequence[int]:
+        """Absolute word addresses whose reads must invoke :meth:`read`.
+
+        When the machine RAM-backs a register page (so the firmware's busy-poll
+        reads execute in TCG with no Python callback), most registers read back
+        the value last written to them — real memory serves those reads for
+        free. A register whose read value is **not** simply the last write —
+        a constant the firmware may overwrite, a self-clearing/latching bit, or
+        a live-computed status word — must instead keep a targeted read hook.
+        Peripherals list those registers' absolute addresses here; everything
+        else in their range is served natively from the backing RAM. Reads of
+        these are, by construction, rare (config/latch polls), so the hook cost
+        is negligible while the hot polled registers stay native.
+        """
+        return ()
+
+    def seed_ram(self, poke: "Callable[[int, int], None]") -> None:
+        """Preload the backing RAM with this peripheral's power-on read values.
+
+        Called once after attach for peripherals in a RAM-backed page. ``poke``
+        writes a 32-bit value to an absolute register address. Only registers
+        served natively (i.e. not in :meth:`read_hook_addrs`) whose reset value
+        is non-zero need seeding — the RAM starts zeroed. Registers that read
+        back their last write need no active upkeep afterwards (the firmware's
+        own store lands in the same RAM); a peripheral whose *computed* native
+        register changes without a firmware write (e.g. a recomposed input
+        word) re-``poke``s it from its own model code when it changes.
+        """
 
 
 class WordRegisterPeripheral(Peripheral):

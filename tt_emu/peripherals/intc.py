@@ -20,6 +20,8 @@ Other peripherals raise lines 0 (audio) / 6 (USB) via :meth:`assert_line` /
 
 from __future__ import annotations
 
+from typing import Callable
+
 from ..peripheral import MmioRegion, WordRegisterPeripheral
 from .gpio import GpioBlock
 
@@ -123,6 +125,17 @@ class IntcTimer(WordRegisterPeripheral):
         return bool(self.pending() & self._regs.get(INT_ENABLE, 0))
 
     # --- register behaviour ---------------------------------------------------------------
+
+    def read_hook_addrs(self) -> tuple[int, ...]:
+        # INT_PENDING / TIMER_STAT_CTRL are computed live; TIMER1_CTRL reads
+        # back with the write-only ACK bit masked off (not the raw store). All
+        # low-frequency, so keep their read callbacks; INT_ENABLE reads back its
+        # last write and is served natively from RAM (seeded below).
+        return (self.base + TIMER1_CTRL, self.base + TIMER_STAT_CTRL,
+                self.base + INT_PENDING)
+
+    def seed_ram(self, poke: Callable[[int, int], None]) -> None:
+        poke(self.base + INT_ENABLE, self._regs.get(INT_ENABLE, 0))
 
     def read_reg(self, offset: int) -> int:
         if offset == INT_PENDING:
