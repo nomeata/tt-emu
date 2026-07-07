@@ -32,10 +32,12 @@ from .loader import (
 )
 from .machine import Machine, MachineConfig
 from .nand_image import NandImage, build_nand_image
+from .peripherals.audio import AudioDma
 from .peripherals.battery import BatteryAdc
 from .peripherals.gpio import GpioBlock
 from .peripherals.intc import IntcTimer
-from .peripherals.nand import EccEngine, L2NandBuffer, NfcController
+from .peripherals.nand import EccEngine, NfcController
+from .peripherals.oid import OidSensor
 from .peripherals import stubs
 from .peripherals.syscon import SysCon
 from .peripherals.zc90b import Zc90bAuth
@@ -96,11 +98,20 @@ class BootedMachine:
         firmware: Firmware,
         zc90b: Zc90bAuth,
         nand: NandImage,
+        oid: OidSensor,
+        audio: AudioDma,
     ) -> None:
         self.machine = machine
         self.firmware = firmware
         self.zc90b = zc90b
         self.nand = nand
+        self.oid = oid
+        self.audio = audio
+
+    def tap(self, oid: int) -> None:
+        """Arm an OID tap; the firmware's own 40 ms poll captures and decodes
+        it (``oid-sensor.md`` §6)."""
+        self.oid.tap(oid)
 
 
 def build_machine(
@@ -111,6 +122,7 @@ def build_machine(
     nand_image: NandImage | None = None,
     a_files: dict[str, bytes] | None = None,
     b_files: dict[str, bytes] | None = None,
+    oid_answer_status_polls: bool = False,
 ) -> BootedMachine:
     """Build a machine, load the firmware, register peripherals, and seed boot state.
 
@@ -133,12 +145,16 @@ def build_machine(
     gpio = GpioBlock()
     intc = IntcTimer(gpio)
     zc90b = Zc90bAuth(gpio)
-    machine.add_peripheral(SysCon())
+    syscon = SysCon()
+    oid = OidSensor(gpio, answer_status_polls=oid_answer_status_polls)
+    audio = AudioDma(nfc, intc, syscon, gpio)
+    machine.add_peripheral(syscon)
     machine.add_peripheral(intc)
     machine.add_peripheral(gpio)
     machine.add_peripheral(BatteryAdc())
     machine.add_peripheral(zc90b)
-    machine.add_peripheral(L2NandBuffer(nfc))
+    machine.add_peripheral(oid)
+    machine.add_peripheral(audio)
     machine.add_peripheral(stubs.make_audio_clock_stub())
     machine.add_peripheral(nfc)
     machine.add_peripheral(ecc)
@@ -185,4 +201,4 @@ def build_machine(
         PROG_LOAD_ADDR,
         firmware.nandboot.size,
     )
-    return BootedMachine(machine, firmware, zc90b, nand)
+    return BootedMachine(machine, firmware, zc90b, nand, oid, audio)

@@ -227,6 +227,9 @@ class Machine:
     def write_u32(self, addr: int, value: int) -> None:
         self.uc.mem_write(addr, struct.pack("<I", value & 0xFFFFFFFF))
 
+    def read_u16(self, addr: int) -> int:
+        return struct.unpack("<H", self.uc.mem_read(addr, 2))[0]
+
     def read_u8(self, addr: int) -> int:
         return self.uc.mem_read(addr, 1)[0]
 
