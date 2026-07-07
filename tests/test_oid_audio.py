@@ -259,7 +259,9 @@ IPT = 20_000  # instructions per 20 ms tick
 
 @pytest.fixture()
 def audio_rig() -> tuple[Machine, AudioDma, IntcTimer, SysCon]:
-    machine = Machine(MachineConfig(instructions_per_tick=IPT))
+    # Faithful pacing: these tests verify the authentic §4 playback-paced
+    # line-0 completion (fast pacing, the default, is covered separately).
+    machine = Machine(MachineConfig(instructions_per_tick=IPT, dac_pacing="faithful"))
     gpio = GpioBlock()
     intc = IntcTimer(gpio)
     syscon = SysCon()
@@ -316,6 +318,25 @@ def test_audio_capture_and_paced_completion(audio_rig) -> None:
     # The ISR's kick-clear is the ACK (§3): line 0 must drop.
     audio.write(DMA_CTRL, 4, audio.read(DMA_CTRL, 4) & ~DMA_KICK)
     assert not intc.pending() & (1 << LINE_AUDIO)
+
+
+def test_fast_pacing_completes_without_the_playback_wait(audio_rig) -> None:
+    """``dac_pacing='fast'`` captures the identical bytes but signals completion
+    as soon as the tick loop runs — not after the buffer's playback duration —
+    so the firmware feeds audio at the emulator's own speed."""
+    machine, audio, intc, _syscon = audio_rig
+    machine.config.dac_pacing = "fast"
+    pattern = bytes(range(256)) * 4  # 0x400 bytes
+    machine.write_bytes(RING_PTR, pattern)
+    _submit(audio, RING_PTR, 0x400)
+
+    # Same capture as faithful pacing — only the completion timing differs.
+    assert audio.capture.chunks[0].data == pattern
+    # The playback-paced time is ~11609 instructions; fast pacing is ready far
+    # sooner — the very next tick delivers it.
+    audio.tick(1)
+    assert intc.pending() & (1 << LINE_AUDIO)
+    assert audio.completions == 1
 
 
 def test_audio_source_recovery_post_advance(audio_rig) -> None:

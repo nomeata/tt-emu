@@ -24,8 +24,8 @@ Architecture (all cross-platform, no firmware hooks — observation only):
   (the clock advances past ``PAUSE_INSTRUCTIONS`` with no new PCM) or a ~5 s
   cap is hit, hands the whole buffer to a *player thread*. The player does one
   blocking ``stream.write`` of the complete buffer — which cannot underrun
-  because all the PCM is already present. Each sound lags real time but plays
-  cleanly. **Degrades gracefully**: if PortAudio / an output device is missing
+  because all the PCM is already present. Each sound plays cleanly.
+  **Degrades gracefully**: if PortAudio / an output device is missing
   it reports "audio unavailable" and the TUI keeps running.
 * :class:`TtEmuApp` — the Textual app: state / tap / audio panels + a log.
 * **Firmware-aware debugger** — when the loaded image is the recognized 2N
@@ -295,7 +295,7 @@ class AudioOutput:
 
     ``start()`` never raises: on any failure (no PortAudio library, no output
     device, …) it records the error and the TUI shows "audio unavailable".
-    Each sound lags real time but plays cleanly and is intelligible.
+    Each sound is buffered and played complete, cleanly and intelligibly.
     """
 
     #: A firmware pause of this many emulated instructions ends one sound.
@@ -537,9 +537,11 @@ class EmulatorSession:
         yaml_path: str | Path | None = None,
         instructions_per_tick: int = SESSION_INSTRUCTIONS_PER_TICK,
         max_instructions: int = 1_000_000_000_000,
+        dac_pacing: str = "fast",
     ) -> None:
         self.firmware_path = str(firmware_path)
         self._ipt = instructions_per_tick
+        self._dac_pacing = dac_pacing
         self._max_instructions = max_instructions
         self._b_files: dict[str, bytes] = {}
         self.product_code: int | None = None
@@ -668,7 +670,11 @@ class EmulatorSession:
             # welcome-jingle window where the firmware discards it.
             booted = build_machine(
                 firmware,
-                MachineConfig(instructions_per_tick=self._ipt, chunk_instructions=2_000),
+                MachineConfig(
+                    instructions_per_tick=self._ipt,
+                    chunk_instructions=2_000,
+                    dac_pacing=self._dac_pacing,
+                ),
                 b_files=self._b_files or None,
             )
         except Exception as exc:  # noqa: BLE001 — surface any build failure in the UI
@@ -1264,7 +1270,7 @@ class TtEmuApp(App[None]):
         if 0 < snap.speed_ratio < 0.9:
             note = (
                 f"\n[dim]emulation at {snap.speed_ratio:.2f}x real time — each sound"
-                f" is buffered and plays one at a time, lagging real time[/dim]"
+                f" is buffered and played complete[/dim]"
             )
         return (
             f"{out_line}\n"
@@ -1446,6 +1452,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-audio", action="store_true", help="disable the sounddevice output stream"
     )
+    parser.add_argument(
+        "--dac-pacing", choices=("fast", "faithful"), default="fast",
+        help="fast (default): feed audio at the emulator's own speed for minimal "
+        "lag; faithful: pace to the pen's real audio timeline (real-time-slow, "
+        "for timing-sensitive testing)",
+    )
     return parser
 
 
@@ -1462,6 +1474,7 @@ def main(argv: list[str] | None = None) -> int:
         args.gme,
         yaml_path=args.yaml,
         instructions_per_tick=args.instructions_per_tick,
+        dac_pacing=args.dac_pacing,
     )
     audio = (
         None

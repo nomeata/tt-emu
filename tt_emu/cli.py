@@ -94,6 +94,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="write the captured audio (S16LE stereo) to FILE",
     )
     parser.add_argument(
+        "--dac-pacing", choices=("fast", "faithful"), default="fast",
+        help="fast (default): produce audio at the emulator's own speed; "
+        "faithful: pace to the pen's real audio timeline (captured PCM is "
+        "identical either way — this only affects emulated timing)",
+    )
+    parser.add_argument(
         "-v", "--verbose", action="count", default=0, help="-v: info, -vv: debug"
     )
     return parser
@@ -136,6 +142,7 @@ def run_headless(argv: list[str] | None = None) -> int:
         return MachineConfig(
             instructions_per_tick=args.instructions_per_tick or default_ipt,
             trace_mmio=args.trace_mmio,
+            dac_pacing=args.dac_pacing,
         )
 
     report: BootReport

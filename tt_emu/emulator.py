@@ -315,9 +315,11 @@ class Emulator:
         gmes: Iterable[str | Path] = (),
         yaml: str | Path | None = None,
         instructions_per_tick: int = SESSION_INSTRUCTIONS_PER_TICK,
+        dac_pacing: str = "fast",
     ) -> None:
         self._firmware = firmware
         self._ipt = instructions_per_tick
+        self._dac_pacing = dac_pacing
 
         game_paths: list[Path] = []
         if gme is not None:
@@ -361,7 +363,7 @@ class Emulator:
     def __enter__(self) -> "Emulator":
         firmware_path = ensure_firmware(self._firmware)
         firmware = load_upd(str(firmware_path))
-        config = MachineConfig(instructions_per_tick=self._ipt)
+        config = MachineConfig(instructions_per_tick=self._ipt, dac_pacing=self._dac_pacing)
         booted = build_machine(firmware, config, b_files=self._b_files or None)
         self._booted = booted
         self.machine = booted.machine

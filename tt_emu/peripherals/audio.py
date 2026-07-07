@@ -21,8 +21,11 @@ Extends the NAND L2-buffer model (:class:`~tt_emu.peripherals.nand.L2NandBuffer`
   spins on the flag), but the bytes are not captured;
 * **paced completion** (§4, ``interrupts-and-timers.md`` §7.4): top-level line 0
   is asserted ``len_bytes / (4 × rate)`` seconds after the submit, converted to
-  machine clock via ``instructions_per_tick`` (one tick = 20 ms). The system
-  tick is never touched (§4 ★ warning). The firmware's ISR clears the kick bit
+  machine clock via ``instructions_per_tick`` (one tick = 20 ms) under
+  ``MachineConfig.dac_pacing='faithful'``; the default ``'fast'`` signals
+  completion as soon as the run loop can, so the firmware feeds audio at the
+  emulator's own speed — identical PCM, far less lag. The system tick is never
+  touched (§4 ★ warning). The firmware's ISR clears the kick bit
   (``+0x00 &= ~0x10000``) — that write is the line-0 ACK (§3);
 * **sample rate** (§7 item 5): decoded from the DAC rate-divider field
   ``0x04000008`` bits[20:13] (``system-control-and-clock.md`` §4), scaled from
@@ -203,10 +206,16 @@ class AudioDma(L2NandBuffer):
             else:
                 self.capture.append(machine.clock, rate, data, audible=self._audible())
 
-        # Pace the completion: len/(4·rate) seconds; one tick = 20 ms (§4).
-        ticks_x_rate = length * 50  # (len / (4·rate)) / 0.02 s  ==  len·12.5/rate ticks
-        delay = max(1, (ticks_x_rate * machine.config.instructions_per_tick
-                        + 4 * rate - 1) // (4 * rate))
+        # Signal the completion. Faithful pacing waits len/(4·rate) seconds so
+        # the firmware runs on the pen's real audio timeline (§4); fast pacing
+        # signals as soon as the tick loop can deliver it, so the firmware
+        # feeds audio at the emulator's own speed — same PCM, far less lag.
+        if machine.config.dac_pacing == "faithful":
+            ticks_x_rate = length * 50  # (len / (4·rate)) / 0.02 s == len·12.5/rate ticks
+            delay = max(1, (ticks_x_rate * machine.config.instructions_per_tick
+                            + 4 * rate - 1) // (4 * rate))
+        else:
+            delay = 1
         self._complete_at = machine.clock + delay
 
     def _resolve_and_read(self, src: int, length: int) -> bytes | None:

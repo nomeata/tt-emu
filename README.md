@@ -57,9 +57,13 @@ tt-emu --gme game.gme --yaml book.yaml
 tt-emu --headless --gme game.gme --tap product --tap 4716 --wav out.wav
 ```
 
-In the TUI, tap the game's **product code** button first (the game mounts), then any
-content code. Audio plays at 22050 Hz; the emulator runs several times slower than the
-real pen, so live playback may pause to rebuffer — an emulation-speed limit, not a bug.
+In the TUI, tap the game's **product code** first (the game mounts), then any content
+code. Audio plays at 22050 Hz. By default the emulated DAC drains as fast as the emulator
+produces samples, so each sound is captured quickly, buffered, and played complete —
+keeping up with real time even though the emulator itself runs several times slower than
+the pen. Pass `--dac-pacing faithful` to run the audio on the pen's real timeline instead
+(real-time-slow playback), for testing timing-sensitive game behaviour; the captured audio
+is identical either way.
 
 ### The GME debugger
 

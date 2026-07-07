@@ -138,6 +138,23 @@ class MachineConfig:
     #: ``False`` restores the uniform all-MMIO window (the pre-optimization
     #: model) — kept as a switch for A/B measurement and as a safe fallback.
     ram_backed_core: bool = True
+    #: How the DAC signals buffer completion. The firmware feeds audio only as
+    #: fast as each submitted buffer "drains", so this sets the audio pace:
+    #: * ``"fast"`` (default): completion is signalled as soon as the run loop
+    #:   can deliver it, so the firmware produces audio at the emulator's own
+    #:   (decode-bound) speed. The captured PCM is identical; it just reaches
+    #:   the speaker with far less lag. Best for listening.
+    #: * ``"faithful"``: completion is paced to the buffer's true playback
+    #:   duration (``len/(4·rate)`` in emulated time), so the firmware runs on
+    #:   the pen's real audio timeline — for reproducing timing-sensitive
+    #:   behaviour at the cost of real-time-slow playback.
+    dac_pacing: str = "fast"
+
+    def __post_init__(self) -> None:
+        if self.dac_pacing not in ("fast", "faithful"):
+            raise ValueError(
+                f"dac_pacing must be 'fast' or 'faithful', got {self.dac_pacing!r}"
+            )
 
 
 @dataclass
