@@ -94,4 +94,4 @@ not distributed with the tool.
 
 ## License
 
-TBD.
+MIT — see [LICENSE](LICENSE). (The same license as tttool.)
