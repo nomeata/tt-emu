@@ -12,6 +12,11 @@ venv/
 .ruff_cache/
 .tox/
 
+# Nix
+result
+result-*
+.direnv/
+
 # Editors / OS
 *.swp
 .DS_Store

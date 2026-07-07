@@ -58,6 +58,14 @@ python -m tt_emu --gme game.gme          # the TUI; add --headless for the scrip
 The editable install above additionally puts the `tt-emu` console command on your PATH;
 it's a convenience, not a requirement for running the code.
 
+### Nix / NixOS
+
+`nix develop` drops you into a devShell with `arm-none-eabi-gcc` + `make` (for the
+test-firmware toolchain) and `PortAudio` / `libstdc++` on `LD_LIBRARY_PATH` — the native
+libraries the pip wheels `dlopen` at runtime, which NixOS otherwise doesn't expose on a
+global path (so live audio, in particular, works). Create the venv as above *inside* that
+shell.
+
 ## The test-firmware toolchain
 
 `tests/firmware/` is a small, self-contained bare-metal ARM test harness: a `tt_test.h` SoC
