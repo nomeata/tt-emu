@@ -7,6 +7,7 @@ full-boot integration test is skipped unless ``update3202MT.upd`` is present.
 
 from __future__ import annotations
 
+import logging
 import struct
 from pathlib import Path
 
@@ -152,6 +153,47 @@ def test_machine_irq_gated_by_cpsr_i() -> None:
     m.set_entry_state(0x08039100, 0x08420000, 0x13 | 0x80)  # IRQs MASKED
     m.run(m.config.chunk_instructions)
     assert m.irqs_delivered == 0
+
+
+# --- Machine: checkpoint hooks + semihosting ---------------------------------------
+
+
+def test_on_code_checkpoint_and_request_stop() -> None:
+    """`on_code` fires at the watched PC and `request_stop` ends the run cleanly."""
+    m = _bare_machine()
+    m.write_bytes(0x08000000, struct.pack("<I", 0xEAFFFFFE))  # b .
+    hits: list[int] = []
+
+    def checkpoint(mm: Machine) -> None:
+        hits.append(mm.pc)
+        mm.request_stop("checkpoint reached")
+
+    m.on_code(0x08000000, checkpoint)
+    m.set_entry_state(0x08000000, 0x08020000, 0x13)
+    result = m.run(10_000)
+    assert result.reason == "checkpoint reached"
+    assert hits and hits[0] == 0x08000000
+
+
+def test_semihosting_write0_logged(caplog: pytest.LogCaptureFixture) -> None:
+    """`svc 0xab` SYS_WRITE0 logs the NUL-terminated string (§1.1) and returns."""
+    m = _bare_machine()
+    code = struct.pack(
+        "<IIII",
+        0xE3A00004,  # mov r0, #4          (SYS_WRITE0)
+        0xE59F1004,  # ldr r1, [pc, #4]    (-> literal below)
+        0xEF0000AB,  # svc 0xab
+        0xEAFFFFFE,  # b .
+    ) + struct.pack("<I", 0x08000100)  # literal: message address
+    m.write_bytes(0x08000000, code)
+    m.write_bytes(0x08000100, b"hello from the blob\x00")
+    m.set_entry_state(0x08000000, 0x08020000, 0x13)
+    with caplog.at_level(logging.INFO, logger="tt_emu.machine"):
+        m.run(1_000)
+    assert "hello from the blob" in caplog.text
+    from unicorn.arm_const import UC_ARM_REG_R0
+
+    assert m.uc.reg_read(UC_ARM_REG_R0) == 0  # success return
 
 
 # --- ZC90B wire model -------------------------------------------------------------
