@@ -67,6 +67,15 @@ G_STATE_ADDR = 0x081D_B904
 STATE_STANDBY = 3
 STATE_BOOK = 13
 
+#: Human names of the observed statechart leaves (see :func:`statechart_leaf`).
+STATE_NAMES: dict[int, str] = {
+    0: "pre-statechart",
+    1: "splash",
+    3: "standby",
+    12: "mount",
+    13: "book",
+}
+
 #: QHsm statechart frame stack: 12-byte frames at 0x08007e80 + 12·depth (the
 #: boot seed QHSM_FRAME_ADDR is frame[0]), byte 0 = the state number, 0 =
 #: unused. The current leaf is the **deepest non-zero frame** (Observed: after

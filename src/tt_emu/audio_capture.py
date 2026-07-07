@@ -14,6 +14,7 @@ import struct
 import wave
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 __all__ = ["AudioCapture", "AudioStats", "CapturedChunk"]
 
@@ -56,9 +57,15 @@ class AudioCapture:
 
     def __init__(self) -> None:
         self.chunks: list[CapturedChunk] = []
+        #: Optional live-sample callback: invoked (from the emulating thread)
+        #: with every chunk as it is captured — e.g. a real-time audio sink.
+        self.listener: Callable[[CapturedChunk], None] | None = None
 
     def append(self, clock: int, rate: int, data: bytes, *, audible: bool = True) -> None:
-        self.chunks.append(CapturedChunk(clock, rate, bytes(data), audible))
+        chunk = CapturedChunk(clock, rate, bytes(data), audible)
+        self.chunks.append(chunk)
+        if self.listener is not None:
+            self.listener(chunk)
 
     @property
     def total_bytes(self) -> int:

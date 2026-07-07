@@ -109,6 +109,7 @@ class BootedMachine:
         nand: NandImage,
         oid: OidSensor,
         audio: AudioDma,
+        gpio: GpioBlock,
     ) -> None:
         self.machine = machine
         self.firmware = firmware
@@ -116,6 +117,7 @@ class BootedMachine:
         self.nand = nand
         self.oid = oid
         self.audio = audio
+        self.gpio = gpio
 
     def tap(self, oid: int) -> None:
         """Arm an OID tap; the firmware's own 40 ms poll captures and decodes
@@ -210,4 +212,4 @@ def build_machine(
         PROG_LOAD_ADDR,
         firmware.nandboot.size,
     )
-    return BootedMachine(machine, firmware, zc90b, nand, oid, audio)
+    return BootedMachine(machine, firmware, zc90b, nand, oid, audio, gpio)

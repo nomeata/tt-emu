@@ -47,7 +47,17 @@ python -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"      # installs the package + test deps
 pytest                       # run the test suite
 python -m tt_emu path/to/firmware.upd   # headless boot
+
+# interactive TUI: boot the pen, tap OID codes, hear the audio live
+tt-emu-tui path/to/firmware.upd --game path/to/game.gme
+python -m tt_emu.tui path/to/firmware.upd --game path/to/game.gme  # equivalent
 ```
+
+In the TUI, tap the game's **product code** button first (the game mounts), then any
+content code. Audio plays through sounddevice at 22050 Hz; since the emulator runs
+slower than the real pen (~a quarter of real time), playback pauses to rebuffer —
+that's an emulation-speed limit, not a bug. Without a working audio device the TUI
+runs silent and keeps capturing.
 
 tt-emu takes the pen's firmware as an input (like a ROM for a console emulator); it is
 not distributed with the tool.
