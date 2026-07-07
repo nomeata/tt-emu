@@ -86,6 +86,39 @@ With `--yaml book.yaml` (the tttool source of the loaded `.gme`, plus its siblin
 as `$eingabe` instead of `$2`, taps as `4716 "acht" → line 1/1`, media by name, and the
 matched YAML source line. Without a YAML everything works with raw numbers.
 
+### Scripting (Python API)
+
+For automation and testing of GMEs, drive the pen from Python. `tt_emu.Emulator` is a
+small, synchronous (no threads, no callbacks) context manager: you script taps and button
+presses and assert on the audio the firmware plays. It boots the real firmware into book
+mode on entry, mounts your `.gme`, and — with the game's tttool YAML — resolves OIDs and
+media by name.
+
+```python
+from tt_emu import Emulator
+
+with Emulator(gme="taschenrechner.gme", yaml="taschenrechner.yaml") as pen:
+    pen.tap("product")                 # mount the game (its product code)
+    pen.tap("acht")                    # tap an OID by symbolic name (or int code)
+    pen.expect_play("acht")            # run until it plays; assert the media name
+    pen.expect(pen.registers["eingabe"] == 8, "eingabe should be 8")
+    pen.wait("400ms")
+    pen.tap("neun")                    # the calculator now holds 89 ("neunundachtzig")
+    pen.expect_play("neun")            # spoken first; expect_play returns its Clip
+    pen.save_wav("session.wav")
+```
+
+Actions each advance the emulation and are their own statement — `tap(oid)` (int code,
+`"product"`, or a YAML script/OID name), `wait("400ms" | "2s" | ticks)`, `press("power" |
+"vol+" | "vol-")`, and the audio waits below. Assertions use the `-O`-safe helpers rather
+than bare `assert` (which `python -O` strips): `expect_play(media)` fuses "wait for the
+next playback" with "check its media" and returns the `Clip`, and `expect(cond, msg)`
+checks any condition with a clear message. The `wait_for_audio() -> Clip` primitive and the
+read-only properties — `state`, `state_chain`, `registers` (by `$`-name), `mounted`,
+`now_playing`, `transitions` — remain available for inspection and flexible pytest asserts.
+A returned `Clip` carries `.media` / `.index`, the captured `.pcm`, its `.duration`, and
+`.save_wav(path)`.
+
 ## Building & contributing
 
 tt-emu is built clean-room from a distilled set of hardware-interface documents in

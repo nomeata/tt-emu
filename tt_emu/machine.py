@@ -306,6 +306,18 @@ class Machine:
             self._stop_reason = reason
         self.uc.emu_stop()
 
+    def clear_stop(self) -> None:
+        """Clear a pending stop so :meth:`run` can be resumed.
+
+        The synchronous scripting API (:mod:`tt_emu.emulator`) steps the machine
+        as a sequence of bounded :meth:`run` calls, each ended from ``on_chunk``
+        with :meth:`request_stop`; clearing the latched reason between calls lets
+        the *same* machine resume forward. Does not touch CPU state, only the
+        run-loop's stop latch. (The threaded TUI worker never calls this — it
+        runs one open-ended :meth:`run`.)
+        """
+        self._stop_reason = None
+
     @property
     def stop_reason(self) -> str | None:
         return self._stop_reason

@@ -137,6 +137,40 @@ def statechart_leaf(machine: Machine) -> int:
     return leaf
 
 
+def book_ready_for_tap(machine: Machine, book_tail_at: int | None) -> bool:
+    """Is the pen ready to receive a tap in/after book mode?
+
+    The shared book-readiness gate (the ``_TapSession`` "book-wait" condition,
+    factored out so the interactive TUI worker and the synchronous scripting
+    :class:`~tt_emu.emulator.Emulator` gate taps identically rather than each
+    re-deriving it). A tap pressed during the book-entry jingle is captured and
+    silently discarded without mounting (``nand-image-layout.md`` §7.3.2), so a
+    product tap must wait until:
+
+    * the book-entry tail has run (``book_tail_at`` is set), and
+    * the statechart leaf is book(13), and
+    * the settle gap since book entry has elapsed, and
+    * the book-open jingle has drained (audio chain idle,
+      ``audio-dac-dma.md`` §3), and
+    * the AO event ring is drained (the pump is idle).
+
+    Once a product is mounted the pen is in-game, so content taps are receptive
+    immediately (the caller still spaces taps by the settle gap since the last
+    lift). Pure RAM reads — never writes firmware state.
+    """
+    if book_tail_at is None:
+        return False
+    if machine.read_u32(CURRENT_PRODUCT_ADDR) != 0:
+        return True  # a GME is mounted -> in-game, content taps are receptive
+    if statechart_leaf(machine) != STATE_BOOK:
+        return False
+    if machine.clock - book_tail_at < SETTLE_INSTRUCTIONS:
+        return False
+    if machine.read_u8(AUDIO_FLAGS_ADDR) & AUDIO_CHAIN_ACTIVE:
+        return False
+    return machine.read_u16(EVENT_RING_HEAD_ADDR) == machine.read_u16(EVENT_RING_TAIL_ADDR)
+
+
 @dataclass
 class BootReport:
     """Structured result of a headless boot run."""

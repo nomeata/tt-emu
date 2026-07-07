@@ -75,14 +75,12 @@ from .runner import (
     BOOK_ENTRY_TAIL_PC,
     CHECKPOINTS,
     CURRENT_PRODUCT_ADDR,
-    EVENT_RING_HEAD_ADDR,
-    EVENT_RING_TAIL_ADDR,
     FATAL_ADDRS,
     RESUME_BYTE_ADDR,
     SESSION_INSTRUCTIONS_PER_TICK,
     SETTLE_INSTRUCTIONS,
-    STATE_BOOK,
     STATE_NAMES,
+    book_ready_for_tap,
     gme_product_code,
     statechart_leaf,
 )
@@ -573,21 +571,11 @@ class EmulatorSession:
             self._book_tail_at = machine.clock
 
     def _ready_for_tap(self, machine: Machine, now: int) -> bool:
-        """Gate the product tap on book readiness (mirrors runner._TapSession's
-        book-wait): a tap pressed during the book-entry jingle is captured and
-        discarded without mounting. Once a product is mounted we are in-game, so
-        content taps proceed on the settle gap alone."""
-        if self._book_tail_at is None:
-            return False
-        if machine.read_u32(CURRENT_PRODUCT_ADDR) != 0:
-            return True  # already mounted -> in-game, content taps are receptive
-        if statechart_leaf(machine) != STATE_BOOK:
-            return False
-        if now - self._book_tail_at < SETTLE_INSTRUCTIONS:
-            return False
-        if machine.read_u8(AUDIO_FLAGS_ADDR) & AUDIO_CHAIN_ACTIVE:
-            return False  # book-open jingle still draining
-        return machine.read_u16(EVENT_RING_HEAD_ADDR) == machine.read_u16(EVENT_RING_TAIL_ADDR)
+        """Gate the product tap on book readiness — the shared
+        :func:`~tt_emu.runner.book_ready_for_tap` condition (a tap pressed
+        during the book-entry jingle is discarded without mounting; once a
+        product is mounted content taps proceed on the settle gap alone)."""
+        return book_ready_for_tap(machine, self._book_tail_at)
 
     def _on_chunk(self, machine: Machine) -> None:
         """Per-chunk callback on the emulation thread: apply commands, observe."""

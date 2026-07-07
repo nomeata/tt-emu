@@ -9,6 +9,7 @@ recipe (:mod:`tt_emu.boot`), and a headless runner (:mod:`tt_emu.runner`).
 from __future__ import annotations
 
 from .boot import BootedMachine, build_machine
+from .emulator import Clip, Emulator, ExpectationError, PenTimeout, ScriptingError
 from .loader import Firmware, load_upd
 from .machine import Machine, MachineConfig, RunResult
 from .peripheral import MmioRegion, Peripheral, WordRegisterPeripheral
@@ -17,12 +18,17 @@ from .runner import BootReport, boot_firmware
 __all__ = [
     "BootReport",
     "BootedMachine",
+    "Clip",
+    "Emulator",
+    "ExpectationError",
     "Firmware",
     "Machine",
     "MachineConfig",
     "MmioRegion",
+    "PenTimeout",
     "Peripheral",
     "RunResult",
+    "ScriptingError",
     "WordRegisterPeripheral",
     "boot_firmware",
     "build_machine",
