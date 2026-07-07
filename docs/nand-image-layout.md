@@ -607,19 +607,29 @@ itself, so this works for arbitrary GMEs):
 
 **Tap 1 — product OID at fresh standby → book mode (no mount yet).** The global
 classifier's *first-load* branch fires for any tapped code ≤ 0x3E7, gated on five
-bytes of firmware-produced state (no seeding — they arise naturally given the boot
-doc's frame seed and GPIO defaults; `akoid_buf` = the OID working buffer, pointer at
+bytes of firmware-produced state (`akoid_buf` = the OID working buffer, pointer at
 game-context `+0x20` — see the OID sensor doc):
 `akoid_buf[0] == 1` (pen-down, set by the decode), game-context `+0x1d == 2` (set
-by standby entry), `akoid_buf[0x21] == 0xFF` ("no product loaded", set by the OID
+by standby entry — **but see §7.3.1: the firmware itself flips this byte to 8 on
+the first standby heartbeat, so it does *not* "arise naturally" at tap time**),
+`akoid_buf[0x21] == 0xFF` ("no product loaded", set by the OID
 subsystem init and *preserved* only if the boot never runs the spurious root-exit —
 the frame-seed's purpose), the OID capture-state byte `0x08008C0D != 0xFF`
 (firmware-initialised), plus `akoid_buf[0xB3] == 0` (production-test flag; stays 0
 unless the test-mode button chord is held). It posts events 0x104A + 0x1058 →
 **state 12** (its entry
 scans `B:/` for `*.bnl` retail archives — an empty result is harmless) → 0x1059 →
-**book(13)**. Book entry zeroes the script context, clears `akoid_buf[0x21]`, and
+**book(13)**. Book entry zeroes the script context, clears `akoid_buf[0x21]`, sets
+game-context `+0x1d` back to 2, and
 plays the book-open system voice. **The GME is not mounted by this tap.**
+
+If the gate *fails*, the tap is **silently dropped**: the classifier passes the
+event through, the standby leaf's handler does not accept event 0x1060 (it is not
+in the small event set that handler reacts to), and nothing else consumes it — the
+statechart simply stays in standby(3). A run where taps decode perfectly
+(`akoid_buf+4` gets the OID) but the pen never leaves standby is this gate failing,
+and in practice the failing byte is `+0x1d` (Observed — both in the reference
+emulation and reproduced independently).
 
 **Tap 2 — the same product OID, in book(13) → the real mount.** The classifier
 gate now fails (`[0x21] == 0`), so the event reaches the book handler's OID
@@ -633,13 +643,81 @@ or no-match booklist: error voice 0x2D.
 
 **Tap 3 — a content OID → the script runs and media plays.**
 
-**Pacing** (Observed under emulation): arm each tap only at the event-pump idle
-(see the OID doc §6). Tap 1 should come reasonably soon after standby entry —
-prolonged no-product idling re-arms `+0x1d` from 2 to 8 and the standby auto-off
-(~300 heartbeats) powers the pen down. Before tap 2, the book-entry voice must
-reach EOF: the dispatch **stops audio before mounting** and spins until playback
-drains, so the audio model must deliver DMA-done completions to EOF. Between
-mount and tap 3, likewise let the pump go idle.
+### 7.3.1 The `+0x1d` standby window — why tap 1 needs help (★ read before implementing)
+
+Game-context byte `+0x1d` (base `0x080089a4`, i.e. `0x080089C1`) is the
+"fresh-standby" marker the tap-1 gate tests. Its lifecycle (Observed):
+
+- **Standby entry writes 2.**
+- The standby leaf's event handler accepts a small set of housekeeping events
+  (the periodic **0x1046 heartbeat** among them — the global heartbeat handler
+  deliberately lets it through to the current leaf). On the **first** accepted
+  event after standby entry, when the USB-session byte `+0x1e != 2` (it is 0 on
+  battery) and the resume byte `+0x24 == 0` (no `B:/FLAG.bin`), the handler
+  re-arms the sensor and **sets `+0x1d = 8`** ("idle mode"). Every *further*
+  accepted heartbeat increments the ~300-count auto-off counter. **Nothing inside
+  standby ever sets `+0x1d` back to 2.**
+- With the heartbeat at ~100 ms, the `+0x1d == 2` window after standby entry is
+  therefore **one heartbeat wide (≤ ~100 ms of emulated time)**. Any realistically
+  paced tap arrives at `+0x1d == 8`, fails the gate, and is dropped (see above).
+  This is a property of the unmodified firmware, not an emulator timing bug —
+  reordering event delivery cannot widen the window. (How a *physical* pen opens a
+  book from long-idle standby is unresolved — plausibly the sensor-wake path
+  re-enters standby entry, re-writing 2. Open question; do not block on it.)
+
+**What the reference emulation does (Observed, proven end-to-end):** present
+`+0x1d = 2` **at the classifier's first-load gate** — concretely: when execution
+reaches the gate's pen-down test (instruction address **`0x080380F4`**) with
+`akoid_buf[0] != 0` (a tap is actually being classified) **and** the current
+product id `*0x081da08c == 0` (nothing mounted), write game-context `+0x1d = 2`.
+This is a one-byte state presentation, scoped so tightly it is inert everywhere
+else: at tap 2 / in-book / in-game taps the byte is already 2 (book entry set it)
+and the gate outcome is decided by `akoid_buf[0x21]` anyway.
+**Never touch `akoid_buf[0x21]`** — it is the tap-1/tap-2 discriminator (0xFF at
+standby makes tap 1 open book mode; 0 at book(13), written by book entry, makes
+tap 2's gate *fail*, which is exactly what routes the event to the OID dispatch
+and the mount). Forcing `[0x21] = 0xFF` per-tap breaks the tap-2 mount (Observed).
+
+Alternatives, for the record (neither is reference-proven):
+
+- *Win the race*: arm the tap frame **before** standby entry (pen already on the
+  page during boot). The 40 ms OID poll can then decode and post 0x1060 ahead of
+  the first ~100 ms heartbeat. Authentic, but a phase race — fragile under model
+  timing changes (Inferred).
+- *Resume descent*: ship **`B:/FLAG.bin`** in the image. Splash then sets
+  `+0x24 = 1`, and at standby the first accepted heartbeat posts 0x1058 itself —
+  the pen descends to book(13) **autonomously, with no tap and no `+0x1d` gate**
+  (this is real-pen-observed post-update behaviour). Tap 1 becomes unnecessary;
+  the sequence shrinks to product-tap (mount) + content-tap. Side effects of the
+  FLAG.bin splash branch are not fully mapped (Inferred viability).
+
+### 7.3.2 Pacing (Observed in the reference emulation)
+
+Present taps as discrete, spaced events — pen down, frame served, pen lifted
+(GPIO9 back to idle-high) — and re-serve the same frame until the firmware's own
+decode has latched it (`akoid_buf+4 == N`, or code word `0x400000|N` at
+`akoid_buf+8`) before counting a tap as delivered. Then:
+
+- **Tap 1** (product): only once the statechart leaf is **standby(3)** and the
+  boot has settled (reference: system tick ≥ 0x100, or ~2 M emulated instructions
+  after IRQ delivery starts on a direct-to-standby boot). With the §7.3.1 gate
+  presentation in place there is no upper deadline except the ~300-heartbeat
+  auto-off (~30 s emulated).
+- **Tap 2** (product again): only once **all three** hold —
+  1. the statechart leaf is **book(13)**;
+  2. the **book-entry tail has run after tap 1**: book entry plays the book-open
+     voice and only *then* clears the pen-down flag and re-enables capture (the
+     tail instruction is at `0x08034850` — a convenient program-counter marker).
+     A tap presented while the entry voice is still playing gets its pen-down flag
+     wiped before dispatch and is lost. This is also where audio matters twice:
+     the voice must reach a real **EOF** (deliver DMA-done completions *paced*, on
+     the order of thousands of emulated instructions apart — instant back-to-back
+     completions can starve the decoder so EOF never comes), because the tap-2
+     dispatch **stops audio before mounting** and spins until playback drains;
+  3. a settle gap since tap 1's decode (reference: **~3 M emulated instructions**)
+     with the pen lifted in between.
+- **Tap 3** (content): same conditions relative to tap 2 — leaf still book(13),
+  pump idle again after the mount, settle gap elapsed.
 
 ### 7.4 Failure signatures — fast diagnosis (Observed mechanisms)
 
@@ -650,7 +728,7 @@ mount and tap 3, likewise let the pump go idle.
 | `.lst` open attempted with garbled path bytes (or fails), 0 reads on **both** drives' data | codepage NLS misload — path conversion broken; verify the codepage load served the real bin bytes (the cached NLS header at `0x081db748` must equal the codepage bin's bytes at file offset 0x2E0) |
 | `.lst` created, header only, count 0; **zero I/O ever in B's block range** | drive `b:` unregistered — B FAT invalid/absent at physical `fs_start + AddrCnt_A/32` (§7.1); and no `.gme` was on A: |
 | booklist count 0 → tap 2 yields voice 0x2D | discovery ran but wrote no records (combine with the rows above) |
-| tap 1 does nothing at standby | first-load gate bytes wrong — usually `akoid_buf[0x21] != 0xFF` (root-exit clobber → frame seed missing) or `+0x1d != 2` (tap too late / entry never ran) |
+| tap 1 decodes (`akoid_buf+4` = the OID) but the statechart stays at standby(3) | first-load gate failed and the 0x1060 was silently dropped. **Expected cause: `+0x1d == 8`** — the normal steady state one heartbeat after standby entry (§7.3.1); apply the scoped gate presentation. If `+0x1d` reads 2, check `akoid_buf[0x21] == 0xFF` (root-exit clobber → frame seed missing), then `0x08008C0D != 0xFF` / `akoid_buf[0xB3] == 0` |
 | tap 2 never reaches the mount | book-entry audio never reached EOF — the pre-mount audio-stop spins (audio completion model) |
 
 ### 7.5 Verification status
@@ -658,7 +736,10 @@ mount and tap 3, likewise let the pump go idle.
 - **Observed end-to-end** (reference emulation): image with the `.gme` reachable on
   **A:** → mount → standby-entry discovery (B: pass no-op, A: pass finds it) →
   booklist ≥ 1 → product-tap ×2 + content-tap → header match → media decodes and
-  plays.
+  plays. The reference run keeps exactly **one** non-hardware state presentation in
+  this chain: the scoped `+0x1d = 2` write at the classifier gate (§7.3.1). The
+  frame is otherwise decoded, classified, routed, mounted and played entirely by
+  unmodified firmware.
 - **Observed:** two-FAT image (A: system + B: game) → both drives register; B's
   VBR at physical 614 is read and accepted; mount returns success.
 - **NOT yet Observed (open):** the discovery B: pass *enumerating* placed B:

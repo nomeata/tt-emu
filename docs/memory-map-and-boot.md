@@ -355,9 +355,13 @@ hold; listed here because a from-entry boot that gets any of them wrong fails
   (2 = USB-session marker) or discovery is skipped; GPIO8 = 0 keeps it 0.
 - **Game-context byte `+0x1d` == 2 and `akoid_buf[0x21]` == 0xFF at the first
   product tap** (both firmware-written: standby entry / OID-subsystem init; the
-  frame seed above is what keeps `[0x21]` alive). Tap reasonably soon after standby
-  entry — prolonged no-product idling re-arms `+0x1d` to 8 and the ~300-heartbeat
-  auto-off powers the pen down.
+  frame seed above is what keeps `[0x21]` alive). Caution: `+0x1d` does **not**
+  stay 2 — the firmware itself flips it to 8 on the *first* standby heartbeat
+  (~100 ms after entry), after which a tap is silently dropped and the pen never
+  leaves standby. This one byte needs the scoped runtime presentation described in
+  `nand-image-layout.md` §7.3.1 (write 2 at the classifier gate while a tap is
+  pending and no product is mounted); "tapping soon after standby entry" is *not*
+  a workable fix. The ~300-heartbeat auto-off (~30 s) is the only deadline.
 
 The full mount→discovery→tap contract, tap sequence (product, product, content) and
 failure-signature table live in `nand-image-layout.md` §7.

@@ -293,6 +293,12 @@ firmware reads the pin exactly once per bit (Observed); tracking clock edges wor
   pulse widths. Respond per observed write/read, at emulated-instruction speed.
 - Arm taps **while the firmware is idle** (event pump drained, standby or book state
   reached). The 40 ms poll picks the frame up on its next firing.
+- A perfectly decoded tap can still be **dropped by the statechart**: at standby the
+  book-opening tap is gated on state bytes, one of which (`game_ctx+0x1d`) the firmware
+  itself invalidates ~one heartbeat (~100 ms) after standby entry. Getting the frame
+  decoded is the *transport* half only — for the tap→book-mount sequence, the required
+  state, the three-tap order (product, product, content) and inter-tap pacing, see
+  `nand-image-layout.md` §7.3–§7.3.2.
 - Avoid arming during a 32-bit status-poll window: the ~100 ms GPIO2 trigger pulse (§3.4)
   hitting an armed PRE frame advances it to ACK, where attention already reads 1 — the
   frame strands unconsumed. Arming between polls (i.e. when the firmware is at the pump
