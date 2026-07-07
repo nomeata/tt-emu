@@ -18,19 +18,26 @@ YAML.](docs/tui-screenshot.svg)
 
 ## Installation
 
-tt-emu is a Python package (3.10+, cross-platform: Linux / macOS / Windows). It installs
-two commands, `tt-emu` (headless) and `tt-emu-tui` (interactive). Use
-[uv](https://docs.astral.sh/uv/) (easiest — nothing to clone), pipx, or pip:
+tt-emu is a Python package (3.10+, cross-platform: Linux / macOS / Windows) that installs
+two commands, `tt-emu` (headless) and `tt-emu-tui` (interactive). Install it straight from
+GitHub with [uv](https://docs.astral.sh/uv/) — no clone, no PyPI:
 
 ```sh
-uv tool install tt-emu       # or:  pipx install tt-emu   /   pip install tt-emu
+uv tool install git+https://github.com/nomeata/tt-emu
 ```
 
-> Not on PyPI yet — until the first release, install from a checkout:
-> `git clone … && cd tt-emu && pip install .` (or `uv tool install .`).
+Or run it once without installing, using `uvx`:
 
-Interactive audio needs a working sound device; without one the tools still run and
-capture audio to a file.
+```sh
+uvx --from git+https://github.com/nomeata/tt-emu tt-emu-tui --game game.gme
+```
+
+pipx and pip take the same git URL if you prefer them (`pipx install
+git+https://github.com/nomeata/tt-emu`). To hack on tt-emu itself, clone it and see
+[BUILDING.md](BUILDING.md).
+
+Interactive audio needs a working sound device; without one the tools still run and capture
+audio to a file.
 
 ## Usage
 
