@@ -5,6 +5,10 @@ stop condition). With ``--tap`` a scripted session runs instead: boot to
 standby, inject the taps through the OID sensor model, capture the audio the
 firmware plays and (with ``--wav``) write it out — the full
 boot → tap product → tap content → WAV chain.
+
+The firmware argument is optional: when omitted, the official
+``update3202MT.upd`` is downloaded from Ravensburger's CDN, SHA-256 verified
+and cached (see :mod:`tt_emu.firmware_fetch`).
 """
 
 from __future__ import annotations
@@ -14,6 +18,7 @@ import logging
 import sys
 from pathlib import Path
 
+from .firmware_fetch import FirmwareDownloadError, FirmwareIntegrityError, ensure_firmware
 from .machine import MachineConfig
 from .runner import (
     SESSION_INSTRUCTIONS_PER_TICK,
@@ -34,7 +39,20 @@ def build_parser() -> argparse.ArgumentParser:
         prog="tt-emu",
         description="Headless tiptoi 2N ('MT') pen emulator — boot the real firmware.",
     )
-    parser.add_argument("firmware", help="path to update3202MT.upd")
+    parser.add_argument(
+        "firmware",
+        nargs="?",
+        default=None,
+        help="path to update3202MT.upd; omit to download the official firmware "
+        "from Ravensburger's CDN into the tt-emu cache (SHA-256 verified)",
+    )
+    parser.add_argument(
+        "--firmware-cache",
+        metavar="DIR",
+        default=None,
+        help="cache directory for the auto-downloaded firmware "
+        "(default: the platform cache dir, e.g. ~/.cache/tt-emu)",
+    )
     parser.add_argument(
         "-n",
         "--max-instructions",
@@ -96,6 +114,14 @@ def main(argv: list[str] | None = None) -> int:
         level = logging.DEBUG
     logging.basicConfig(level=level, format="%(levelname)s %(name)s: %(message)s")
 
+    # No firmware argument → resolve to the cached official download
+    # (SHA-256 verified; see firmware_fetch.py). An explicit path is used as-is.
+    try:
+        firmware = str(ensure_firmware(args.firmware, cache_dir=args.firmware_cache))
+    except (FirmwareDownloadError, FirmwareIntegrityError) as exc:
+        print(f"tt-emu: {exc}", file=sys.stderr)
+        return 1
+
     b_files: dict[str, bytes] = {}
     for game in args.game:
         p = Path(game)
@@ -120,7 +146,7 @@ def main(argv: list[str] | None = None) -> int:
     report: BootReport
     if taps:
         report = run_session(
-            args.firmware,
+            firmware,
             taps,
             flag_resume=args.flag_resume,
             wav_path=args.wav,
@@ -132,7 +158,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     else:
         report = boot_firmware(
-            args.firmware,
+            firmware,
             max_instructions=args.max_instructions or DEFAULT_BOOT_BUDGET,
             config=make_config(20_000),
             a_dir=args.a_dir,

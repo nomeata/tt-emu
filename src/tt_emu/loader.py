@@ -91,13 +91,21 @@ def _u32(buf: bytes, off: int) -> int:
     return struct.unpack_from("<I", buf, off)[0]
 
 
-def load_upd(path: str | Path) -> Firmware:
+def load_upd(path: str | Path | None = None) -> Firmware:
     """Parse an ``update3202MT.upd``-style container and extract the boot artifacts.
+
+    With ``path=None`` the official firmware is resolved via
+    :func:`tt_emu.firmware_fetch.ensure_firmware` (cached download, SHA-256
+    verified against the pinned hash).
 
     Raises :class:`UpdFormatError` on structural problems; sanity-checks the
     artifacts against the documented invariants (nandboot generation magic at
     +0x20, artifact bounds).
     """
+    if path is None:
+        from .firmware_fetch import ensure_firmware
+
+        path = ensure_firmware(None)
     path = Path(path)
     raw = path.read_bytes()
     if len(raw) < UPD_HEADER_SIZE:
