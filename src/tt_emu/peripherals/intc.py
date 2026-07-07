@@ -114,6 +114,12 @@ class IntcTimer(WordRegisterPeripheral):
 
     def irq_asserted(self) -> bool:
         """Machine-side delivery gate: ``(pending & enable) != 0`` (§3)."""
+        if not self._lines and not self._timer_latched:
+            # Fast path (polled every chunk): with nothing latched, only a
+            # live GPIO-scan cause could assert line 10 — and the scan is
+            # usually disarmed, so skip composing the pending word.
+            if not self._regs.get(TIMER_STAT_CTRL, 0) & STAT_GPIO_SCAN_ENABLE:
+                return False
         return bool(self.pending() & self._regs.get(INT_ENABLE, 0))
 
     # --- register behaviour ---------------------------------------------------------------

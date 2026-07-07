@@ -474,9 +474,14 @@ class EmulatorSession:
         self.post_event(f"loading firmware {Path(self.firmware_path).name} …")
         try:
             firmware = load_upd(self.firmware_path)
+            # chunk_instructions is pinned to the historical 2000: the
+            # interactive tap injection here (unlike runner._TapSession) is
+            # not gated on the book-entry settle window, and coarser chunks
+            # shift a held tap's first post-book-entry capture into the
+            # welcome-jingle window where the firmware discards it.
             booted = build_machine(
                 firmware,
-                MachineConfig(instructions_per_tick=self._ipt),
+                MachineConfig(instructions_per_tick=self._ipt, chunk_instructions=2_000),
                 b_files=self._b_files or None,
             )
         except Exception as exc:  # noqa: BLE001 — surface any build failure in the UI

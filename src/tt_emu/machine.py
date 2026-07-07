@@ -99,7 +99,19 @@ class MachineConfig:
     #: tick is a working cadence").
     instructions_per_tick: int = 20_000
     #: Instructions per ``emu_start`` chunk; bounds IRQ-delivery latency.
-    chunk_instructions: int = 2_000
+    #: ``None`` (the default) scales with the tick: ``instructions_per_tick
+    #: // 10``, i.e. IRQs are delivered within 10% of a timer period — the
+    #: same 2000-instruction chunk as before at the boot cadence of 20k/tick,
+    #: but far fewer Python-side chunk boundaries at the session cadence of
+    #: 1M/tick. Set explicitly to pin an exact chunk size.
+    chunk_instructions: int | None = None
+
+    @property
+    def effective_chunk(self) -> int:
+        """The chunk size :meth:`Machine.run` uses (see ``chunk_instructions``)."""
+        if self.chunk_instructions is not None:
+            return self.chunk_instructions
+        return max(1, self.instructions_per_tick // 10)
     #: Log every MMIO access to an address the first few times (diagnostics).
     trace_mmio: bool = False
     #: Max traced accesses per (address, direction) before muting.
@@ -141,8 +153,13 @@ class Machine:
         self.irqs_delivered = 0
 
         self._peripherals: list[Peripheral] = []
+        self._ticking: list[Peripheral] = []  # peripherals that override tick()
         self._region_starts: list[int] = []
         self._regions: list[tuple[int, int, Peripheral]] = []  # (start, end, periph)
+        #: Per-offset dispatch cache: offset -> (periph|None, read, write, base)
+        #: — resolves the bisect region lookup once per distinct MMIO address
+        #: (the firmware polls a small, fixed register set millions of times).
+        self._mmio_cache: dict[int, tuple[Peripheral | None, Callable | None, Callable | None, int]] = {}
         self._scratch = bytearray(MMIO_SIZE)  # §5.3 RAM-like fallback registers
         self._trace_counts: dict[tuple[int, bool], int] = {}
         self._stop_reason: str | None = None
@@ -172,7 +189,10 @@ class Machine:
             self._regions.append((region.base, region.end, peripheral))
         self._regions.sort(key=lambda r: r[0])
         self._region_starts = [r[0] for r in self._regions]
+        self._mmio_cache.clear()  # region map changed; re-resolve lazily
         self._peripherals.append(peripheral)
+        if type(peripheral).tick is not Peripheral.tick:
+            self._ticking.append(peripheral)
         peripheral.attach(self)
 
     def _find_peripheral(self, addr: int) -> Peripheral | None:
@@ -185,24 +205,39 @@ class Machine:
 
     # --- MMIO dispatch -------------------------------------------------------------
 
+    def _mmio_resolve(self, offset: int) -> tuple[Peripheral | None, Callable | None, Callable | None, int]:
+        """Resolve + cache the dispatch entry for one MMIO ``offset`` (hot path)."""
+        periph = self._find_peripheral(MMIO_BASE + offset)
+        entry: tuple[Peripheral | None, Callable | None, Callable | None, int]
+        if periph is None:
+            entry = (None, None, None, 0)
+        else:
+            entry = (periph, periph.read, periph.write, MMIO_BASE - periph.base)
+        self._mmio_cache[offset] = entry
+        return entry
+
     def _mmio_read(self, _uc: Uc, offset: int, size: int, _ud: object) -> int:
-        addr = MMIO_BASE + offset
-        periph = self._find_peripheral(addr)
-        if periph is not None:
-            value = periph.read(addr - periph.base, size)
+        entry = self._mmio_cache.get(offset)
+        if entry is None:
+            entry = self._mmio_resolve(offset)
+        periph, read, _write, rel = entry
+        if read is not None:
+            value = read(rel + offset, size)
         else:
             value = int.from_bytes(self._scratch[offset : offset + size], "little")
         if self.config.trace_mmio:
-            self._trace(addr, size, value, periph, is_write=False)
+            self._trace(MMIO_BASE + offset, size, value, periph, is_write=False)
         return value
 
     def _mmio_write(self, _uc: Uc, offset: int, size: int, value: int, _ud: object) -> None:
-        addr = MMIO_BASE + offset
-        periph = self._find_peripheral(addr)
+        entry = self._mmio_cache.get(offset)
+        if entry is None:
+            entry = self._mmio_resolve(offset)
+        periph, _read, write, rel = entry
         if self.config.trace_mmio:
-            self._trace(addr, size, value, periph, is_write=True)
-        if periph is not None:
-            periph.write(addr - periph.base, size, value)
+            self._trace(MMIO_BASE + offset, size, value, periph, is_write=True)
+        if write is not None:
+            write(rel + offset, size, value)
         else:
             self._scratch[offset : offset + size] = value.to_bytes(size, "little")
 
@@ -282,28 +317,38 @@ class Machine:
     ) -> RunResult:
         """Emulate forward up to ``max_instructions`` (or until a stop is requested).
 
-        Runs in chunks of ``config.chunk_instructions``; between chunks the
+        Runs in chunks of ``config.effective_chunk``; between chunks the
         peripherals tick (advancing model time) and a pending+enabled IRQ is
         delivered per ``interrupts-and-timers.md`` §3/§7.3.
         """
+        # Hoisted hot-loop locals: this loop runs once per chunk, and the
+        # attribute lookups add up over the millions of chunks of a session.
+        uc = self.uc
+        reg_read = uc.reg_read
+        emu_start = uc.emu_start
+        chunk_size = self.config.effective_chunk
+        ticking = self._ticking
+        intc = self.intc
+        deliver_irq = self._deliver_irq
         budget_end = self.clock + max_instructions
         while self._stop_reason is None and self.clock < budget_end:
-            chunk = min(self.config.chunk_instructions, budget_end - self.clock)
-            pc = self.uc.reg_read(UC_ARM_REG_PC)
-            if self.uc.reg_read(UC_ARM_REG_CPSR) & CPSR_T:
+            chunk = min(chunk_size, budget_end - self.clock)
+            pc = reg_read(UC_ARM_REG_PC)
+            if reg_read(UC_ARM_REG_CPSR) & CPSR_T:
                 pc |= 1  # resume in Thumb state
             self._fault = None
             try:
-                self.uc.emu_start(pc, _NEVER, count=chunk)
+                emu_start(pc, _NEVER, count=chunk)
             except UcError as err:
                 if not self._handle_emu_error(err):
                     break
             # The chunk may have ended early (emu_stop/fault); the approximation
             # only paces peripherals, so counting the full chunk is acceptable.
             self.clock += chunk
-            for peripheral in self._peripherals:
+            for peripheral in ticking:
                 peripheral.tick(self.clock)
-            self._maybe_deliver_irq()
+            if intc is not None and intc.irq_asserted():
+                deliver_irq()
             if on_chunk is not None:
                 on_chunk(self)
         reason = self._stop_reason or "instruction budget exhausted"
@@ -311,10 +356,11 @@ class Machine:
 
     # --- IRQ delivery (interrupts-and-timers.md §3) ---------------------------------
 
-    def _maybe_deliver_irq(self) -> bool:
-        """Deliver one IRQ if the controller asserts and the CPU accepts (§3)."""
-        if self.intc is None or not self.intc.irq_asserted():
-            return False
+    def _deliver_irq(self) -> bool:
+        """Deliver one asserted IRQ if the CPU accepts it (§3).
+
+        The caller (the run loop) has already checked ``intc.irq_asserted()``.
+        """
         cpsr = self.uc.reg_read(UC_ARM_REG_CPSR)
         if cpsr & CPSR_I or (cpsr & MODE_MASK) == MODE_IRQ:
             return False

@@ -99,6 +99,8 @@ class WordRegisterPeripheral(Peripheral):
         self._regs: dict[int, int] = {}
 
     def read(self, offset: int, size: int) -> int:
+        if size == 4 and not offset & 3:  # fast path: the firmware's usual access
+            return self.read_reg(offset) & 0xFFFFFFFF
         word = self.read_reg(offset & ~3) & 0xFFFFFFFF
         shift = (offset & 3) * 8
         return (word >> shift) & ((1 << (size * 8)) - 1)

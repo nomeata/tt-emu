@@ -64,6 +64,10 @@ class GpioBlock(WordRegisterPeripheral):
         self._out_watchers: dict[int, list[PinWatcher]] = {}
         self._dir_watchers: dict[int, list[PinWatcher]] = {}
         self._in_overrides: dict[int, int] = {}
+        #: Memoized :meth:`input_word` (None = recompose). GPIO_IN is the
+        #: firmware's hottest poll target; the composition only changes on
+        #: set_input/clear_input or an output-latch write.
+        self._in_word: int | None = None
         self.reset()
 
     @property
@@ -82,6 +86,7 @@ class GpioBlock(WordRegisterPeripheral):
         self._regs[GPIO_DIR0] = GPIO_DIR0_SEED
         self._regs[GPIO_PULL0] = GPIO_PULL0_SEED
         self._in_overrides.clear()
+        self._in_word = None
 
     # --- device-model API ------------------------------------------------------------
 
@@ -96,10 +101,12 @@ class GpioBlock(WordRegisterPeripheral):
     def set_input(self, pin: int, level: int) -> None:
         """Drive input pin ``pin`` to ``level`` (device-model override of GPIO_IN)."""
         self._in_overrides[pin] = level & 1
+        self._in_word = None
 
     def clear_input(self, pin: int) -> None:
         """Stop driving ``pin``; it falls back to the idle base word."""
         self._in_overrides.pop(pin, None)
+        self._in_word = None
 
     def out_level(self, pin: int) -> int:
         """Current output-latch level of bank-0 ``pin``."""
@@ -110,12 +117,17 @@ class GpioBlock(WordRegisterPeripheral):
         return (self._regs.get(GPIO_DIR0, 0) >> pin) & 1
 
     def input_word(self) -> int:
-        """Compose the live GPIO_IN bank-0 word (§8 item 2)."""
-        word = GPIO_IN_IDLE
-        for pin, level in self._in_overrides.items():
-            word = (word & ~(1 << pin)) | (level << pin)
-        # bit16 mirrors the amp-enable output latch (§1.1).
-        word = (word & ~(1 << PIN_AMP_ENABLE)) | (self.out_level(PIN_AMP_ENABLE) << PIN_AMP_ENABLE)
+        """Compose the live GPIO_IN bank-0 word (§8 item 2; memoized)."""
+        word = self._in_word
+        if word is None:
+            word = GPIO_IN_IDLE
+            for pin, level in self._in_overrides.items():
+                word = (word & ~(1 << pin)) | (level << pin)
+            # bit16 mirrors the amp-enable output latch (§1.1).
+            word = (word & ~(1 << PIN_AMP_ENABLE)) | (
+                self.out_level(PIN_AMP_ENABLE) << PIN_AMP_ENABLE
+            )
+            self._in_word = word
         return word
 
     def gpio_int_trigger(self) -> int:
@@ -147,6 +159,7 @@ class GpioBlock(WordRegisterPeripheral):
         old = self._regs.get(offset, GPIO_DIR0_SEED if offset == GPIO_DIR0 else 0)
         super().write_reg(offset, value)
         if offset == GPIO_OUT0 and old != value:
+            self._in_word = None  # bit16 mirrors the amp-enable latch (§1.1)
             self._notify(self._out_watchers, old, value)
             if (old >> PIN_POWER_HOLD) & 1 and not (value >> PIN_POWER_HOLD) & 1:
                 # GPIO15 1->0: the pen released its own supply (§4).
