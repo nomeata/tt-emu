@@ -28,6 +28,7 @@
           packages = with pkgs; [
             python3           # create the venv: pip/uv install -e .
             uv                # uv venv / uv pip, if you prefer it to pip
+            ruff              # linter (the nixpkgs build runs on NixOS; the wheel doesn't)
             gcc-arm-embedded  # arm-none-eabi-gcc/objcopy: the test-firmware toolchain
             gnumake           # the tests/firmware Makefile
           ];
