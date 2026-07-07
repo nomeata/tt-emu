@@ -80,8 +80,17 @@ HAL_LEAF_TIMER_ADDR = 0x07FF_E740
 NAND_ROW_CYCLES_ADDR = 0x0800_79E0
 NAND_ROW_CYCLES = 3
 
-#: CPU entry state (§5.2).
-SVC_STACK_TOP = 0x0842_0000
+#: CPU entry state (§5.2). DOC GAP (found empirically; refines §5.2's
+#: "SP = 0x08420000"): the stack must live **inside the pen's real 4-MiB RAM**
+#: ``[0x08000000, 0x08400000]`` — the firmware's ``Utl_UStr*`` string
+#: routines validate every pointer against exactly that range and silently
+#: no-op on stack-resident strings otherwise (their guard:
+#: ``addr + 0xF8000000 <= 0x400000``). With the doc's 0x08420000 the game
+#: discovery scan builds its ``"B:/"``/``"A:/"`` root paths on the stack,
+#: the copy is rejected, and the enumeration silently opens a garbage path
+#: (booklist count 0). The firmware itself never references addresses above
+#: ~0x081E0000, so the top of real RAM is free for the stack.
+SVC_STACK_TOP = 0x0840_0000
 CPSR_SVC_IRQS_ON = 0x13  # SVC mode (0x13), ARM state, I = 0
 
 #: A small ARM stub returning 1 (`mov r0,#1; bx lr`), planted at HAL_LEAF_TIMER

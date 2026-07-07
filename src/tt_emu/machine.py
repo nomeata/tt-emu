@@ -76,7 +76,10 @@ RAM_REGIONS: tuple[tuple[int, int, str], ...] = (
 #: The loaded image's IRQ vector (nandboot vector table at 0x08000000, +0x18).
 IRQ_VECTOR = 0x0800_0018
 #: IRQ-mode stack top set on first delivery (§3: emulator-chosen, proven).
-IRQ_STACK_TOP = 0x0841_F000
+#: Must lie inside the pen's real 4-MiB RAM window — the firmware's Utl_UStr*
+#: routines reject pointers outside [0x08000000, 0x08400000] (see
+#: boot.SVC_STACK_TOP); 64 KiB below the SVC stack top keeps them disjoint.
+IRQ_STACK_TOP = 0x083F_0000
 
 CPSR_I = 0x80  # IRQ disable
 CPSR_T = 0x20  # Thumb state

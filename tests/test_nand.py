@@ -70,10 +70,13 @@ def test_decode_sub_sector_all_modes() -> None:
             assert decode_byte_offset(0x100, k * eccsize, eccsize) == 0x20000 + k * 512
 
 
-def test_tag_key_is_row_base() -> None:
-    assert tag_key(0x8600) == 256 * 134
-    assert tag_key(0x8613) == 256 * 134 + 8 * 0x13
-    assert tag_key(255) == 8 * 255  # metadata row (sparse block-0 row space)
+def test_tag_key_is_raw_row() -> None:
+    """Tags are keyed by the raw row (§4.2): a unit ≥ 32 of a block's window
+    aliases the next blocks' *data* linearly but owns its own spare tag."""
+    assert tag_key(0x8600) == 0x8600
+    assert tag_key(0x8613) == 0x8613
+    assert tag_key(255) == 255  # metadata row (sparse block-0 row space)
+    assert tag_key(0x8620) != tag_key(0x8700)  # unit 32 != next block's page 0
     assert AU_SECS == 8
 
 
@@ -99,10 +102,20 @@ def test_image_erase_shadows_data_and_tags() -> None:
 
 
 def test_head_tag_format() -> None:
-    tag = make_head_tag(480)  # B:'s first block is logical 480 (§6 step 5)
+    tag = make_head_tag(60)  # B:'s first NFTL block is logical 60 (VBLOCK doc gap)
     assert tag[0] == 1 and tag[0] & 0x80 == 0     # seq, not obsolete
     assert tag[2:4] == b"\xfd\xff"                # 0xfffd chain end
-    assert struct.unpack("<H", tag[4:6])[0] == 480 | 0x8000
+    assert struct.unpack("<H", tag[4:6])[0] == 60 | 0x8000
+
+
+def test_unit_tag_format() -> None:
+    from tt_emu.nand_image import make_unit_tag
+
+    tag = make_unit_tag(60)  # the firmware's append-form unit tag (Observed)
+    assert tag[0] == 0 and tag[1] == 0
+    assert tag[2:4] == b"\xfd\xff"                       # chain end
+    assert struct.unpack("<H", tag[4:6])[0] == 60        # bit 15 clear
+    assert struct.unpack("<H", tag[6:8])[0] == 1         # own = 0x0001
 
 
 # --- FAT16 builder -------------------------------------------------------------------
@@ -223,19 +236,29 @@ class _Rig:
             tag = bytes(self.m.read_bytes(SRAM_WINDOW, 8))
         return data, tag
 
-    def program_au(self, row: int, data: bytes, tag: bytes, *, mode: int = 2) -> None:
-        """§8.2 PROGRAM: setup, per-record stage-to-window + flush strobe, commit."""
+    def program_au(self, row: int, data: bytes, tag: bytes, *, mode: int = 2,
+                   record_size: int = 512) -> None:
+        """§8.2 PROGRAM: setup, per-record stage-to-window + flush strobe, commit.
+
+        ``record_size`` is the data-record payload (512, or the runtime FAT
+        driver's 1024). Records longer than the 512-B window are staged in
+        512-B slabs at window offset 0 with one drain poll each (Observed
+        protocol) — the parity scales with the sectors per record.
+        """
         parity = 7 * mode + 7 if mode < 4 else 14 * mode - 14
         self._stage([0x40064, *self._addr_cycles(0, row, final_prog=True)])
         self._go()
-        records = [data[i : i + 512] for i in range(0, len(data), 512)] + [tag]
+        records = [data[i : i + record_size] for i in range(0, len(data), record_size)]
+        records.append(tag)
         for rec in records:
             payload = len(rec)
+            rec_parity = parity * max(payload // 512, 1)
             self.ecc.write(0, 4, (payload << 7) | (mode << 21) | 0x100015 | 8)
-            self._stage([((payload + parity - 1) << 11) | 0x129])
+            self._stage([((payload + rec_parity - 1) << 11) | 0x129])
             self._go()
-            self.m.write_bytes(SRAM_WINDOW, rec)
-            assert self.l2.read(0x10, 4) >> 16 == 0  # drained
+            for s in range(0, payload, 512):  # <=512-B slabs at window offset 0
+                self.m.write_bytes(SRAM_WINDOW, rec[s : s + 512])
+                assert self.l2.read(0x10, 4) >> 16 == 0  # drain poll per slab
             self.l2.write(0, 4, (1 << 12) | (4 << 8) | 0x800)  # flush strobe
             self.l2.write(0, 4, (4 << 8) | 0x800)              # re-attach
         self._stage([0x8065])  # cmd 0x10 + LAST
@@ -306,6 +329,37 @@ def test_nfc_program_read_round_trip() -> None:
     assert rtag == tag
 
 
+def test_nfc_program_round_trip_1024_byte_records() -> None:
+    """The runtime FAT driver's write path: 1024-B records staged through the
+    512-B circular window in two slabs with a drain poll each (Observed).
+    A capture-at-strobe model sees only the window's final state and commits
+    one slab duplicated — the write round-trip corruption behind 'discovery
+    persists 0 games'. The record must be assembled slab by slab."""
+    img = NandImage()
+    rig = _Rig(img)
+    payload = bytes((i * 31 + (i >> 7)) & 0xFF for i in range(AU_SIZE))
+    assert payload[:512] != payload[512:1024]  # halves must be distinguishable
+    tag = make_head_tag(60)
+    rig.program_au((618 << 8) | 5, payload, tag, record_size=1024)
+    data, rtag = rig.read_au((618 << 8) | 5, 0, AU_SIZE)
+    assert data == payload
+    assert rtag == tag
+
+
+def test_nfc_unit_tags_do_not_alias_block_page0() -> None:
+    """§4.2 raw-row tag keys: programming unit 32 of a block's row window
+    (whose *data* lands in the next physical block) must not disturb that
+    block's own page-0 tag — the mount scan reads it to classify the block."""
+    img = NandImage()
+    rig = _Rig(img)
+    rig.program_au((614 << 8) | 32, b"\xa5" * AU_SIZE, make_head_tag(60))
+    # data lands linearly in the next block...
+    assert img.read(615 * BLOCK_SIZE, 4) == b"\xa5" * 4
+    # ...but block 615's own page-0 tag row stays erased (free-pool view).
+    _, tag = rig.read_au(615 << 8, 8 * ECCSIZE, 0, want_tag=True)
+    assert tag == b"\xff" * 8
+
+
 def test_nfc_erase_shadows_placed_content() -> None:
     img = NandImage()
     img.program(140 * BLOCK_SIZE, b"static content")
@@ -374,9 +428,13 @@ def test_image_builder_layout() -> None:
     vbr_b = img.read((FS_START + A_BLOCKS) * BLOCK_SIZE, 512)
     assert vbr_b[0x36:0x3E] == b"FAT16   "
     assert vbr_b[43:54].rstrip() == b"TIPTOI"
-    # A block 134 head tag: logical 0; B block 614: logical 480 (§6 step 5)
-    assert struct.unpack("<H", img.get_tag(134 * 256)[4:6])[0] == 0x8000
-    assert struct.unpack("<H", img.get_tag(614 * 256)[4:6])[0] == 480 | 0x8000
+    # Head tags per 1-MiB NFTL block (VBLOCK doc gap): A's first span is
+    # logical 0 at block 134, B's is logical 60 at block 614; the span's
+    # interior units carry append-form unit tags in the base row window.
+    assert struct.unpack("<H", img.get_tag(134 << 8)[4:6])[0] == 0x8000
+    assert struct.unpack("<H", img.get_tag(614 << 8)[4:6])[0] == 60 | 0x8000
+    assert struct.unpack("<H", img.get_tag(614 << 8 | 1)[4:6])[0] == 60  # unit tag
+    assert img.get_tag(615 << 8) == b"\xff" * 8  # follower page-0 row stays blank
 
 
 # --- Boot smoke test: the mount checkpoint ------------------------------------------

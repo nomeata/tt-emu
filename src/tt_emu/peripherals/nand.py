@@ -57,9 +57,22 @@ def decode_byte_offset(row: int, col: int, eccsize: int) -> int:
 
 
 def tag_key(row: int) -> int:
-    """Tag-store key for a row: the AU's flat sector base (tags are keyed by
-    the row base, never by sub-sector — §4.2)."""
-    return ROW_STRIDE * (row >> 8) + AU_SECS * (row & 0xFF)
+    """Tag-store key for a row: the **raw row itself** (tags are keyed by the
+    row base, never by sub-sector — §4.2; and never flattened to sector
+    indices — a row with unit ≥ 32 aliases the next blocks' *data* linearly
+    but owns a spare tag distinct from their page-0 tags)."""
+    return row
+
+
+def _sector_eccsize(nbytes: int, payload: int) -> int:
+    """Per-sector on-bus record size (512 + parity — the §4.1 ``eccsize``).
+
+    A data record moves ``payload/512`` consecutive sectors; ``nbytes`` (the
+    data micro-op's byte count) is payload + parity for **all** of them, so
+    one sector's eccsize is ``nbytes / nsec`` (identity for 512-B records).
+    """
+    nsec = max(payload // SECTOR_SIZE, 1)
+    return nbytes // nsec
 
 
 # --- ECC engine 0x0405B000 (§6) -------------------------------------------------------
@@ -162,6 +175,10 @@ class NfcController(WordRegisterPeripheral):
         self._bytes_done = 0  # data bytes already served/captured this transaction
         self._pend_prog = 0          # payload bytes awaiting the L2 flush strobe
         self._pend_prog_eccsize = SECTOR_SIZE
+        #: Program-record bytes already drained from the window (a >512-B
+        #: record is staged through the circular window in 512-B slabs, one
+        #: drain poll each — see :meth:`on_level_poll`).
+        self._prog_staged = bytearray()
         self._cb_src: tuple[int, int] | None = None
         #: Outstanding >512-B read record streaming through the circular
         #: window, with the fill-poll count since its data op (see
@@ -281,16 +298,18 @@ class NfcController(WordRegisterPeripheral):
         """0x119: deposit one record into the SRAM window (§8.1 / §10).
 
         ``payload`` (the bytes that cross the window) comes from the ECC config
-        word; ``nbytes`` is payload+parity = the record's eccsize, which decodes
-        the column into a sub-sector. payload >= 512 → the next data record
-        (records advance by their own payload size — the boot loader uses
-        1024-B records, the runtime driver 512-B ones); < 512 → the row's tag,
-        truncated to the descriptor's tag length (the boot-stage metadata reads
-        use 4-byte tags = the §2.1 spare magics; the NFTL uses 8).
+        word; ``nbytes`` is payload+parity, from which the per-sector record
+        size (``eccsize``, §4.1) that decodes the column into a sub-sector is
+        derived. payload >= 512 → the next data record (records advance by
+        their own payload size — the boot loader and the runtime FAT driver
+        use 1024-B records, single-sector paths 512-B ones); < 512 → the
+        row's tag, truncated to the descriptor's tag length (the boot-stage
+        metadata reads use 4-byte tags = the §2.1 spare magics; the NFTL
+        uses 8).
         """
         payload = self.ecc.payload_len or min(nbytes, SECTOR_SIZE)
         if payload >= SECTOR_SIZE:
-            offset = decode_byte_offset(self._row, self._col, nbytes - payload + SECTOR_SIZE)
+            offset = decode_byte_offset(self._row, self._col, _sector_eccsize(nbytes, payload))
             data = self.flash.read(offset + self._bytes_done, payload)
             self._bytes_done += payload
         else:
@@ -307,20 +326,43 @@ class NfcController(WordRegisterPeripheral):
         self.l2_level = 8
 
     def _data_program(self, nbytes: int) -> None:
-        """0x129: arm a program record; bytes are captured on the L2 flush strobe."""
+        """0x129: arm a program record.
+
+        The CPU stages the record through the circular window in <=512-B
+        slabs, polling the drain (level == 0) once after each slab —
+        :meth:`on_level_poll` captures them; the L2 flush strobe commits the
+        assembled record (§8.2 steps b–d).
+        """
         self._pend_prog = self.ecc.payload_len or min(nbytes, SECTOR_SIZE)
-        self._pend_prog_eccsize = nbytes
+        self._pend_prog_eccsize = _sector_eccsize(nbytes, self._pend_prog)
+        self._prog_staged = bytearray()
         self.l2_level = 0  # program path polls level == 0 (drained), §7
 
     def on_level_poll(self) -> None:
-        """A BUF_STATUS fill-level read: advance an outstanding read stream.
+        """A BUF_STATUS fill-level read: advance the record streaming through
+        the 512-B circular window (§7), in whichever direction is armed.
 
-        The k-th poll since the data op precedes the CPU's copy of 64-byte
-        chunk k-1 (Observed, one poll per chunk). Chunks 0..7 were deposited
-        eagerly; each later poll deposits the chunk about to be consumed at
-        its wrapped window offset — modelling the controller refilling the
-        circular buffer as the CPU drains it (§7).
+        **Read path**: the k-th poll since the data op precedes the CPU's copy
+        of 64-byte chunk k-1 (Observed, one poll per chunk). Chunks 0..7 were
+        deposited eagerly; each later poll deposits the chunk about to be
+        consumed at its wrapped window offset — modelling the controller
+        refilling the circular buffer as the CPU drains it.
+
+        **Program path**: the CPU memcpys each <=512-B slab of the armed
+        record to window offset 0, then polls the drain once (Observed:
+        ``(memcpy 512, poll) × 2, strobe`` for the runtime driver's 1024-B
+        records; §8.2 step c). The poll is the moment the controller has
+        consumed the slab — capture it into the staged-record buffer, or a
+        longer record would wrap the window and overwrite its first half
+        (the write round-trip corruption of a capture-at-strobe model).
         """
+        if self._pend_prog:
+            remaining = self._pend_prog - len(self._prog_staged)
+            if remaining > 0:
+                assert self.machine is not None
+                chunk = min(remaining, SRAM_WINDOW_SIZE)
+                self._prog_staged += self.machine.read_bytes(SRAM_WINDOW, chunk)
+            return
         if self._stream is None:
             return
         chunk = self._stream_polls  # 0-based index of the chunk copied next
@@ -338,9 +380,12 @@ class NfcController(WordRegisterPeripheral):
     def l2_strobe(self, op: int) -> None:
         """BUF_CTRL strobe on buffer 4 (from :class:`L2NandBuffer`, §7/§10).
 
-        op 1 = flush/commit: capture the staged record from the window —
-        >= 512 B → program the next data record at the decoded offset;
-        < 512 B → store the row's tag. op 0 = attach/reset (clears the level).
+        op 1 = flush/commit the armed program record — the slabs drained at
+        the level polls, plus any tail still sitting in the window (§8.2
+        steps c–d guarantee a poll per slab, so the tail is at most one
+        window's worth): >= 512 B → program the next data record at the
+        decoded offset; < 512 B → store the row's tag. op 0 = attach/reset
+        (clears the level).
         """
         self.l2_level = 0
         if op != 1 or not self._pend_prog:
@@ -348,22 +393,18 @@ class NfcController(WordRegisterPeripheral):
         assert self.machine is not None
         payload = self._pend_prog
         self._pend_prog = 0
+        data = bytes(self._prog_staged[:payload])
+        self._prog_staged = bytearray()
+        while len(data) < payload:  # un-polled tail (a slab per iteration)
+            data += self.machine.read_bytes(
+                SRAM_WINDOW, min(payload - len(data), SRAM_WINDOW_SIZE)
+            )
         if payload >= SECTOR_SIZE:
-            data = self._capture(payload)
-            eccsize = self._pend_prog_eccsize - payload + SECTOR_SIZE
-            offset = decode_byte_offset(self._row, self._col, eccsize)
+            offset = decode_byte_offset(self._row, self._col, self._pend_prog_eccsize)
             self.flash.program(offset + self._bytes_done, data)
             self._bytes_done += payload
         else:
-            self.flash.set_tag(tag_key(self._row), self._capture(payload))
-
-    def _capture(self, count: int) -> bytes:
-        """Read ``count`` staged bytes back out of the circular window (§7)."""
-        assert self.machine is not None
-        if count <= SRAM_WINDOW_SIZE:
-            return self.machine.read_bytes(SRAM_WINDOW, count)
-        window = self.machine.read_bytes(SRAM_WINDOW, SRAM_WINDOW_SIZE)
-        return bytes(window[i & (SRAM_WINDOW_SIZE - 1)] for i in range(count))
+            self.flash.set_tag(tag_key(self._row), data)
 
     # --- copy-back (§8.6) -----------------------------------------------------------------
 

@@ -74,3 +74,19 @@ Found during Step 2c/2d (code fixed or precisely characterized):
 - **oid-sensor.md §7.3** — the standby **decode-vs-(+0x1d re-arm) timing**: the model must
   deliver pen-down and the classified OID in one dispatch (or classify on the first gameplay
   poll), else the first-load gate loses the fresh-standby race. (Open.)
+
+Found during the write-round-trip fix (gap 1, code fixed — fold into docs):
+- **nand-and-nfc-controller.md §7/§10** — the runtime FAT driver programs **1024-byte** records
+  staged through the 512-B SRAM window as two 512-B slabs (one drain poll each); a model must
+  capture each slab at its poll, not only at the final flush (else the last slab is duplicated
+  and every FS program is corrupted `data[:512]==data[512:]`).
+- **nand-image-layout.md §4** — the NFTL **logical block is 1 MiB (8 physical blocks)**: COW head
+  tags carry the 1-MiB-block number and row addressing is linear across the 8-block span (row
+  carries from `base<<8|0xFF` into the next block; unit reaches 255). Tag each span's base block
+  (head `logical=(base−FS_START)/8`); key tags by the **raw row** `block<<8|unit`, not a flattened
+  sector base (which aliases neighbour page-0 tags and destroys the span). This closes the old
+  "B: enumerates 0 entries" issue.
+- **memory-map-and-boot.md §2/§5** — the SVC/IRQ **stacks must live inside `[0x08000000,0x08400000)`**;
+  `Utl_UStr*` validates every pointer against that range and silently no-ops out-of-range strings,
+  so a stack above `0x08400000` makes discovery build garbage `"B:/"/"A:/"` paths. Use SVC top
+  `0x08400000`, IRQ top `0x083F0000`.

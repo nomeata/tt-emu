@@ -32,6 +32,7 @@ __all__ = [
     "NandImage",
     "build_nand_image",
     "make_head_tag",
+    "make_unit_tag",
     "BLOCK_SIZE",
     "NUM_BLOCKS",
     "SECTOR_SIZE",
@@ -39,6 +40,7 @@ __all__ = [
     "FS_START",
     "A_BLOCKS",
     "B_BLOCKS",
+    "VBLOCK_BLOCKS",
 ]
 
 # --- Geometry (nand-and-nfc-controller.md §2) --------------------------------------
@@ -67,6 +69,31 @@ B_ADDRCNT = B_BLOCKS * AUS_PER_BLOCK   # 0x8000
 #: FAT volume sizes (§6 step 4: A 60 MiB = full span; B 64 MiB example size).
 A_VOLUME_BYTES = A_BLOCKS * BLOCK_SIZE
 B_VOLUME_BYTES = 64 * 1024 * 1024
+
+#: DOC GAP (found empirically; refines ``nand-image-layout.md`` §4/§6 step 5):
+#: the NFTL's **logical block is 1 MiB** — 2048 sectors = 256 four-KiB program
+#: units — spanning **8 physical 128-KiB blocks**. The firmware's runtime row
+#: addressing is linear across the span (``row + 1`` = the next 4-KiB unit,
+#: carrying from ``base<<8 | 0xFF`` into the next physical block), its
+#: write-pointer probe scans all 256 unit tags of a span, and its own COW
+#: tags carry ``[4:6] = the 1-MiB logical block number`` (Observed: the COW
+#: chain for A:'s first MiB is tagged logical 0 while writing units > 31).
+#: Consequently the §6 step-5 per-128-KiB-block head tags are 8× off in both
+#: alignment and numbering; the misnumbering is invisible for content within
+#: the first MiB of a partition (which is why the doc's recipe *appears* to
+#: work) but leaves every later logical block unmapped — the documented
+#: "B: enumerates 0 entries" open issue (§7.5/§8) is exactly B:'s VBR block
+#: (logical 60) having no head tag. The builder therefore numbers head tags
+#: per 8-block span (``logical = (base − FS_START)/8``) and tags **only the
+#: span's base block**: follower blocks hold their placed data with blank
+#: tags — the authentic state of a partially-appended logical block (the
+#: firmware's own format writes tags only up to each block's write pointer;
+#: the runtime row addressing reaches follower data linearly regardless of
+#: their tags). Tagging followers as additional same-logical chain ends is
+#: wrong: the mount's duplicate-head arbitration keeps one block and
+#: **erases** the rest (Observed — it destroyed the placed span).
+VBLOCK_BLOCKS = 8
+VBLOCK_BYTES = VBLOCK_BLOCKS * BLOCK_SIZE
 
 #: Metadata rows (nand-image-layout.md §2.1; map rows 200/201 are the free
 #: emulator choice named in the bin entry table).
@@ -110,15 +137,45 @@ def make_head_tag(logical_block: int, *, seq: int = 1, own: int = 0xFFFF) -> byt
     return struct.pack("<BBHHH", seq, 0, 0xFFFD, (logical_block & 0x7FFF) | 0x8000, own)
 
 
+def make_unit_tag(logical_block: int, *, obsolete: bool = False) -> bytes:
+    """Build the tag of a placed non-head unit (page) of an NFTL logical block.
+
+    Byte-for-byte the tag the firmware's own append path writes on every unit
+    it programs (Observed): ``{[0]=0, [1]=0, [2:4]=the member's chain-next
+    (0xfffd = chain end for a single placed member), [4:6]=logical`` (head-
+    valid bit 15 **clear**) ``, [6:8]=0x0001}``. These tags are what make the
+    placed content part of the logical block's *write pointer*: the runtime's
+    descending unit-tag probe stops at the last non-blank tag, so appends land
+    after the placed content instead of zero-padding over it (a blank tag
+    reads as an erased page — read-modify-writes then merge 0xFF over placed
+    sectors, Observed).
+
+    ``obsolete`` sets bit 7 of ``[0]`` — the firmware stamps it on the
+    **physical-block-leading** units (page 0 of each 128-KiB block after the
+    span's base, Observed on its own appends) so the mount's per-block scan
+    classifies those blocks as span content instead of competing chain heads
+    (non-obsolete same-logical page-0 tags make the duplicate-head arbitration
+    erase all but one block of the span, Observed).
+    """
+    return struct.pack(
+        "<BBHHH", 0x80 if obsolete else 0, 0, 0xFFFD, logical_block & 0x7FFF, 0x0001
+    )
+
+
 class NandImage:
     """Sparse NAND backing store: data blocks + per-AU spare tags (§10).
 
     Data is addressed by **flat byte offset** into the concatenated 2048-byte
     data pages (the controller's §4.2 decode produces these offsets); tags are
-    keyed by the AU's flat 512-B sector base ``256*block + 8*au`` ("keyed by
-    the row base, never by sub-sector", §4.2). Unwritten blocks read erased
-    (``0xFF`` data, blank tags); an erase drops a block's data *and* tags so it
-    shadows any placed content (§6 step 7).
+    keyed by the **raw row** ``block << 8 | unit`` ("keyed by the row base,
+    never by sub-sector", §4.2 — and never flattened: the FS write path uses
+    unit values ≥ 32, whose *data* aliases the following blocks' bytes
+    linearly, but whose spare tags are distinct from those blocks' page-0
+    tags — collapsing the keys makes the mount scan misread a placed span's
+    interior unit tags as neighbour-block head claims and erase the span,
+    Observed). Unwritten rows read erased (``0xFF`` data, blank tags); an
+    erase drops a block's data *and* its 256 row tags so it shadows any
+    placed content (§6 step 7).
     """
 
     def __init__(self) -> None:
@@ -161,21 +218,21 @@ class NandImage:
             pos += chunk
 
     def erase_block(self, block: int) -> None:
-        """Erase a 128-KiB block: data reads 0xFF, all its tags dropped (§8.3)."""
+        """Erase a 128-KiB block: data reads 0xFF, all its row tags dropped (§8.3)."""
         self.erases += 1
         self._blocks.pop(block, None)
-        base = block * SECTORS_PER_BLOCK
-        for key in [k for k in self._tags if base <= k < base + SECTORS_PER_BLOCK]:
+        base = block << 8
+        for key in [k for k in self._tags if base <= k < base + 0x100]:
             del self._tags[key]
 
     # --- tags -----------------------------------------------------------------------
 
-    def get_tag(self, sector_base: int) -> bytes:
-        """The 8-byte spare tag of the AU at ``sector_base`` (blank = erased)."""
-        return self._tags.get(sector_base, BLANK_TAG)
+    def get_tag(self, row: int) -> bytes:
+        """The 8-byte spare tag of ``row`` = ``block<<8 | unit`` (blank = erased)."""
+        return self._tags.get(row, BLANK_TAG)
 
-    def set_tag(self, sector_base: int, tag: bytes) -> None:
-        self._tags[sector_base] = bytes(tag[:8].ljust(8, b"\xff"))
+    def set_tag(self, row: int, tag: bytes) -> None:
+        self._tags[row] = bytes(tag[:8].ljust(8, b"\xff"))
 
     def tag_count(self) -> int:
         return len(self._tags)
@@ -187,7 +244,7 @@ class NandImage:
         self.program(offset, data)
 
     def tag_au(self, block: int, au: int, tag: bytes) -> None:
-        self.set_tag(block * SECTORS_PER_BLOCK + au * (AU_SIZE // SECTOR_SIZE), tag)
+        self.set_tag(block << 8 | au, tag)
 
 
 # --- Metadata payload builders (nand-image-layout.md §2.2/§2.3, §6 step 6) ----------
@@ -278,29 +335,51 @@ def _place_bin(img: NandImage, data: bytes, start_block: int, *, logical_base: i
             img.tag_au(block, au, make_head_tag(logical_base + b, own=block))
 
 
-def _place_fat_volume(img: NandImage, vol: Fat16Volume, start_block: int) -> int:
-    """Place a FAT16 volume at ``start_block`` per §6 step 5; return blocks placed.
+def _place_fat_volume(
+    img: NandImage, vol: Fat16Volume, start_block: int
+) -> list[tuple[int, int]]:
+    """Place a FAT16 volume at ``start_block``; return the placed spans as
+    ``(logical block, partition-relative base block)`` pairs (map entries).
 
-    128-KiB slices that are entirely 0x00 or 0xFF are skipped (unallocated
-    clusters stay erased = free pool), **except** slices overlapping the FAT
-    system area (reserved + FATs + root directory), which the firmware reads
-    even when zero-filled — skipping one would serve 0xFF for real FAT/root
-    sectors. Head-tag logical numbers are relative to FS_START for both
-    partitions (§6 step 5).
+    Placement granularity is the NFTL's **1-MiB logical block** (the
+    :data:`VBLOCK_BLOCKS` doc gap): a span with live content — bytes that are
+    not uniformly 0x00/0xFF, or any part of the FAT system area (reserved +
+    FATs + root directory, which the firmware reads even when zero-filled) —
+    is placed in full and tagged like a freshly-appended single-member chain:
+    unit 0 carries the head tag (``logical = (base − FS_START)/8 | 0x8000``),
+    every further placed unit the firmware's append-form unit tag
+    (:func:`make_unit_tag`) — so the mount maps the base block as the
+    logical block's head, classifies the follower blocks as its chain
+    content (not free-pool, not competing heads), and the runtime's
+    write-pointer probe places appends *after* the placed content.
+    Content-free spans stay fully erased (the free pool). Logical numbers
+    are 1-MiB blocks relative to ``FS_START`` for both partitions — B's
+    first span is logical 60.
     """
+    if (start_block - FS_START) % VBLOCK_BLOCKS:
+        raise ValueError("partition base must be aligned to the 1-MiB NFTL block")
     sys_bytes = vol.system_sectors * SECTOR_SIZE
-    placed = 0
-    for s in range(0, len(vol.data), BLOCK_SIZE):
-        chunk = bytes(vol.data[s : s + BLOCK_SIZE])
-        forced = s < sys_bytes
-        if not forced and (chunk.count(0) == len(chunk) or chunk.count(0xFF) == len(chunk)):
+    spans: list[tuple[int, int]] = []
+    for s in range(0, len(vol.data), VBLOCK_BYTES):
+        chunk = bytes(vol.data[s : s + VBLOCK_BYTES])
+        live = s < sys_bytes or not (
+            chunk.count(0) == len(chunk) or chunk.count(0xFF) == len(chunk)
+        )
+        if not live:
             continue
-        block = start_block + s // BLOCK_SIZE
-        img.place(block * BLOCK_SIZE, chunk)
-        for au in range((len(chunk) + AU_SIZE - 1) // AU_SIZE):
-            img.tag_au(block, au, make_head_tag(block - FS_START))
-        placed += 1
-    return placed
+        base_block = start_block + s // BLOCK_SIZE
+        logical = (base_block - FS_START) // VBLOCK_BLOCKS
+        img.place(base_block * BLOCK_SIZE, chunk)
+        # Unit tags live in the *base block's row window* (row = base<<8 |
+        # unit, unit up to 255) — where the runtime's write-pointer probe and
+        # page reads look. The neighbour blocks' own page-0 rows (what the
+        # mount scan reads) stay blank, exactly as the firmware's appends
+        # leave them.
+        for unit in range((len(chunk) + AU_SIZE - 1) // AU_SIZE):
+            tag = make_head_tag(logical) if unit == 0 else make_unit_tag(logical)
+            img.set_tag(base_block << 8 | unit, tag)
+        spans.append((logical, base_block - FS_START))
+    return spans
 
 
 # --- The recipe (nand-image-layout.md §6) --------------------------------------------
@@ -343,14 +422,11 @@ def build_nand_image(
     # (block 0's sparse row space maps into unused blocks 6/7 — module docstring).
     for row, magic, payload in _metadata_rows():
         img.place(row * AU_SIZE, payload)
-        img.set_tag(row * (AU_SIZE // SECTOR_SIZE), struct.pack("<I", magic) + b"\xff" * 4)
+        img.set_tag(row, struct.pack("<I", magic) + b"\xff" * 4)
 
     # Factory bad-block bitmap at row 2 (see ROW_BADBLOCK_BITMAP doc-gap note):
     # all-zero = no factory bad blocks; tag u32 = replica/"times" counter.
     img.place(ROW_BADBLOCK_BITMAP * AU_SIZE, bytes(METADATA_PAYLOAD))
-    img.set_tag(
-        ROW_BADBLOCK_BITMAP * (AU_SIZE // SECTOR_SIZE),
-        struct.pack("<I", 1) + b"\xff" * 4,
-    )
+    img.set_tag(ROW_BADBLOCK_BITMAP, struct.pack("<I", 1) + b"\xff" * 4)
 
     return img
