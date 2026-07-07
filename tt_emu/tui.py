@@ -18,9 +18,11 @@ Architecture (all cross-platform, no firmware hooks — observation only):
 * :class:`AudioOutput` — a sounddevice output stream at the firmware's rate
   (22050 Hz S16LE stereo, ``audio-dac-dma.md`` §1). **Degrades gracefully**: if
   PortAudio / an output device is missing it reports "audio unavailable" and
-  the TUI keeps running. Underruns output silence: the emulator runs at only a
-  fraction of the pen's real speed (~2.5 M insn/s vs. the ~50 MIPS pacing), so
-  gaps during playback are an emulation-speed limit, not a bug.
+  the TUI keeps running. The emulator runs well below the pen's real-time rate,
+  so a persistently-open stream would starve and underrun constantly; instead
+  the stream is only *run* while audio is ready — a monitor thread starts it
+  once a prebuffer fills, and the callback stops it cleanly when the ring drains
+  (no ALSA underruns).
 * :class:`TtEmuApp` — the Textual app: state / tap / audio panels + a log.
 * **Firmware-aware debugger** — when the loaded image is the recognized 2N
   "MT" build (byte-exact fingerprint, ``firmware-2n-mt.md`` §1), an
@@ -226,58 +228,123 @@ class AudioOutput:
 
     ``start()`` never raises: on any failure (no PortAudio library, no output
     device, …) it records the error and the TUI shows "audio unavailable".
-    A small prebuffer smooths chunk jitter; a starved stream outputs silence
-    and is reported as an underrun — expected while the emulator runs slower
-    than real time.
+
+    The emulator produces audio far slower than real time, so a persistently
+    open stream would starve and underrun continuously — and ALSA logs each
+    underrun to stderr, corrupting the Textual display. So this class **never
+    runs a starving stream**: the stream is created stopped, a monitor thread
+    starts it only once a prebuffer's worth of PCM is ready, and when the ring
+    drains the callback stops the stream *cleanly* (``raise sd.CallbackStop``:
+    PortAudio finishes the current buffer and stops — no underrun). The monitor
+    restarts it when the next prebuffer is ready.
     """
 
-    #: Buffered audio required before playback starts (smooths submit jitter).
+    #: Buffered audio required before (re)starting playback (smooths jitter and
+    #: makes each play burst long enough to be worth spinning the stream up).
     PREBUFFER_SECONDS = 0.4
-    #: Consecutive silent callbacks after which "underrun" decays to "idle".
-    _IDLE_AFTER_BLOCKS = 20
+    #: Monitor poll period — how often it checks whether to (re)start the stream.
+    _MONITOR_PERIOD = 0.02
 
     def __init__(self, ring: AudioRing, rate: int = DEFAULT_RATE) -> None:
         self.ring = ring
         self.rate = rate
         self.available = False
         self.error: str | None = None
+        #: Count of clean drain→stop→restart cycles (shown as "Underruns" in the
+        #: panel, but these are *clean* stops, not real ALSA underruns).
         self.underrun_blocks = 0
         self.level = 0.0  #: peak of the last played block, 0..1
-        self.state = "off"  #: off / idle / buffering / playing / underrun
+        self.state = "off"  #: off / buffering / playing / idle
         self._stream: object | None = None
-        self._playing = False
-        self._silent_blocks = 0
+        #: The stop sentinel, set once :meth:`start` imports sounddevice; the
+        #: callback raises it to stop the stream. ``None`` until then, so a unit
+        #: test can invoke :meth:`_callback` without sounddevice installed.
+        self._callback_stop: type[BaseException] | None = None
         self._prebuffer_bytes = int(self.PREBUFFER_SECONDS * rate) * FRAME_BYTES
+        # Serializes stream start()/stop()/close() across the monitor thread,
+        # the PortAudio callback (via CallbackStop), and close().
+        self._lock = threading.Lock()
+        self._closing = threading.Event()
+        self._monitor: threading.Thread | None = None
 
     def start(self) -> bool:
-        """Open + start the output stream; False (with :attr:`error`) on failure."""
+        """Create the (stopped) output stream + monitor thread.
+
+        Returns False (with :attr:`error`) on any failure. Never raises. The
+        stream is *not* started here — the monitor starts it once the ring holds
+        a prebuffer's worth of PCM.
+        """
         try:
             import sounddevice as sd  # type: ignore[import-untyped]
 
             # RawOutputStream: the callback gets a raw interleaved S16LE byte
-            # buffer — the exact layout the ring already holds.
+            # buffer — the exact layout the ring already holds. Created stopped;
+            # the monitor thread starts it only when there's audio to play.
             stream = sd.RawOutputStream(
                 samplerate=self.rate,
                 channels=2,
                 dtype="int16",
                 callback=self._callback,
             )
-            stream.start()
             self._stream = stream
+            self._callback_stop = sd.CallbackStop
         except Exception as exc:  # noqa: BLE001 — any failure means "no audio"
             self.error = str(exc) or type(exc).__name__
             self.available = False
             self.state = "off"
             return False
         self.available = True
-        self.state = "idle"
+        self.state = "buffering"
+        self._monitor = threading.Thread(
+            target=self._monitor_loop, name="tt-emu-audio", daemon=True
+        )
+        self._monitor.start()
         return True
 
-    def close(self) -> None:
+    def _monitor_loop(self) -> None:
+        """Daemon thread: start the stream whenever a prebuffer is ready.
+
+        Runs the stream only when there's something to play. Once the callback
+        drains the ring it raises CallbackStop (stopping the stream cleanly),
+        and this loop spins it back up as soon as the next prebuffer arrives.
+        """
+        while not self._closing.is_set():
+            self._run_monitor_step()
+            self._closing.wait(self._MONITOR_PERIOD)
+
+    def _run_monitor_step(self) -> None:
+        """One monitor poll: start the stream if it's stopped and prebuffered."""
         stream = self._stream
-        self._stream = None
+        if stream is None or self.ring.fill_bytes < self._prebuffer_bytes:
+            return
+        with self._lock:
+            # Re-check under the lock: close() may have run, and the stream may
+            # already be active (playing).
+            if (
+                self._closing.is_set()
+                or self._stream is not stream
+                or stream.active  # type: ignore[attr-defined]
+            ):
+                return
+            try:
+                stream.start()  # type: ignore[attr-defined]
+                self.state = "playing"
+            except Exception:  # noqa: BLE001 — a failed start is not fatal
+                pass
+
+    def close(self) -> None:
+        """Stop the monitor + stream and release the device. Never raises."""
+        self._closing.set()
+        monitor = self._monitor
+        self._monitor = None
+        if monitor is not None:
+            monitor.join(timeout=1.0)
+        with self._lock:
+            stream = self._stream
+            self._stream = None
         self.available = False
         self.state = "off"
+        self.level = 0.0
         if stream is not None:
             try:
                 stream.stop()  # type: ignore[attr-defined]
@@ -291,33 +358,21 @@ class AudioOutput:
     # ring holds, so PCM bytes copy straight in.
     def _callback(self, outdata: object, frames: int, _time: object, _status: object) -> None:
         nbytes = frames * FRAME_BYTES
-        if not self._playing:
-            fill = self.ring.fill_bytes
-            if fill >= self._prebuffer_bytes:
-                self._playing = True
-                self.state = "playing"
-            else:
-                self.state = "buffering" if fill else "idle"
-                outdata[:] = bytes(nbytes)  # type: ignore[index]  # silence
-                self.level = 0.0
-                return
-        data, got = self.ring.pull(nbytes)
+        data, got = self.ring.pull(nbytes)  # silence-padded to exactly nbytes
         outdata[:] = data  # type: ignore[index]
-        if got == 0:
-            self.underrun_blocks += 1
-            self._silent_blocks += 1
-            self.level = 0.0
-            if self._silent_blocks >= self._IDLE_AFTER_BLOCKS:
-                # The track drained (or the emulator fell far behind): go back
-                # to prebuffering so the next burst starts smoothly.
-                self._playing = False
-                self.state = "idle"
-            else:
-                self.state = "underrun"
-        else:
-            self._silent_blocks = 0
+        if got == nbytes:
+            # A full block of real PCM: still playing.
             self.state = "playing"
             self.level = _peak_level(data)
+            return
+        # The ring drained mid-block: ``data`` already has the missing tail as
+        # silence. Stop the stream cleanly rather than underrun — the monitor
+        # restarts it once the next prebuffer is ready.
+        self.level = 0.0
+        self.state = "idle"
+        self.underrun_blocks += 1
+        if self._callback_stop is not None:
+            raise self._callback_stop
 
 
 # --- The emulation thread --------------------------------------------------------------
