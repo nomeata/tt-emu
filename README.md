@@ -8,6 +8,12 @@ CPU, NAND, audio, the OID (optical) sensor, buttons, and so on — and can run t
 `.gme` audio-book files either headless (for scripted testing) or through an interactive
 terminal UI where you can "tap" OID codes and hear the audio in real time.
 
+![The tt-emu TUI running the taschenrechner game with the firmware-aware debugger open —
+live statechart, GME interpreter registers, and OID→script-line routing with symbolic
+names joined from a tttool YAML.](docs/tui-screenshot.svg)
+
+<sup>Regenerate this screenshot with `python scripts/screenshot.py`.</sup>
+
 ## Status
 
 Early / work in progress. Built clean-room from a distilled set of hardware-interface
@@ -55,14 +61,14 @@ pytest                                         # the test suite
 # The firmware argument is OPTIONAL for the headless command: omit it and tt-emu
 # downloads + caches the official update3202MT.upd (verified against a pinned
 # SHA-256; reused offline afterwards). Pass a path to use your own .upd.
-tt-emu path/to/firmware.upd   # headless boot  (equivalently: python -m tt_emu …)
+tt-emu                        # headless boot (firmware auto-downloads; or pass a .upd path)
 
 # interactive TUI: boot the pen, tap OID codes, hear the audio live
-tt-emu-tui path/to/firmware.upd --game path/to/game.gme
-python -m tt_emu.tui path/to/firmware.upd --game path/to/game.gme  # equivalent
+tt-emu-tui --game path/to/game.gme               # firmware auto-downloads too
+python -m tt_emu.tui --game path/to/game.gme     # equivalent
 
 # with the game's tttool source: symbolic names in the debugger panels
-tt-emu-tui path/to/firmware.upd --game game.gme --yaml book.yaml
+tt-emu-tui --game game.gme --yaml book.yaml
 ```
 
 In the TUI, tap the game's **product code** button first (the game mounts), then any
