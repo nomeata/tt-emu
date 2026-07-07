@@ -51,6 +51,9 @@ python -m tt_emu path/to/firmware.upd   # headless boot
 # interactive TUI: boot the pen, tap OID codes, hear the audio live
 tt-emu-tui path/to/firmware.upd --game path/to/game.gme
 python -m tt_emu.tui path/to/firmware.upd --game path/to/game.gme  # equivalent
+
+# with the game's tttool source: symbolic names in the debugger panels
+tt-emu-tui path/to/firmware.upd --game game.gme --yaml book.yaml
 ```
 
 In the TUI, tap the game's **product code** button first (the game mounts), then any
@@ -58,6 +61,33 @@ content code. Audio plays through sounddevice at 22050 Hz; since the emulator ru
 slower than the real pen (~a quarter of real time), playback pauses to rebuffer —
 that's an emulation-speed limit, not a bug. Without a working audio device the TUI
 runs silent and keeps capturing.
+
+### The GME debugger
+
+When the loaded image is a **recognized firmware build** (currently the 2N "MT"
+`N0038MT / 20131009` image of `Update3202MT.upd`, identified by a byte-exact
+fingerprint — see [`docs/firmware-2n-mt.md`](docs/firmware-2n-mt.md)), the TUI adds
+live debugger panels on top of the generic view (`d` toggles them):
+
+- **Statechart** — the firmware's live QHsm state hierarchy (all 70 states named),
+  active leaf highlighted;
+- **Transitions** — a clock-stamped log of every state change (push/pop/sibling),
+  annotated with the event that caused it;
+- **GME interpreter** — mounted product and file, the `$`-register file with live
+  values, playlist/media state, armed GME timers, pending deferred jumps;
+- **OID → script** — the last tapped OID, which script line it routed to, and that
+  line's conditions (with live register values), actions, and playlist, plus a trace
+  of the actions the interpreter actually executed.
+
+All of it is **hook-free**: the firmware runs unmodified, and the debugger only polls
+emulator RAM (plus the documented read-only PC watchpoints for the executed-action
+trace and "now playing"). Unrecognized firmware simply keeps the generic panels.
+
+With `--yaml book.yaml` (the tttool source of the loaded `.gme`, plus its sibling
+`book.codes.yaml` for the script→OID codes), the panels use **symbolic names**:
+registers as `$eingabe` instead of `$2`, taps as `4716 "acht" → line 1/1`, media by
+name, and the matched YAML source line — all joined to the live state by product id,
+OID code, and script-line index. Without a YAML everything works with raw numbers.
 
 tt-emu takes the pen's firmware as an input (like a ROM for a console emulator); it is
 not distributed with the tool.

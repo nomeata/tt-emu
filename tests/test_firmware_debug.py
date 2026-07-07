@@ -1,0 +1,410 @@
+"""Firmware-aware debugger tests: recognition, symbols, live readers, TUI panels.
+
+Layers (fastest first):
+
+* pure recognition / name-table checks (no artifacts needed);
+* tttool YAML + GME-container symbol parsing and their join, verified against
+  the real ``taschenrechner`` sources (register name→index, script codes,
+  media names, line matching) — file parsing only, no emulator;
+* the Textual debug panels driven through the pilot with a fabricated debug
+  snapshot (headless, no emulator, no audio device);
+* one live end-to-end run on the real firmware: boot → book → tap product →
+  tap content, asserting the hook-free readers (statechart chain, registers,
+  OID→script routing, transition log) observe it all.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from pathlib import Path
+
+import pytest
+
+from tt_emu.firmware import detect, mt
+from tt_emu.firmware.symbols import (
+    GmeScripts,
+    derive_media_names,
+    load_tttool_yaml,
+    parse_min_yaml,
+)
+from tt_emu.loader import load_upd
+from tt_emu.tui import EmulatorSession, EmuSnapshot, TtEmuApp
+
+UPD_PATH = Path("/home/jojo/tiptoi/update3202MT.upd")
+GME_PATH = Path("/home/jojo/tiptoi/tiptoi-taschenrechner/taschenrechner.gme")
+YAML_PATH = Path("/home/jojo/tiptoi/tiptoi-taschenrechner/taschenrechner.yaml")
+
+needs_upd = pytest.mark.skipif(not UPD_PATH.exists(), reason="firmware .upd not present")
+needs_game = pytest.mark.skipif(
+    not (GME_PATH.exists() and YAML_PATH.exists()),
+    reason="taschenrechner .gme/.yaml not present",
+)
+
+
+# --- §1 recognition ---------------------------------------------------------------------
+
+
+def test_recognize_rejects_other_images() -> None:
+    assert not mt.recognize(b"")
+    assert not mt.recognize(b"\x00" * 64)
+    assert not mt.recognize(b"N0038MT\x00\x00\x00" + b"20140101" + b"\x00\x00Tiptoi")
+    assert detect(b"some other firmware image") is None
+
+
+@needs_upd
+def test_recognize_real_firmware() -> None:
+    firmware = load_upd(str(UPD_PATH))
+    assert mt.recognize(firmware.prog.data)
+    label = detect(firmware.prog.data)
+    assert label is not None and "N0038MT" in label
+
+
+def test_state_name_table_is_complete() -> None:
+    # docs/firmware-2n-mt.md §2.3: exactly 70 states, ids 0..69.
+    assert set(mt.STATE_NAMES) == set(range(70))
+    assert mt.state_name(13) == "book"
+    assert mt.state_name(3) == "standby"
+    assert mt.state_name(50) == "selection_board_mode"
+    assert mt.state_name(200) == "state200"  # graceful for out-of-table ids
+    assert "tap" in mt.event_name(0x1060)
+    assert "game launch" in mt.event_name(0x1020)
+
+
+# --- tttool YAML parsing ------------------------------------------------------------------
+
+
+def test_min_yaml_parser_subset() -> None:
+    doc = parse_min_yaml(
+        "# comment\n"
+        "product-id: 42\n"
+        "comment: Hello world\n"
+        "scripts:\n"
+        "  one:   $a := 1 P(x)\n"
+        "  two:\n"
+        "  - $a == 1? P(y) # trailing comment\n"
+        "  - P(z)\n"
+        "  three: $b := 2\n"
+    )
+    assert doc["product-id"] == "42"
+    assert doc["comment"] == "Hello world"
+    scripts = doc["scripts"]
+    assert isinstance(scripts, dict)
+    assert scripts["one"] == "$a := 1 P(x)"
+    assert scripts["two"] == ["$a == 1? P(y)", "P(z)"]  # list at the key's indent
+    assert scripts["three"] == "$b := 2"
+
+
+@needs_game
+def test_yaml_symbols_taschenrechner() -> None:
+    symbols = load_tttool_yaml(YAML_PATH)
+    assert symbols.product_id == 42
+    assert symbols.comment == "Ein akustischer Taschenrechner"
+    # Script names + codes (from the sibling .codes.yaml).
+    assert len(symbols.scripts) == 28
+    assert symbols.codes["acht"] == 4716
+    assert symbols.oid_label(4716) == "acht"
+    assert symbols.oid_label(4733) == "sag_zahl"
+    assert len(symbols.scripts["auswerten"]) == 5
+    # Register names sorted ascending == the assemble-time index order.
+    assert symbols.register_names[2] == "eingabe"
+    assert symbols.register_names[6] == "zahl"
+    assert symbols.register_name(2) == "$eingabe"
+    assert symbols.register_name(99) == "$99"  # graceful degrade
+    # Source-line join (line order == firmware line order).
+    assert symbols.script_source(4718, 1) is not None
+    assert "$operator == 1?" in symbols.script_source(4718, 1)
+
+
+# --- GME container parsing + the YAML↔GME join ------------------------------------------------
+
+
+@needs_game
+def test_gme_scripts_and_register_index_join() -> None:
+    gme = GmeScripts(GME_PATH.read_bytes())
+    assert (gme.product, gme.first_oid, gme.last_oid) == (42, 4716, 4743)
+
+    # 'acht' (OID 4716): $eingabe *= 10, $eingabe += 8, $zahl := $eingabe,
+    # J(sag_zahl). Verifies the binary action encoding AND the sorted-name
+    # register rule ($eingabe = 2, $zahl = 6) against a real tttool GME.
+    lines = gme.script(4716)
+    assert lines is not None and len(lines) == 1
+    assert lines[0].conds == ()
+    assert lines[0].actions == (
+        (2, 0xFFF2, 1, 10),  # Mult($eingabe, 10)
+        (2, 0xFFF0, 1, 8),  # Inc($eingabe, 8)
+        (6, 0xFFF9, 0, 2),  # Set($zahl, $eingabe) — register operand
+        (0, 0xF8FF, 1, 4733),  # Jump(sag_zahl) — operand is the OID code
+    )
+
+    # 'auswerten' line 1: [$operator == 1] $wert += $eingabe … ($operator=4, $wert=5).
+    lines = gme.script(4718)
+    assert lines is not None and len(lines) == 5
+    assert lines[1].conds == ((0, 4, 0xFFF9, 1, 1),)
+    assert lines[1].actions[0] == (5, 0xFFF0, 0, 2)
+
+    # Media names derived by aligning YAML P(...) args with binary playlists.
+    symbols = load_tttool_yaml(YAML_PATH)
+    media = derive_media_names(symbols, gme)
+    assert media[21] == "null"  # sag_zahl line 0: $zahl == 0? P(null)
+    assert media[0] == "acht"
+    assert len(media) >= 30
+
+
+@needs_game
+def test_render_and_line_matching() -> None:
+    symbols = load_tttool_yaml(YAML_PATH)
+    gme = GmeScripts(GME_PATH.read_bytes())
+    symbols.media_names.update(derive_media_names(symbols, gme))
+
+    lines = gme.script(4716)
+    assert lines is not None
+    rendered = [
+        mt.render_action(*action, symbols, lines[0].playlist)
+        for action in lines[0].actions
+    ]
+    assert rendered == [
+        "Mult($eingabe,10)",
+        "Inc($eingabe,8)",
+        "Set($zahl,$eingabe)",
+        "Jump(sag_zahl)",
+    ]
+    cond = gme.script(4718)[1].conds[0]
+    assert mt.render_condition(cond, symbols, registers=(0, 0, 0, 0, 3)) == "$operator=3 == 1"
+
+    # The resident-line matcher: the parsed (actions, playlist) identify the line.
+    debugger = mt.MtDebugger.__new__(mt.MtDebugger)  # match logic needs no machine
+    debugger._match_cache = {}
+    sag_zahl = gme.script(4733)
+    assert sag_zahl is not None
+    for expect, line in enumerate(sag_zahl):
+        assert (
+            debugger._match_line(42, 4733, sag_zahl, line.actions, line.playlist)
+            == expect
+        )
+
+
+# --- the TUI debug panels (pilot, headless, fabricated snapshot) --------------------------------
+
+
+class _FakeDebugSession:
+    """SessionControl stand-in publishing a ready debug snapshot."""
+
+    def __init__(self) -> None:
+        from tt_emu.tui import AudioRing
+
+        self.product_code: int | None = 42
+        self.content_oids = [4716]
+        self.ring = AudioRing()
+        self.snapshot = EmuSnapshot(
+            power="running",
+            leaf=13,
+            debug=mt.MtDebugSnapshot(
+                ready=True,
+                chain=(3, 12, 13),
+                last_event=0x1060,
+                registers=(0, 0, 8, 0, 0, 0, 8, 0, 0, 0, 0),
+                register_names=tuple(
+                    f"${n}" for n in (
+                        "dreistellig", "einer_return", "eingabe", "neuer_operator",
+                        "operator", "wert", "zahl", "zehner", "ziffer",
+                        "zweistellig", "zweistellig_return",
+                    )
+                ),
+                product=42,
+                product_label="Ein akustischer Taschenrechner",
+                gme_handle=3,
+                gme_mounted=True,
+                gme_path="b:\\taschenrechner.gme",
+                book_count=1,
+                oid_first=4716,
+                oid_last=4743,
+                last_oid=4716,
+                routing=mt.OidRouting(
+                    oid=4716,
+                    label="acht",
+                    kind="content",
+                    line_count=1,
+                    matched_line=0,
+                    actions=("Mult($eingabe,10)", "Inc($eingabe,8)"),
+                    source="$eingabe *= 10 $eingabe += 8",
+                ),
+                tick=1234,
+                heartbeat=99,
+            ),
+        )
+        self._transitions = [
+            "[   1,000,000] push    standby → book_mount  [depth 0→1]  on 0x1058 open product",
+        ]
+
+    def start(self) -> None: ...
+    def shutdown(self, timeout: float = 5.0) -> None: ...
+    def tap(self, oid: int) -> None: ...
+    def press_button(self, name: str, *, hold: bool = False) -> None: ...
+    def post_event(self, message: str) -> None: ...
+
+    def drain_events(self) -> list[str]:
+        return []
+
+    def drain_transitions(self) -> list[str]:
+        out, self._transitions = self._transitions, []
+        return out
+
+
+def test_app_debug_panels_populate_and_toggle() -> None:
+    async def scenario() -> None:
+        fake = _FakeDebugSession()
+        app = TtEmuApp(fake, audio=None)
+        async with app.run_test(size=(120, 50)) as pilot:
+            from textual.widgets import Static
+
+            await pilot.pause()
+            # Recognized firmware: the debug row is revealed and populated.
+            assert app.query_one("#debug-panels").display is True
+            statechart = str(app.query_one("#statechart-body", Static).content)
+            assert "book (13)" in statechart and "standby (3)" in statechart
+            assert "active" in statechart  # the leaf is highlighted
+            gme = str(app.query_one("#gme-body", Static).content)
+            assert "42 — Ein akustischer Taschenrechner" in gme
+            assert "$eingabe=8" in gme and "$zahl=8" in gme
+            oid = str(app.query_one("#oid-body", Static).content)
+            assert "4716" in oid and "acht" in oid
+            assert "line 1/1" in oid
+            assert "Inc($eingabe,8)" in oid
+            # The transition log received the drained lines.
+            transitions = app.query_one("#transitions")
+            assert transitions.display is True
+            assert any("book_mount" in str(line) for line in transitions.lines)
+            # 'd' toggles the debug row off (and back on).
+            await pilot.press("d")
+            assert app.query_one("#debug-panels").display is False
+            await pilot.press("d")
+            assert app.query_one("#debug-panels").display is True
+
+    asyncio.run(scenario())
+
+
+def test_app_without_debug_stays_generic() -> None:
+    """Unrecognized firmware (debug=None): the debug row never shows."""
+
+    async def scenario() -> None:
+        from test_tui import _FakeSession
+
+        fake = _FakeSession()
+        app = TtEmuApp(fake, audio=None)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            assert app.query_one("#debug-panels").display is False
+            assert app.query_one("#transitions").display is False
+            await pilot.press("d")  # toggling without a debugger is a no-op + log line
+            assert app.query_one("#debug-panels").display is False
+
+    asyncio.run(scenario())
+
+
+# --- live end-to-end: the hook-free readers on the real firmware -------------------------------
+
+
+@needs_upd
+@needs_game
+def test_live_debugger_boot_book_tap() -> None:
+    """Boot the real image, mount the game, tap 'acht'; the readers see it all.
+
+    Everything asserted here is read hook-free from emulator RAM (plus the
+    documented read-only PC watchpoints for the executed-action trace).
+    """
+    session = EmulatorSession(UPD_PATH, [GME_PATH], yaml_path=YAML_PATH)
+    assert session.symbols is not None and session.symbols.product_id == 42
+    session.start()
+
+    transitions: list[str] = []
+    seen_actions: set[str] = set()
+    matched_line_seen = False
+
+    def wait_for(what: str, cond, timeout: float) -> EmuSnapshot:
+        nonlocal matched_line_seen
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            snap = session.snapshot
+            transitions.extend(session.drain_transitions())
+            debug = snap.debug
+            if debug is not None:
+                seen_actions.update(debug.recent_actions)
+                routing = debug.routing
+                if routing is not None and routing.oid == 4716 and routing.matched_line == 0:
+                    matched_line_seen = True
+            if cond(snap):
+                return snap
+            assert session.running, f"emulator died waiting for {what}: {snap.power}"
+            time.sleep(0.02)
+        pytest.fail(f"timeout waiting for {what}; last power={session.snapshot.power}")
+
+    try:
+        # Firmware recognized; the FLAG.bin resume route descends into book(13).
+        snap = wait_for(
+            "book mode",
+            lambda s: s.debug is not None and s.debug.ready and 13 in s.debug.chain,
+            timeout=240.0,
+        )
+        assert snap.firmware_label and "N0038MT" in snap.firmware_label
+        assert snap.debug is not None
+        assert snap.debug.chain_names[-1] == "book"
+        assert snap.debug.chain[0] == 3  # bottom of the stack: standby
+
+        # Tap the product OID: the GME mounts, the register file loads.
+        session.tap(42)
+        snap = wait_for(
+            "product mount + registers",
+            lambda s: s.debug is not None
+            and s.debug.product == 42
+            and len(s.debug.registers) == 11,
+            timeout=180.0,
+        )
+        debug = snap.debug
+        assert debug is not None
+        assert debug.gme_mounted and debug.gme_handle != -1
+        assert debug.product_label == "Ein akustischer Taschenrechner"
+        assert (debug.oid_first, debug.oid_last) == (4716, 4743)
+        assert debug.book_count == 1
+        assert "GME" in debug.gme_path.upper()
+        assert debug.register_names[2] == "$eingabe"
+
+        # Tap 'acht' (4716): $eingabe *= 10; $eingabe += 8 -> the register file
+        # shows 8, and the OID routing names the tapped script.
+        session.tap(4716)
+        snap = wait_for(
+            "content tap effect ($eingabe == 8)",
+            lambda s: s.debug is not None
+            and len(s.debug.registers) == 11
+            and s.debug.registers[2] == 8,
+            timeout=180.0,
+        )
+        debug = snap.debug
+        assert debug is not None
+        assert debug.last_oid == 4716
+        assert debug.routing is not None and debug.routing.oid == 4716
+        assert debug.routing.label == "acht"
+
+        # Give the poller a moment to observe the matched line + exec trace.
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline and not (
+            matched_line_seen and "Inc($eingabe,8)" in seen_actions
+        ):
+            snap = session.snapshot
+            transitions.extend(session.drain_transitions())
+            if snap.debug is not None:
+                seen_actions.update(snap.debug.recent_actions)
+                routing = snap.debug.routing
+                if routing is not None and routing.oid == 4716 and routing.matched_line == 0:
+                    matched_line_seen = True
+            time.sleep(0.02)
+        # The PC-watch action trace saw the script run symbolically.
+        assert "Inc($eingabe,8)" in seen_actions, seen_actions
+        assert matched_line_seen  # OID 4716 → line 1/1 was observed live
+
+        # The transition log recorded the descent into book mode.
+        transitions.extend(session.drain_transitions())
+        assert any("book" in line for line in transitions), transitions
+    finally:
+        session.shutdown(timeout=30.0)
+    assert not session.running

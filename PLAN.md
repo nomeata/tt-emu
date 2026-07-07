@@ -36,8 +36,8 @@ Implemented from **only** `docs/`. High-quality, cross-platform Python.
 
 ## Step 3 — Firmware awareness / GME debugger
 
-- [ ] `docs/firmware-<id>.md` — the specific firmware we target: statechart layout, the GME interpreter model, register semantics, the symbols the TUI can surface
-- [ ] TUI enrichment when the firmware is recognized: live hierarchical-state view, a state-transition log, GME interpreter state + "registers", a rich GME debugger; use tttool `.yaml` (when present) for symbolic OID / script-line names
+- [x] `docs/firmware-2n-mt.md` — statechart, GME interpreter/registers, recognition fingerprint, tttool-YAML join, live-read checklist
+- [x] TUI debugger (firmware-aware): live statechart tree, transition log, GME interpreter + register table, OID->script-line routing, tttool-YAML symbolic names, hook-free (d toggles, --yaml)
 
 ## Orchestration conventions
 

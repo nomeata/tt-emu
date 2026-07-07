@@ -143,6 +143,10 @@ class _FakeSession:
         out, self._events = self._events, []
         return out
 
+    def drain_transitions(self) -> list[str]:
+        out, self._transitions = getattr(self, "_transitions", []), []
+        return out
+
     def post_event(self, message: str) -> None:
         self._events.append(message)
 

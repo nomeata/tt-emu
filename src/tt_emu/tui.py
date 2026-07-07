@@ -21,6 +21,15 @@ Architecture (all cross-platform, no firmware hooks — observation only):
   fraction of the pen's real speed (~2.5 M insn/s vs. the ~50 MIPS pacing), so
   gaps during playback are an emulation-speed limit, not a bug.
 * :class:`TtEmuApp` — the Textual app: state / tap / audio panels + a log.
+* **Firmware-aware debugger** — when the loaded image is the recognized 2N
+  "MT" build (byte-exact fingerprint, ``firmware-2n-mt.md`` §1), an
+  :class:`~tt_emu.firmware.mt.MtDebugger` adds hook-free live readers (RAM
+  polling + the documented read-only PC watchpoints) and the TUI reveals
+  debugger panels: the live statechart hierarchy, a state-transition log, the
+  GME interpreter (product, ``$``-registers, playlist/media), and the
+  OID→script-line routing of the last tap. ``--yaml book.yaml`` joins a
+  tttool source file for symbolic names (register/script/media names). On any
+  other firmware the debugger stays off and the generic panels remain.
 
 Taps are physical **press-and-hold** injections (``oid-sensor.md`` §6): the
 frame is re-served until the firmware's own 23-bit gameplay capture latches it
@@ -52,6 +61,9 @@ from textual.widgets import Button, Footer, Header, Input, RichLog, Static
 
 from .audio_capture import DEFAULT_RATE, FRAME_BYTES, CapturedChunk
 from .boot import BootedMachine, build_machine
+from .firmware import detect as detect_firmware
+from .firmware import mt as fw_mt
+from .firmware.symbols import GmeScripts, TttoolSymbols, derive_media_names, load_tttool_yaml
 from .loader import load_upd
 from .machine import Machine, MachineConfig
 from .runner import (
@@ -310,9 +322,13 @@ class EmuSnapshot:
     last_chunk_bytes: int = 0
     last_chunk_clock: int = 0
     taps_fired: int = 0
+    firmware_label: str = ""  #: non-empty once a known firmware was recognized
+    debug: fw_mt.MtDebugSnapshot | None = None  #: rich debug view (recognized fw only)
 
     @property
     def leaf_name(self) -> str:
+        if self.debug is not None and self.debug.ready:
+            return fw_mt.state_name(self.leaf)
         return STATE_NAMES.get(self.leaf, f"state {self.leaf}")
 
 
@@ -330,6 +346,7 @@ class EmulatorSession:
         firmware_path: str | Path,
         game_paths: Iterable[str | Path] = (),
         *,
+        yaml_path: str | Path | None = None,
         flag_resume: bool = True,
         instructions_per_tick: int = SESSION_INSTRUCTIONS_PER_TICK,
         max_instructions: int = 1_000_000_000_000,
@@ -349,13 +366,40 @@ class EmulatorSession:
         if flag_resume:
             self._b_files.setdefault(FLAG_BIN_NAME, FLAG_BIN_CONTENT)
 
+        # tttool YAML symbols (optional; --yaml). Failure degrades to raw numbers.
+        self.symbols: TttoolSymbols | None = None
+        self._symbols_error: str | None = None
+        if yaml_path is not None:
+            try:
+                self.symbols = load_tttool_yaml(yaml_path)
+            except Exception as exc:  # noqa: BLE001 — symbols are best-effort
+                self._symbols_error = f"{yaml_path}: {exc}"
+        if self.symbols is not None:
+            # Join media names: align the YAML's P(...) args with the matching
+            # game's binary playlists (firmware-2n-mt.md §5).
+            for name, data in self._b_files.items():
+                if name == FLAG_BIN_NAME:
+                    continue
+                try:
+                    scripts = GmeScripts(data)
+                except (ValueError, struct.error, IndexError):
+                    continue
+                if scripts.product == self.symbols.product_id:
+                    self.symbols.media_names.update(
+                        derive_media_names(self.symbols, scripts)
+                    )
+
         self.ring = AudioRing()
         self.booted: BootedMachine | None = None
         self.snapshot = EmuSnapshot()
+        self.debugger: fw_mt.MtDebugger | None = None  #: set on the worker thread
+        self._firmware_label = ""
 
         self._commands: deque[tuple[object, ...]] = deque()  # thread-safe deque
         self._events: deque[str] = deque(maxlen=2000)
         self._events_lock = threading.Lock()
+        self._transitions: deque[str] = deque(maxlen=2000)
+        self._transitions_lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -415,6 +459,14 @@ class EmulatorSession:
                 out.append(self._events.popleft())
         return out
 
+    def drain_transitions(self) -> list[str]:
+        """Statechart-transition log lines (recognized firmware only)."""
+        out: list[str] = []
+        with self._transitions_lock:
+            while self._transitions:
+                out.append(self._transitions.popleft())
+        return out
+
     # --- worker thread -------------------------------------------------------------------
 
     def _run(self) -> None:
@@ -438,6 +490,33 @@ class EmulatorSession:
             f"{', '.join(games) or '(no games)'}"
             + (" + FLAG.bin resume marker" if FLAG_BIN_NAME in self._b_files else "")
         )
+
+        # Firmware-aware debugger: only after positively recognizing the image
+        # (firmware-2n-mt.md §1). Unrecognized firmware -> generic panels only.
+        self._firmware_label = detect_firmware(firmware.prog.data) or ""
+        if self._firmware_label:
+            game_blobs = [d for n, d in self._b_files.items() if n != FLAG_BIN_NAME]
+            self.debugger = fw_mt.MtDebugger(
+                booted.machine,
+                gme_files=game_blobs,
+                symbols=self.symbols,
+                log=self._debug_log,
+            )
+            self.debugger.attach_watches()
+            self.post_event(
+                f"firmware recognized: {self._firmware_label} — debugger panels enabled"
+            )
+        else:
+            self.post_event("firmware not recognized — generic panels only")
+        if self._symbols_error:
+            self.post_event(f"WARNING: could not load tttool YAML symbols: {self._symbols_error}")
+        elif self.symbols is not None:
+            sym = self.symbols
+            self.post_event(
+                f"symbols: {Path(sym.path).name} (product {sym.product_id}, "
+                f"{len(sym.scripts)} scripts, {len(sym.register_names)} registers, "
+                f"{len(sym.media_names)} media names)"
+            )
         for addr, name in CHECKPOINTS.items():
             booted.machine.on_code(addr, self._make_checkpoint(name))
         for addr, name in FATAL_ADDRS.items():
@@ -476,6 +555,12 @@ class EmulatorSession:
         self._last_chunk = chunk
         if chunk.audible:
             self.ring.push(chunk.data)
+
+    def _debug_log(self, message: str) -> None:
+        """Debugger watchpoint sink (emulation thread): clock-stamped event."""
+        booted = self.booted
+        clock = booted.machine.clock if booted is not None else 0
+        self.post_event(f"[{clock:>12,}] {message}")
 
     def _on_chunk(self, machine: Machine) -> None:
         """Per-chunk callback on the emulation thread: apply commands, observe."""
@@ -518,6 +603,14 @@ class EmulatorSession:
                     booted.gpio.clear_input(pin)
                     self.post_event(f"[{now:>12,}] button {name}: released")
 
+        # Statechart-transition detection: a cheap per-chunk RAM poll of the
+        # QHsm (SP, depth, leaf) triple (firmware-2n-mt.md §3, pure-RAM method).
+        if self.debugger is not None:
+            transition = self.debugger.poll_transition()
+            if transition is not None:
+                with self._transitions_lock:
+                    self._transitions.append(f"[{now:>12,}] {transition.format()}")
+
         if now - self._last_snapshot_clock >= SNAPSHOT_INTERVAL:
             self._last_snapshot_clock = now
             self.snapshot = self._build_snapshot(machine)
@@ -554,7 +647,10 @@ class EmulatorSession:
         leaf = statechart_leaf(machine)
         if leaf != self._last_leaf:
             self._last_leaf = leaf
-            name = STATE_NAMES.get(leaf, f"state {leaf}")
+            if self.debugger is not None:
+                name = fw_mt.state_name(leaf)
+            else:
+                name = STATE_NAMES.get(leaf, f"state {leaf}")
             self.post_event(f"[{now:>12,}] statechart leaf -> {name} ({leaf})")
         mounted = machine.read_u32(CURRENT_PRODUCT_ADDR)
         if mounted != self._last_mounted:
@@ -587,6 +683,8 @@ class EmulatorSession:
             last_chunk_bytes=len(last.data) if last else 0,
             last_chunk_clock=last.clock if last else 0,
             taps_fired=booted.oid.taps_served,
+            firmware_label=self._firmware_label,
+            debug=self.debugger.snapshot() if self.debugger is not None else None,
         )
 
 
@@ -603,6 +701,7 @@ class SessionControl(Protocol):
     def tap(self, oid: int) -> None: ...
     def press_button(self, name: str, *, hold: bool = ...) -> None: ...
     def drain_events(self) -> list[str]: ...
+    def drain_transitions(self) -> list[str]: ...
     def post_event(self, message: str) -> None: ...
 
 
@@ -638,9 +737,24 @@ class TtEmuApp(App[None]):
     #state-panel { width: 34%; }
     #tap-panel { width: 33%; }
     #audio-panel { width: 33%; }
+    #debug-panels { height: 15; }
+    #statechart-panel, #gme-panel, #oid-panel {
+        border: round $secondary;
+        padding: 0 1;
+    }
+    #statechart-panel { width: 28%; }
+    #gme-panel { width: 38%; }
+    #oid-panel { width: 34%; }
+    #logs { height: 1fr; }
     #log {
         border: round $primary;
-        height: 1fr;
+        width: 1fr;
+        height: 100%;
+    }
+    #transitions {
+        border: round $secondary;
+        width: 44%;
+        height: 100%;
     }
     #oid-input { margin-bottom: 1; }
     #quick-taps, #hw-buttons { height: auto; }
@@ -653,6 +767,7 @@ class TtEmuApp(App[None]):
     BINDINGS = [
         Binding("q", "quit", "Quit"),
         Binding("t", "focus_tap", "Tap an OID"),
+        Binding("d", "toggle_debug", "Debug panels"),
         Binding("p", "power", "Power (hold)"),
         Binding("plus", "volume('vol+')", "Vol +"),
         Binding("minus", "volume('vol-')", "Vol -"),
@@ -663,6 +778,10 @@ class TtEmuApp(App[None]):
         self.session = session
         self.audio = audio
         self._log_handler: _SessionLogHandler | None = None
+        #: Debug panels wanted (key 'd' toggles); they only show once the
+        #: recognized firmware actually publishes a ready debug snapshot.
+        self.debug_enabled = True
+        self._debug_shown = True  # composed visible; on_mount hides until ready
 
     # --- layout --------------------------------------------------------------------------
 
@@ -692,7 +811,16 @@ class TtEmuApp(App[None]):
                     yield Button("Vol -", id="btn-vol-down")
             with Vertical(id="audio-panel"):
                 yield Static(id="audio-body")
-        yield RichLog(id="log", markup=False, highlight=False, wrap=True)
+        with Horizontal(id="debug-panels"):
+            with Vertical(id="statechart-panel"):
+                yield Static(id="statechart-body")
+            with Vertical(id="gme-panel"):
+                yield Static(id="gme-body")
+            with Vertical(id="oid-panel"):
+                yield Static(id="oid-body")
+        with Horizontal(id="logs"):
+            yield RichLog(id="log", markup=False, highlight=False, wrap=True)
+            yield RichLog(id="transitions", markup=False, highlight=False, wrap=True)
         yield Footer()
 
     def on_mount(self) -> None:
@@ -700,6 +828,14 @@ class TtEmuApp(App[None]):
         self.query_one("#tap-panel").border_title = "Tap"
         self.query_one("#audio-panel").border_title = "Audio"
         self.query_one("#log").border_title = "Events"
+        self.query_one("#statechart-panel").border_title = "Statechart"
+        self.query_one("#gme-panel").border_title = "GME interpreter"
+        self.query_one("#oid-panel").border_title = "OID → script"
+        self.query_one("#transitions").border_title = "Transitions"
+        self._set_debug_display(False)
+        # Keep the event log focused (the pre-debugger auto-focus target) so
+        # the single-key bindings ('t', 'd', …) work out of the box.
+        self.query_one("#log", RichLog).focus()
         self._log_handler = _SessionLogHandler(self.session)
         logging.getLogger("tt_emu").addHandler(self._log_handler)
         if self.audio is not None and self.audio.start():
@@ -729,6 +865,133 @@ class TtEmuApp(App[None]):
         rich_log = self.query_one("#log", RichLog)
         for line in self.session.drain_events():
             rich_log.write(line)
+        self._refresh_debug(snap)
+
+    # --- debugger panels (recognized firmware only) -----------------------------------------
+
+    def _set_debug_display(self, show: bool) -> None:
+        if self._debug_shown == show:
+            return
+        self._debug_shown = show
+        self.query_one("#debug-panels").display = show
+        self.query_one("#transitions").display = show
+
+    def _refresh_debug(self, snap: EmuSnapshot) -> None:
+        debug = snap.debug
+        available = debug is not None and debug.ready
+        self._set_debug_display(available and self.debug_enabled)
+        transitions = self.session.drain_transitions()
+        if not available:
+            return
+        assert debug is not None
+        log = self.query_one("#transitions", RichLog)
+        for line in transitions:
+            log.write(line)  # RichLog buffers while hidden — nothing is lost
+        if self._debug_shown:
+            self.query_one("#statechart-body", Static).update(self._statechart_text(debug))
+            self.query_one("#gme-body", Static).update(self._gme_text(debug))
+            self.query_one("#oid-body", Static).update(self._oid_text(debug))
+
+    def _statechart_text(self, debug: fw_mt.MtDebugSnapshot) -> str:
+        lines: list[str] = []
+        chain = list(zip(debug.chain, debug.chain_names))
+        for i, (state, name) in enumerate(chain):
+            prefix = "" if i == 0 else "  " * (i - 1) + "└─ "
+            entry = f"{prefix}{name} ({state})"
+            if i == len(chain) - 1:
+                entry = f"[b reverse]{entry}[/]  ◀ active"
+            lines.append(entry)
+        if not lines:
+            lines.append("(statechart not entered yet)")
+        lines.append("")
+        lines.append(f"[b]Depth[/b] {max(len(chain) - 1, 0)}")
+        lines.append(f"[b]Tick[/b] {debug.tick:,}   [b]Heartbeat[/b] {debug.heartbeat:,}")
+        return "\n".join(lines)
+
+    def _gme_text(self, debug: fw_mt.MtDebugSnapshot) -> str:
+        product = str(debug.product) if debug.product else "(none)"
+        if debug.product_label:
+            product += f" — {debug.product_label}"
+        mounted = "mounted" if debug.gme_mounted else "not mounted"
+        if debug.gme_handle == -1:
+            handle = "no handle"
+        elif debug.gme_handle > 0xFFFF:  # a FILE*-style handle: show as a pointer
+            handle = f"handle {debug.gme_handle:#x}"
+        else:
+            handle = f"handle {debug.gme_handle}"
+        path = debug.gme_path or "(no record)"
+        lines = [
+            f"[b]Product[/b]  {product}",
+            f"[b]File[/b]     {path}  ({handle}, {mounted})",
+            f"[b]Books[/b]    {debug.book_count} found"
+            f"   [b]OIDs[/b] {debug.oid_first}…{debug.oid_last}",
+        ]
+        now: list[str] = []
+        if debug.last_play:
+            now.append(debug.last_play)
+        now.append("busy" if debug.play_busy else "idle")
+        now.append("GME media (XOR)" if debug.xor_active else "system source")
+        if debug.playall_mode:
+            now.append(f"play-all @{debug.playall_cursor}")
+        lines.append(f"[b]Playing[/b]  {', '.join(now)}")
+        extras: list[str] = []
+        extras.append(
+            f"timer slot {debug.timer_slot}" if debug.timer_slot is not None else "timer —"
+        )
+        if debug.deferred_jump is not None:
+            target = debug.deferred_jump_label or str(debug.deferred_jump)
+            extras.append(f"Jump → {target} pending (on audio stop)")
+        lines.append(f"[b]Timer[/b]    {'   '.join(extras)}")
+        if debug.registers:
+            lines.append(f"[b]Registers[/b] ({len(debug.registers)}):")
+            cells = [
+                f"{name}={value}"
+                for name, value in zip(debug.register_names, debug.registers)
+            ]
+            shown = cells[:24]
+            if len(cells) > 24:
+                shown.append(f"… +{len(cells) - 24} more")
+            lines.append("  ".join(shown))
+        else:
+            lines.append("[b]Registers[/b] (none — no GME mounted)")
+        return "\n".join(lines)
+
+    def _oid_text(self, debug: fw_mt.MtDebugSnapshot) -> str:
+        if not debug.last_oid:
+            return "(no tap decoded yet)"
+        routing = debug.routing
+        label = f' "{routing.label}"' if routing and routing.label else ""
+        lines = [f"[b]Tap[/b]     {debug.last_oid}{label}"
+                 f"   [dim]first tap {debug.first_tap_oid}[/dim]"]
+        if routing is None:
+            return lines[0]
+        if routing.kind == "product-band":
+            lines.append("[b]Route[/b]   product band (≤999) → mount/classifier")
+            return "\n".join(lines)
+        if routing.kind == "out-of-range":
+            lines.append("[b]Route[/b]   outside the mounted GME's OID range → error voice")
+            return "\n".join(lines)
+        if routing.kind == "no-script":
+            lines.append("[b]Route[/b]   no script at this OID (offset 0xFFFFFFFF)")
+            return "\n".join(lines)
+        where = (
+            f"line {routing.matched_line + 1}/{routing.line_count}"
+            if routing.matched_line >= 0
+            else f"{routing.line_count} lines (resident line unmatched)"
+        )
+        script = f"'{routing.label}'" if routing.label else f"OID {routing.oid}"
+        lines.append(f"[b]Script[/b]  {script} → {where}")
+        if routing.conditions:
+            lines.append(f"[b]Cond[/b]    {'; '.join(routing.conditions)}")
+        if routing.actions:
+            lines.append(f"[b]Actions[/b] {'; '.join(routing.actions)}")
+        if routing.playlist:
+            lines.append(f"[b]Playlist[/b] {', '.join(routing.playlist)}")
+        if routing.source:
+            lines.append(f"[b]YAML[/b]    {routing.source}")
+        if debug.recent_actions:
+            lines.append(f"[dim]exec: {'; '.join(debug.recent_actions[-6:])}[/dim]")
+        return "\n".join(lines)
 
     def _state_text(self, snap: EmuSnapshot) -> str:
         if snap.speed_ratio > 0:
@@ -824,6 +1087,17 @@ class TtEmuApp(App[None]):
     def action_focus_tap(self) -> None:
         self.query_one("#oid-input", Input).focus()
 
+    def action_toggle_debug(self) -> None:
+        self.debug_enabled = not self.debug_enabled
+        debug = self.session.snapshot.debug
+        if debug is None or not debug.ready:
+            self._log_line(
+                "debug panels: no recognized firmware state yet"
+                + (" (enabled once ready)" if self.debug_enabled else "")
+            )
+            return
+        self._refresh()
+
     def action_power(self) -> None:
         self.session.press_button("power", hold=True)
 
@@ -846,6 +1120,12 @@ def build_parser() -> argparse.ArgumentParser:
         "product/content codes become quick-tap buttons)",
     )
     parser.add_argument(
+        "--yaml", metavar="YAML", default=None,
+        help="tttool source .yaml of the game: joins symbolic names (register "
+        "$-names, script/OID labels, media names) into the debugger panels; a "
+        "sibling <book>.codes.yaml supplies the script→OID codes",
+    )
+    parser.add_argument(
         "--no-flag-resume", action="store_true",
         help="do not provision B:/FLAG.bin (the pen then stays at standby; "
         "the resume route is what lets a game mount — nand-image-layout.md §7.3.1)",
@@ -866,6 +1146,7 @@ def main(argv: list[str] | None = None) -> int:
     session = EmulatorSession(
         args.firmware,
         args.game,
+        yaml_path=args.yaml,
         flag_resume=not args.no_flag_resume,
         instructions_per_tick=args.instructions_per_tick,
     )
