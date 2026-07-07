@@ -66,7 +66,8 @@ from typing import Callable, Iterable, Protocol, cast
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
-from textual.widgets import Button, Footer, Header, Input, RichLog, Static
+from textual.widgets import Button, Footer, Header, Input, OptionList, RichLog, Static
+from textual.widgets.option_list import Option
 
 from .audio_capture import DEFAULT_RATE, FRAME_BYTES, CapturedChunk
 from .boot import BootedMachine, build_machine
@@ -126,13 +127,14 @@ TAP_TIMEOUT_INSTRUCTIONS = 250 * SESSION_INSTRUCTIONS_PER_TICK
 SNAPSHOT_INTERVAL = 200_000
 
 
-def gme_content_oids(data: bytes, limit: int = 3) -> list[int]:
-    """A few content OIDs from a ``.gme`` script table (for quick-tap buttons).
+def gme_content_oids(data: bytes, limit: int | None = 3) -> list[int]:
+    """The used content OIDs of a ``.gme`` script table.
 
     Game-data format (not firmware RE): u32 at offset 0 points at the script
     table = ``u32 last_oid, u32 first_oid`` then one u32 script offset per code
-    (``0xFFFFFFFF`` = unused). Returns the first ``limit`` used codes; empty on
-    any parse doubt.
+    (``0xFFFFFFFF`` = unused). Returns the first ``limit`` used codes (all of
+    them when ``limit is None`` — the interactive tap list wants the whole set);
+    empty on any parse doubt.
     """
     try:
         (table,) = struct.unpack_from("<I", data, 0)
@@ -143,7 +145,8 @@ def gme_content_oids(data: bytes, limit: int = 3) -> list[int]:
         offsets = struct.unpack_from(f"<{count}I", data, table + 8)
     except struct.error:
         return []
-    return [first + i for i, off in enumerate(offsets) if off != 0xFFFFFFFF][:limit]
+    used = [first + i for i, off in enumerate(offsets) if off != 0xFFFFFFFF]
+    return used if limit is None else used[:limit]
 
 
 # --- Audio plumbing -------------------------------------------------------------------
@@ -546,7 +549,10 @@ class EmulatorSession:
             self._b_files[Path(game).name] = data
             if self.product_code is None:
                 self.product_code = gme_product_code(data)
-                self.content_oids = gme_content_oids(data)
+                # The whole tappable set (not just a few): the interactive tap
+                # list shows every used content OID, symbolic-named when a YAML
+                # was joined.
+                self.content_oids = gme_content_oids(data, limit=None)
 
         # tttool YAML symbols (optional; --yaml). Failure degrades to raw numbers.
         self.symbols: TttoolSymbols | None = None
@@ -894,6 +900,7 @@ class SessionControl(Protocol):
 
     product_code: int | None
     content_oids: list[int]
+    symbols: TttoolSymbols | None  #: tttool YAML names (--yaml); None otherwise
     ring: AudioRing
     snapshot: EmuSnapshot
 
@@ -930,14 +937,21 @@ class TtEmuApp(App[None]):
     TITLE = "tt-emu — tiptoi pen emulator"
 
     CSS = """
-    #panels { height: 16; }
-    #state-panel, #tap-panel, #audio-panel {
+    #main { height: 1fr; }
+    #tap-panel {
+        width: 36;
         border: round $primary;
         padding: 0 1;
     }
-    #state-panel { width: 34%; }
-    #tap-panel { width: 33%; }
-    #audio-panel { width: 33%; }
+    #tap-list { height: 1fr; }
+    #right { width: 1fr; }
+    #panels { height: 16; }
+    #state-panel, #audio-panel {
+        border: round $primary;
+        padding: 0 1;
+    }
+    #state-panel { width: 50%; }
+    #audio-panel { width: 50%; }
     #debug-panels { height: 15; }
     #statechart-panel, #gme-panel, #oid-panel {
         border: round $secondary;
@@ -958,8 +972,8 @@ class TtEmuApp(App[None]):
         height: 100%;
     }
     #oid-input { margin-bottom: 1; }
-    #quick-taps, #hw-buttons { height: auto; }
-    #quick-taps Button, #hw-buttons Button {
+    #hw-buttons { height: auto; margin-top: 1; }
+    #hw-buttons Button {
         margin-right: 1;
         min-width: 6;
     }
@@ -968,11 +982,15 @@ class TtEmuApp(App[None]):
     BINDINGS = [
         Binding("q", "quit", "Quit"),
         Binding("t", "focus_tap", "Tap an OID"),
+        Binding("s", "cycle_sort", "Sort taps"),
         Binding("d", "toggle_debug", "Debug panels"),
         Binding("p", "power", "Power (hold)"),
         Binding("plus", "volume('vol+')", "Vol +"),
         Binding("minus", "volume('vol-')", "Vol -"),
     ]
+
+    #: Tap-list orderings cycled by the 's' binding.
+    SORT_MODES = ("OID", "name", "recent")
 
     def __init__(self, session: SessionControl, audio: AudioOutput | None = None) -> None:
         super().__init__()
@@ -983,60 +1001,63 @@ class TtEmuApp(App[None]):
         #: recognized firmware actually publishes a ready debug snapshot.
         self.debug_enabled = True
         self._debug_shown = True  # composed visible; on_mount hides until ready
+        #: Tap-list ordering: index into SORT_MODES (0 = by OID).
+        self._sort_index = 0
+        #: Tap recency for the LRU ordering: OID -> monotonically-rising rank
+        #: (higher == more recently tapped). Only used by the "recent" sort.
+        self._tap_recency: dict[int, int] = {}
+        self._tap_seq = 0
 
     # --- layout --------------------------------------------------------------------------
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        with Horizontal(id="panels"):
-            with Vertical(id="state-panel"):
-                yield Static(id="state-body")
+        with Horizontal(id="main"):
+            # Left column: the tap region gets its own full-height scrolling list.
             with Vertical(id="tap-panel"):
                 yield Input(
                     placeholder="OID code, e.g. 4716 — Enter taps",
                     id="oid-input",
                     type="text",
                 )
-                with Horizontal(id="quick-taps"):
-                    if self.session.product_code is not None:
-                        yield Button(
-                            f"Product {self.session.product_code}",
-                            id=f"tap-{self.session.product_code}",
-                            variant="primary",
-                        )
-                    for oid in self.session.content_oids:
-                        yield Button(str(oid), id=f"tap-{oid}")
+                yield OptionList(id="tap-list")
                 with Horizontal(id="hw-buttons"):
                     yield Button("Power", id="btn-power", variant="error")
                     yield Button("Vol +", id="btn-vol-up")
                     yield Button("Vol -", id="btn-vol-down")
-            with Vertical(id="audio-panel"):
-                yield Static(id="audio-body")
-        with Horizontal(id="debug-panels"):
-            with Vertical(id="statechart-panel"):
-                yield Static(id="statechart-body")
-            with Vertical(id="gme-panel"):
-                yield Static(id="gme-body")
-            with Vertical(id="oid-panel"):
-                yield Static(id="oid-body")
-        with Horizontal(id="logs"):
-            yield RichLog(id="log", markup=False, highlight=False, wrap=True)
-            yield RichLog(id="transitions", markup=False, highlight=False, wrap=True)
+            # Right column: everything else, stacked.
+            with Vertical(id="right"):
+                with Horizontal(id="panels"):
+                    with Vertical(id="state-panel"):
+                        yield Static(id="state-body")
+                    with Vertical(id="audio-panel"):
+                        yield Static(id="audio-body")
+                with Horizontal(id="debug-panels"):
+                    with Vertical(id="statechart-panel"):
+                        yield Static(id="statechart-body")
+                    with Vertical(id="gme-panel"):
+                        yield Static(id="gme-body")
+                    with Vertical(id="oid-panel"):
+                        yield Static(id="oid-body")
+                with Horizontal(id="logs"):
+                    yield RichLog(id="log", markup=False, highlight=False, wrap=True)
+                    yield RichLog(id="transitions", markup=False, highlight=False, wrap=True)
         yield Footer()
 
     def on_mount(self) -> None:
         self.query_one("#state-panel").border_title = "Pen state"
-        self.query_one("#tap-panel").border_title = "Tap"
         self.query_one("#audio-panel").border_title = "Audio"
         self.query_one("#log").border_title = "Events"
         self.query_one("#statechart-panel").border_title = "Statechart"
         self.query_one("#gme-panel").border_title = "GME interpreter"
         self.query_one("#oid-panel").border_title = "OID → script"
         self.query_one("#transitions").border_title = "Transitions"
+        self._populate_tap_list()
         self._set_debug_display(False)
-        # Keep the event log focused (the pre-debugger auto-focus target) so
-        # the single-key bindings ('t', 'd', …) work out of the box.
-        self.query_one("#log", RichLog).focus()
+        # Focus the tap list so Enter taps the highlighted OID out of the box;
+        # the single-key bindings ('t', 's', 'd', …) are app-level and fire
+        # whatever holds focus (OptionList binds only navigation keys).
+        self.query_one("#tap-list", OptionList).focus()
         self._log_handler = _SessionLogHandler(self.session)
         logging.getLogger("tt_emu").addHandler(self._log_handler)
         if self.audio is not None and self.audio.start():
@@ -1259,6 +1280,80 @@ class TtEmuApp(App[None]):
     def _log_line(self, message: str) -> None:
         self.query_one("#log", RichLog).write(message)
 
+    # --- tap list ------------------------------------------------------------------------
+
+    @property
+    def _sort_mode(self) -> str:
+        return self.SORT_MODES[self._sort_index]
+
+    def _tap_rows(self) -> list[tuple[int, str]]:
+        """``(OID code, prompt)`` rows for the tap list in the current sort order.
+
+        The product code is always pinned first (the easiest to reach); the used
+        content OIDs follow, named from the tttool YAML when one was joined
+        (``symbols.oid_label``) and ordered by the active sort mode. Degrades to
+        an empty list when no game / firmware was recognized.
+        """
+        symbols = self.session.symbols
+
+        def name_of(code: int) -> str | None:
+            return symbols.oid_label(code) if symbols is not None else None
+
+        rows: list[tuple[int, str]] = []
+        product = self.session.product_code
+        if product is not None:
+            rows.append((product, f"{product:>6}  ★ Product"))
+
+        content = list(self.session.content_oids)
+        mode = self._sort_mode
+        if mode == "name":
+            # Named first (alphabetical, case-insensitive), unnamed after by OID.
+            content.sort(key=lambda c: (name_of(c) is None, (name_of(c) or "").lower(), c))
+        elif mode == "recent":
+            # Most-recently-tapped first; never-tapped last, in OID order.
+            content.sort(key=lambda c: (-self._tap_recency.get(c, -1), c))
+        else:  # "OID": numeric ascending
+            content.sort()
+        for code in content:
+            name = name_of(code)
+            rows.append((code, f"{code:>6}  {name}" if name else f"{code:>6}"))
+        return rows
+
+    def _populate_tap_list(self) -> None:
+        """Rebuild the tap OptionList for the current sort, keeping the cursor."""
+        option_list = self.query_one("#tap-list", OptionList)
+        keep: str | None = None
+        if option_list.highlighted is not None:
+            try:
+                keep = option_list.get_option_at_index(option_list.highlighted).id
+            except Exception:  # noqa: BLE001 — a stale index mid-rebuild is harmless
+                keep = None
+        option_list.clear_options()
+        option_list.add_options(
+            [Option(prompt, id=f"tap-{code}") for code, prompt in self._tap_rows()]
+        )
+        if keep is not None:
+            try:
+                option_list.highlighted = option_list.get_option_index(keep)
+            except Exception:  # noqa: BLE001 — the row may no longer exist
+                pass
+        self._update_tap_title()
+
+    def _update_tap_title(self) -> None:
+        count = self.query_one("#tap-list", OptionList).option_count
+        self.query_one("#tap-panel").border_title = (
+            f"Tap · {count} OIDs · sort: {self._sort_mode}"
+        )
+
+    def action_cycle_sort(self) -> None:
+        self._sort_index = (self._sort_index + 1) % len(self.SORT_MODES)
+        self._populate_tap_list()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        oid_id = event.option_id or ""
+        if oid_id.startswith("tap-"):
+            self._do_tap(int(oid_id[4:]))
+
     # --- input ---------------------------------------------------------------------------
 
     def _do_tap(self, oid: int) -> None:
@@ -1266,6 +1361,12 @@ class TtEmuApp(App[None]):
             self.session.tap(oid)
         except ValueError as exc:
             self._log_line(f"tap rejected: {exc}")
+            return
+        # Track recency for the LRU ordering; refresh only when it changes order.
+        self._tap_seq += 1
+        self._tap_recency[oid] = self._tap_seq
+        if self._sort_mode == "recent":
+            self._populate_tap_list()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         text = event.value.strip()
@@ -1281,9 +1382,7 @@ class TtEmuApp(App[None]):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         bid = event.button.id or ""
-        if bid.startswith("tap-"):
-            self._do_tap(int(bid[4:]))
-        elif bid == "btn-power":
+        if bid == "btn-power":
             self.session.press_button("power", hold=True)
         elif bid == "btn-vol-up":
             self.session.press_button("vol+")
@@ -1332,7 +1431,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--gme", metavar="GME", action="append", default=[],
         help=".gme file placed on partition B: (repeatable; the first one's "
-        "product/content codes become quick-tap buttons)",
+        "product/content codes populate the tap list)",
     )
     parser.add_argument(
         "--yaml", metavar="YAML", default=None,

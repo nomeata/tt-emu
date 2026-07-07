@@ -30,7 +30,7 @@ from tt_emu.firmware.symbols import (
     parse_min_yaml,
 )
 from tt_emu.loader import load_upd
-from tt_emu.tui import EmulatorSession, EmuSnapshot, TtEmuApp
+from tt_emu.tui import EmulatorSession, EmuSnapshot, TtEmuApp, gme_content_oids
 
 _GAME_DIR = game_dir()
 UPD_PATH = firmware_path()
@@ -197,6 +197,7 @@ class _FakeDebugSession:
 
         self.product_code: int | None = 42
         self.content_oids = [4716]
+        self.symbols: object | None = None
         self.ring = AudioRing()
         self.snapshot = EmuSnapshot(
             power="running",
@@ -296,6 +297,41 @@ def test_app_debug_panels_populate_and_toggle() -> None:
             await wait_for(pilot, app, "#debug-panels", ready=lambda w: w.display is False)
             await pilot.press("d")
             await wait_for(pilot, app, "#debug-panels", ready=lambda w: w.display is True)
+
+    asyncio.run(scenario())
+
+
+@needs_game
+def test_app_tap_list_named_from_yaml() -> None:
+    """A joined tttool YAML gives every tap row its symbolic name."""
+
+    async def scenario() -> None:
+        from test_tui import _FakeSession
+
+        fake = _FakeSession()
+        fake.symbols = load_tttool_yaml(YAML_PATH)
+        fake.content_oids = gme_content_oids(GME_PATH.read_bytes(), limit=None)
+        app = TtEmuApp(fake, audio=None)
+        async with run_app(app, size=(120, 50)) as pilot:
+            tap_list = await wait_for(
+                pilot, app, "#tap-list", ready=lambda w: w.option_count > 3
+            )
+            prompts = [
+                str(tap_list.get_option_at_index(i).prompt)
+                for i in range(tap_list.option_count)
+            ]
+            # Product is pinned first; content OIDs carry their YAML names.
+            assert "Product" in prompts[0]
+            joined = "\n".join(prompts)
+            assert "acht" in joined and "sag_zahl" in joined
+            # By-OID order (the default): 4716 'acht' precedes 4733 'sag_zahl'.
+            assert joined.index("acht") < joined.index("sag_zahl")
+            # Selecting a named row taps that OID.
+            tap_list.focus()
+            await pilot.pause()
+            tap_list.highlighted = tap_list.get_option_index("tap-4716")
+            await pilot.press("enter")
+            assert fake.taps == [4716]
 
     asyncio.run(scenario())
 

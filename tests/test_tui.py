@@ -119,6 +119,7 @@ class _FakeSession:
     def __init__(self) -> None:
         self.product_code: int | None = 42
         self.content_oids = [4716, 4717]
+        self.symbols: object | None = None  # no tttool YAML in the fake
         self.ring = AudioRing()
         self.snapshot = EmuSnapshot()
         self.taps: list[int] = []
@@ -165,9 +166,15 @@ def test_app_builds_and_injects_taps_via_pilot() -> None:
             await pilot.press("t")  # binding: focus the tap input
             await pilot.press(*"4716", "enter")
             assert fake.taps == [4716]
-            # Quick-tap button for the product code.
-            await wait_for(pilot, app, "#tap-42")
-            await pilot.click("#tap-42")
+            # The scrollable tap list holds a row per OID; selecting the product
+            # row (Enter on the highlighted option) taps it.
+            tap_list = await wait_for(
+                pilot, app, "#tap-list", ready=lambda w: w.option_count >= 2
+            )
+            tap_list.focus()
+            await pilot.pause()
+            tap_list.highlighted = tap_list.get_option_index("tap-42")
+            await pilot.press("enter")
             assert fake.taps == [4716, 42]
             # Out-of-range input is rejected gracefully (no crash).
             await pilot.press("t")
@@ -178,6 +185,40 @@ def test_app_builds_and_injects_taps_via_pilot() -> None:
             await pilot.click("#btn-vol-up")
             assert fake.buttons == [("power", True), ("vol+", False)]
         assert fake.stopped  # shutdown ran on unmount
+
+    asyncio.run(scenario())
+
+
+def test_app_tap_list_sort_and_lru() -> None:
+    async def scenario() -> None:
+        fake = _FakeSession()
+        fake.content_oids = [4718, 4716, 4717]  # deliberately out of order
+        app = TtEmuApp(fake, audio=None)
+        async with run_app(app, size=(100, 40)) as pilot:
+            tap_list = await wait_for(
+                pilot, app, "#tap-list", ready=lambda w: w.option_count == 4
+            )
+
+            def codes() -> list[str]:
+                return [
+                    tap_list.get_option_at_index(i).id or ""
+                    for i in range(tap_list.option_count)
+                ]
+
+            # Default sort = by OID: product pinned first, then ascending OIDs.
+            assert codes() == ["tap-42", "tap-4716", "tap-4717", "tap-4718"]
+            assert "sort: OID" in str(app.query_one("#tap-panel").border_title)
+            # Tap 4718 from the list (records recency), then cycle to 'recent'.
+            tap_list.focus()
+            await pilot.pause()
+            tap_list.highlighted = tap_list.get_option_index("tap-4718")
+            await pilot.press("enter")
+            assert fake.taps == [4718]
+            await pilot.press("s")  # OID -> name
+            await pilot.press("s")  # name -> recent
+            assert "sort: recent" in str(app.query_one("#tap-panel").border_title)
+            # LRU: the just-tapped 4718 jumps to the top (after the pinned product).
+            assert codes()[:2] == ["tap-42", "tap-4718"]
 
     asyncio.run(scenario())
 
