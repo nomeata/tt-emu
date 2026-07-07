@@ -39,7 +39,7 @@ scripted runner. Buttons follow ``gpio-buttons-led.md`` §8 item 4: drive the
 pin to its active level for ~2 scan periods (short press) or past the ~600 ms
 hold threshold (power-off needs a hold), then release.
 
-Run it: ``tt-emu-tui --game game.gme`` (the firmware is auto-downloaded and
+Run it: ``tt-emu --gme game.gme`` (the firmware is auto-downloaded and
 cached when no path is given) or ``python -m tt_emu.tui …``.
 """
 
@@ -1181,7 +1181,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         firmware = str(ensure_firmware(args.firmware, cache_dir=args.firmware_cache))
     except (FirmwareDownloadError, FirmwareIntegrityError) as exc:
-        print(f"tt-emu-tui: {exc}", file=sys.stderr)
+        print(f"tt-emu: {exc}", file=sys.stderr)
         return 1
     session = EmulatorSession(
         firmware,

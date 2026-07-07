@@ -29,7 +29,7 @@ Implemented from **only** `docs/`. High-quality, cross-platform Python.
 - [x] Hardware peripherals modelled: syscon, interrupts/timer, GPIO, battery, ZC90B, NAND+NFC, OID, audio DAC/DMA (USB = default dead-bus per its doc)
 - [x] Boot: authentic NAND image + NAND/NFC controller; firmware mounts A:, reads codepage, passes auth, reaches the event-pump statechart (39 tests)
 - [x] Headless / scripted mode: load a GME, boot via FLAG.bin resume, tap product+content, capture audio → WAV (byte-identical media)
-- [x] Interactive TUI (Textual): background emulation thread, tap OIDs, real-time audio (sounddevice), state/audio/log panels, buttons (tt-emu-tui)
+- [x] Interactive TUI (Textual): background emulation thread, tap OIDs, real-time audio (sounddevice), state/audio/log panels, buttons (tt-emu)
 - [x] Test suite (90 pytest) + in-repo cross-compiled test-firmware toolchain (tt_test.h + Makefile + 7 bare-metal ARM peripheral-contract blobs, run headless)
       (arm cross-compiler only, no external checkout) building tiny dumper.gme-style
       test GMEs, exercised through headless mode
