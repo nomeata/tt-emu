@@ -10,8 +10,10 @@ Implements ``memory-map-and-boot.md`` §5 (the recipe that works):
   geometry struct at 0x08008CA8 (96 bytes), the QHsm frame byte at 0x08007E80 =
   1, and (optionally, §5.4 item 2) the HAL leaf override 0x07FFE740 → 1;
 * the peripheral set: the real SysCon (chip-ID/clock gate), IntcTimer, GPIO,
-  BatteryAdc, and the ZC90B auth chip, plus the constant stubs of the
-  boot-constants checklist (``index.md``).
+  BatteryAdc, the ZC90B auth chip, and the storage subsystem (NFC + ECC + L2
+  buffer serving a built NAND image — ``nand-and-nfc-controller.md`` §10,
+  ``nand-image-layout.md`` §6), plus the constant stubs of the boot-constants
+  checklist (``index.md``).
 
 The ZC90B S-boxes are read from the loaded PROG image (``zc90b-auth.md`` §4).
 """
@@ -29,9 +31,11 @@ from .loader import (
     PROG_LOAD_ADDR,
 )
 from .machine import Machine, MachineConfig
+from .nand_image import NandImage, build_nand_image
 from .peripherals.battery import BatteryAdc
 from .peripherals.gpio import GpioBlock
 from .peripherals.intc import IntcTimer
+from .peripherals.nand import EccEngine, L2NandBuffer, NfcController
 from .peripherals import stubs
 from .peripherals.syscon import SysCon
 from .peripherals.zc90b import Zc90bAuth
@@ -64,6 +68,16 @@ NAND_GEOMETRY_BYTES = bytes.fromhex(
 #: not cycle-faithful.
 HAL_LEAF_TIMER_ADDR = 0x07FF_E740
 
+#: The blob's row-address-cycle count byte (``nand-and-nfc-controller.md`` §3:
+#: "a global row-address-cycle count (3) ... seeded by the probe"). The .upd
+#: blob's static value is **2**; the skipped boot probe would set **3** for
+#: this chip class. Found empirically at blob offset 0x79E0 (the address-cycle
+#: stager reads it via a literal pool): with 2, every row is emitted truncated
+#: to 16 bits and the NFTL scan of blocks >= 256 aliases into blocks 0..255 —
+#: the scan then sees duplicate chain heads and erases the system bins.
+NAND_ROW_CYCLES_ADDR = 0x0800_79E0
+NAND_ROW_CYCLES = 3
+
 #: CPU entry state (§5.2).
 SVC_STACK_TOP = 0x0842_0000
 CPSR_SVC_IRQS_ON = 0x13  # SVC mode (0x13), ARM state, I = 0
@@ -76,10 +90,17 @@ _RETURN_ONE_STUB = struct.pack("<II", 0xE3A00001, 0xE12FFF1E)
 class BootedMachine:
     """A machine loaded with firmware and seeded to the PROG entry state."""
 
-    def __init__(self, machine: Machine, firmware: Firmware, zc90b: Zc90bAuth) -> None:
+    def __init__(
+        self,
+        machine: Machine,
+        firmware: Firmware,
+        zc90b: Zc90bAuth,
+        nand: NandImage,
+    ) -> None:
         self.machine = machine
         self.firmware = firmware
         self.zc90b = zc90b
+        self.nand = nand
 
 
 def build_machine(
@@ -87,13 +108,26 @@ def build_machine(
     config: MachineConfig | None = None,
     *,
     override_hal_timer_leaf: bool = True,
+    nand_image: NandImage | None = None,
+    a_files: dict[str, bytes] | None = None,
+    b_files: dict[str, bytes] | None = None,
 ) -> BootedMachine:
     """Build a machine, load the firmware, register peripherals, and seed boot state.
 
     ``override_hal_timer_leaf`` plants the return-1 stub at 0x07FFE740 (§5.4
     item 2); leave it on unless the timer model is made cycle-faithful.
+
+    ``nand_image`` supplies a pre-built NAND image; by default one is built
+    from the firmware artifacts per ``nand-image-layout.md`` §6, with
+    ``a_files``/``b_files`` as the host content of the A: (system) and B:
+    (user ``.gme``) partitions.
     """
     machine = Machine(config)
+
+    # --- storage: NAND image + controller trio (nand-and-nfc-controller.md §10) -----
+    nand = nand_image or build_nand_image(firmware, a_files=a_files, b_files=b_files)
+    ecc = EccEngine()
+    nfc = NfcController(nand, ecc)
 
     # --- peripherals ---------------------------------------------------------------
     gpio = GpioBlock()
@@ -104,10 +138,10 @@ def build_machine(
     machine.add_peripheral(gpio)
     machine.add_peripheral(BatteryAdc())
     machine.add_peripheral(zc90b)
-    machine.add_peripheral(stubs.DmaStub())
+    machine.add_peripheral(L2NandBuffer(nfc))
     machine.add_peripheral(stubs.make_audio_clock_stub())
-    machine.add_peripheral(stubs.NfcStub())
-    machine.add_peripheral(stubs.make_ecc_stub())
+    machine.add_peripheral(nfc)
+    machine.add_peripheral(ecc)
     machine.add_peripheral(stubs.UsbStub())
     machine.add_peripheral(stubs.make_dac_stub())
     machine.add_peripheral(stubs.make_dormant_bank_stub())
@@ -131,6 +165,11 @@ def build_machine(
     # power-off "give up" branch — otherwise increments it 0->1 (reproducing the
     # dumped value). Seeding the dumped 1 makes the pen power off ~228k insns in.
     machine.write_u8(NAND_GEOMETRY_ADDR + 1, 0)
+    # Row-address-cycle count the probe would have set (see NAND_ROW_CYCLES).
+    # Written to the loaded blob and its HAL alias copy.
+    machine.write_u8(NAND_ROW_CYCLES_ADDR, NAND_ROW_CYCLES)
+    machine.write_u8(NANDBOOT_ALIAS_ADDR + (NAND_ROW_CYCLES_ADDR - NANDBOOT_LOAD_ADDR),
+                     NAND_ROW_CYCLES)
     if override_hal_timer_leaf:
         machine.write_bytes(HAL_LEAF_TIMER_ADDR, _RETURN_ONE_STUB)
 
@@ -146,4 +185,4 @@ def build_machine(
         PROG_LOAD_ADDR,
         firmware.nandboot.size,
     )
-    return BootedMachine(machine, firmware, zc90b)
+    return BootedMachine(machine, firmware, zc90b, nand)

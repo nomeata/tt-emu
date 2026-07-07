@@ -12,6 +12,7 @@ import logging
 from dataclasses import dataclass, field
 
 from .boot import BootedMachine, build_machine
+from .fat16 import files_from_dir
 from .loader import Firmware, load_upd
 from .machine import MachineConfig, RunResult
 
@@ -34,6 +35,16 @@ FATAL_ADDRS: dict[int, str] = {
     0x08038D24: "fatal_low_battery_blink (battery-and-power.md §2.3)",
 }
 
+# --- Mount health globals (memory-map-and-boot.md §5.8, index.md RAM table) ---------
+
+#: Mem-driver vtable "keystone": *0x081db984 == 0x08038cf8 after a good mount.
+KEYSTONE_ADDR = 0x081D_B984
+KEYSTONE_EXPECTED = 0x0803_8CF8
+#: Codepage-active flag byte (nonzero once codepage_load succeeded).
+CODEPAGE_FLAG_ADDR = 0x081D_B730
+#: Booklist head (populated by the discovery scan).
+BOOKLIST_HEAD_ADDR = 0x081D_A080
+
 
 @dataclass
 class BootReport:
@@ -43,6 +54,17 @@ class BootReport:
     checkpoints_hit: list[tuple[int, int, str]] = field(default_factory=list)
     timer_irqs: int = 0
     irqs_delivered: int = 0
+    keystone: int = 0
+    codepage_flag: int = 0
+    booklist_head: int = 0
+    nand_reads: int = 0
+    nand_programs: int = 0
+    nand_erases: int = 0
+
+    @property
+    def mount_ok(self) -> bool:
+        """§5.8 "Keystone self-built" — the NFTL init ran through the real mount."""
+        return self.keystone == KEYSTONE_EXPECTED
 
     def format_log(self) -> str:
         lines = ["boot run log:"]
@@ -53,6 +75,15 @@ class BootReport:
             f"after ~{self.result.instructions} insn"
         )
         lines.append(f"  timer IRQs latched: {self.timer_irqs}, delivered: {self.irqs_delivered}")
+        lines.append(
+            f"  mount: keystone={self.keystone:#010x} "
+            f"({'OK' if self.mount_ok else 'not built'}), "
+            f"codepage flag={self.codepage_flag:#x}, booklist head={self.booklist_head:#010x}"
+        )
+        lines.append(
+            f"  nand: {self.nand_reads} reads, {self.nand_programs} programs, "
+            f"{self.nand_erases} erases"
+        )
         return "\n".join(lines)
 
 
@@ -61,10 +92,21 @@ def boot_firmware(
     *,
     max_instructions: int = 40_000_000,
     config: MachineConfig | None = None,
+    a_dir: str | None = None,
+    b_dir: str | None = None,
 ) -> BootReport:
-    """Load ``path``, boot, and emulate up to ``max_instructions``; return a report."""
+    """Load ``path``, boot, and emulate up to ``max_instructions``; return a report.
+
+    ``a_dir``/``b_dir`` are optional host directories mirrored onto the A:
+    (system) / B: (user ``.gme``) NAND partitions (``nand-image-layout.md`` §5).
+    """
     firmware: Firmware = load_upd(path)
-    booted: BootedMachine = build_machine(firmware, config)
+    booted: BootedMachine = build_machine(
+        firmware,
+        config,
+        a_files=files_from_dir(a_dir) if a_dir else None,
+        b_files=files_from_dir(b_dir) if b_dir else None,
+    )
     machine = booted.machine
 
     hits: list[tuple[int, int, str]] = []
@@ -92,5 +134,11 @@ def boot_firmware(
         checkpoints_hit=hits,
         timer_irqs=booted.machine.intc.timer_irqs if booted.machine.intc else 0,  # type: ignore[attr-defined]
         irqs_delivered=machine.irqs_delivered,
+        keystone=machine.read_u32(KEYSTONE_ADDR),
+        codepage_flag=machine.read_u8(CODEPAGE_FLAG_ADDR),
+        booklist_head=machine.read_u32(BOOKLIST_HEAD_ADDR),
+        nand_reads=booted.nand.reads,
+        nand_programs=booted.nand.programs,
+        nand_erases=booted.nand.erases,
     )
     return report

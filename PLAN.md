@@ -27,7 +27,7 @@ Implemented from **only** `docs/`. High-quality, cross-platform Python.
 
 - [x] CPU + memory map skeleton (Unicorn ARMv5), MMIO dispatch framework, .upd loader, boot recipe, ZC90B; boots to the storage-mount checkpoint (16 tests)
 - [ ] Each hardware peripheral as a model (one module per component doc)
-- [ ] Boot: present an authentic NAND image; run the real firmware to a running state
+- [x] Boot: authentic NAND image + NAND/NFC controller; firmware mounts A:, reads codepage, passes auth, reaches the event-pump statechart (39 tests)
 - [ ] Headless / scripted mode (load a GME, inject taps, capture audio → WAV)
 - [ ] Interactive TUI (Textual): tap OIDs, live audio (sounddevice), controls
 - [ ] Test suite (pytest) + **in-repo test-firmware toolchain**: a C header + Makefile
@@ -45,3 +45,19 @@ Implemented from **only** `docs/`. High-quality, cross-platform Python.
 - Fable-first; some tasks may be flagged to Opus — that's fine.
 - Clean-room: Step-1 agents may read `../firmware-re/`; Step-2 agents read **only** `tt-emu/docs/`.
 - Commit after every deliverable (conventional commits; no internal session URLs).
+
+## Doc corrections to fold in (found during Step 2, code already handles them)
+
+Applied to docs already: 2a's clock bit-12 self-clear; the geometry seed byte +1 = 0.
+
+Deferred (fold into docs in a final pass — the emulator code already accounts for them):
+- **nand-and-nfc-controller.md** — the row-address-cycle count: the boot blob's static
+  value is **2** (blob offset 0x79E0), not the probe's 3; a from-entry boot must seed it
+  to 3, else rows ≥256 truncate to 16 bits, the NFTL scan sees duplicate chain heads, and
+  the system bins get erased. (A §5.6-class seed the docs omit.)
+- **nand-image-layout.md** — the factory **bad-block bitmap at row 2**: `mtd_init` reads a
+  0x1000-byte bitmap (1 bit/block, set = bad) before partition build; an erased (0xFF) page
+  marks every block bad → the mount loops forever. Zero-fill a bitmap at row 2 = no bad
+  blocks. (Runtime home of the ASA data; "omittable" is true for the boot loader, not the mount.)
+- **nand-and-nfc-controller.md §7** — streaming record size: the boot loader's metadata/scan
+  reads use **1024-byte** ECC records (payload from the ECC config word), not a fixed 512.

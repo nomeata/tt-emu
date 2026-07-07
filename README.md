@@ -40,6 +40,18 @@ documents.
 | `tests/` | test suite + in-repo test-firmware build |
 | `PLAN.md` | roadmap / build plan |
 
+## Development
+
+```sh
+python -m venv .venv && . .venv/bin/activate
+pip install -e ".[dev]"      # installs the package + test deps
+pytest                       # run the test suite
+python -m tt_emu path/to/firmware.upd   # headless boot
+```
+
+tt-emu takes the pen's firmware as an input (like a ROM for a console emulator); it is
+not distributed with the tool.
+
 ## License
 
 TBD.

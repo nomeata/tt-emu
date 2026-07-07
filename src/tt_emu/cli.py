@@ -37,6 +37,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--trace-mmio", action="store_true", help="log the first few MMIO accesses per address"
     )
     parser.add_argument(
+        "--a-dir", metavar="DIR", default=None,
+        help="host directory mirrored onto NAND partition A: (system files)",
+    )
+    parser.add_argument(
+        "--b-dir", metavar="DIR", default=None,
+        help="host directory mirrored onto NAND partition B: (user .gme files)",
+    )
+    parser.add_argument(
         "-v", "--verbose", action="count", default=0, help="-v: info, -vv: debug"
     )
     return parser
@@ -56,7 +64,11 @@ def main(argv: list[str] | None = None) -> int:
         trace_mmio=args.trace_mmio,
     )
     report = boot_firmware(
-        args.firmware, max_instructions=args.max_instructions, config=config
+        args.firmware,
+        max_instructions=args.max_instructions,
+        config=config,
+        a_dir=args.a_dir,
+        b_dir=args.b_dir,
     )
     print(report.format_log())
     return 0
