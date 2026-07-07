@@ -22,6 +22,7 @@ import logging
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from .audio_capture import AudioStats
 from .boot import BootedMachine, build_machine
@@ -634,6 +635,7 @@ def run_session(
     a_dir: str | None = None,
     b_dir: str | None = None,
     b_files: dict[str, bytes] | None = None,
+    on_prepared: "Callable[[BootedMachine], None] | None" = None,
 ) -> SessionReport:
     """Boot, inject the ``taps`` sequence, capture audio, optionally write a WAV.
 
@@ -646,6 +648,11 @@ def run_session(
     (``nand-image-layout.md`` §7.3.1): the unmodified firmware then descends
     into book(13) autonomously and ``taps`` should be [product, content, …] —
     the authentic route around the one-heartbeat ``+0x1d`` standby window.
+
+    ``on_prepared`` is an optional callback invoked with the booted machine
+    *before* the run starts, so a caller can attach read-only PC watchpoints
+    (``machine.on_code``) — used to observe the main-binary GME load/launch
+    path (``firmware-2n-mt.md`` §8) without touching firmware behaviour.
     """
     if config is None:
         config = MachineConfig(instructions_per_tick=SESSION_INSTRUCTIONS_PER_TICK)
@@ -653,6 +660,8 @@ def run_session(
         b_files = dict(b_files or {})
         b_files.setdefault(FLAG_BIN_NAME, FLAG_BIN_CONTENT)
     booted, hits = _prepare(path, config, a_dir, b_dir, b_files)
+    if on_prepared is not None:
+        on_prepared(booted)
     session = _TapSession(booted, taps, hits, flag_resume=flag_resume)
     result = booted.machine.run(max_instructions, on_chunk=session.on_chunk)
 

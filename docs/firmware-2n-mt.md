@@ -463,6 +463,109 @@ safe once item 2 passes.
   the assignment rule.
 - **Embedded-binary GMEs** (states 67/69) run their own ARM code; §4's interpreter view
   covers them only up to the launch. Registers/playlist panels are meaningless while such
-  a binary runs.
+  a binary runs. The load/launch path itself is **fully exercised** — see §8.
 - All addresses are specific to **N0038MT / 20131009**; any other build (including the
   older non-MT 3202 image) relocates them — hence the hard gate in §1.
+
+---
+
+## 8. Main-binary (embedded-code) GMEs
+
+Most GMEs are **play-script** GMEs: the firmware's GME *interpreter* (§4) walks
+their tables. A **main-binary GME** is different — it carries a native ARM blob
+that the firmware **loads and executes**, and that blob drives the game by
+calling back into the firmware through a ~90-entry `system_api` table. This is a
+2N/ZC3202N-only feature. The emulator runs such a GME **with no code changes and
+no hooks** — the unmodified firmware does all of it — demonstrated end-to-end by
+`tests/test_main_binary.py` against `tests/data/main_binary/minimal_mb.gme`.
+
+### 8.1 The header fields that select it
+
+| GME hdr off | field | firmware use |
+|---|---|---|
+| 0xA4 | **separate-binary flag** (1 byte) | read as `*0x081DA088`; `== 1` means "this product ships a separate main binary → launch it" |
+| 0xA8 | **main-binary table** (ZC3202N) | `gme_read_main_binary_table` reads it → `{binOff, binLen}` → state 69 |
+| 0x98 | additional game-binaries table | non-zero → state 67 (`gme_binary_subgame`) |
+| 0xA0 / 0xC8 | ZC3201 / ZC3203L binary tables | not the MT pen's slots |
+
+Binary-table layout: a 16-byte header (the skipped 0th slot) then, at `+0x10`,
+the real entry `{u32 binOff, u32 binLen, char name[8]}`. **Observed** (loader
+reads at table+0x10; blob then follows). The header `0xA4` flag being 1 is
+mandatory — otherwise the firmware treats the whole offset region as absent.
+
+### 8.2 The load / launch path (all Observed, addresses N0038MT)
+
+On the authentic `flag_resume` + product-tap flow (§4, `nand-image-layout.md`
+§7.3) the firmware mounts the product and then, **on its own**, with no special
+content tap:
+
+1. **`gme_oid_dispatch` @0x0803629C** (book(13) default handler, runs every
+   dispatch): if `*0x081DA088 == 1` (separate flag, hdr@0xA4) **and** the
+   product-mounted flag `akoid_buf[0x4A8] == 1` **and** `is_audio_playing()==0`,
+   it posts **event 0x1045** and sets `akoid_buf[0x4A8]=2`.
+2. **0x1045 → push state 69** `gme_separate_binary`. Its entry runs
+   **`gme_read_main_binary_table` @0x080AADD8**: `fs_seek(gme, 0xA8)` → table
+   offset; `fs_seek(table+0x10)` → reads `binOff` (→`*0x080AADD4`) and `binLen`;
+   logs `"Firmware address = %x,File len=%d."`. State 69 then posts **0x101B**.
+3. **0x101B → push state 67** `gme_binary_subgame`. Its handler
+   `gme_oid_dispatch_alt` @0x080AAF70 (event-action slot 15) calls
+   **`gme_launch_binary_build_sysapi` @0x080AA934**, which:
+   - `gme_alloc_binary_region` @0x08038C5C returns the load address
+     **0x08132000** and a region size of **0x10000 (64 KiB)**;
+   - fills a ~90-word `system_api` struct on the stack from a ROM pointer pool;
+   - `fs_seek(gme, binOff); fs_read(gme, 0x08132000, binLen)` — loads the blob;
+   - **`(*(code*)0x08132000)(&system_api)`** — jumps in with `r0 = &system_api`.
+
+State 67's handler calls the launcher **on every event-pump cycle**, so the blob
+is re-loaded and re-run each tick — the blob *is* the game's per-tick handler
+(it must return; `bx lr` re-enters the firmware). The blob is entered in ARM
+state at the region base; a one-instruction `b main`-style thunk at 0x08132000
+is the usual entry (`startup.s`).
+
+### 8.3 The `system_api` table (offsets verified against N0038MT)
+
+`r0` points at the struct; each field is `offset = slot*4`. The pointers are all
+ordinary firmware functions the emulator is already running, so a blob's callback
+lands in real firmware code with no special support:
+
+| off | field | firmware fn (N0038MT) |
+|---|---|---|
+| +0x0C | `is_audio_playing` | 0x0800B024 |
+| +0x14 | `open`  | 0x0800DE20 (`fs_open`) |
+| +0x18 | `read`  | 0x0800DEC8 (`fs_read`) |
+| +0x1C | `write` | 0x080AD4E4 |
+| +0x20 | `close` | 0x080AD514 |
+| +0x24 | `seek`  | 0x0800DED8 |
+| +0x2C | `play_sound(fh,off,len)` | 0x080AB7B4 (`play_media`, §4.5) |
+| +0x34 | `fpAkOidPara` | → the game-context akoidpara base |
+| +0x38 | `p_filehandle_current_gme` | → `0x08121ED0` (the mounted GME handle, §4.2) |
+
+A blob plays bundled media #i by reading the media table (hdr@0x04) for the
+`(offset,len)` pair and calling `play_sound(*p_filehandle_current_gme, off, len)`
+— the same `play_media` path as a script GME, so the media/codec/XOR chain (§4.5)
+applies unchanged.
+
+### 8.4 What the emulator must present
+
+**Nothing beyond a normal firmware run.** The load region 0x08132000 is inside
+the main-RAM mapping (`memory-map-and-boot.md` §2: `[0x08000000,0x08400000)`),
+already present; the blob's callbacks are firmware functions already executing;
+the mount + `flag_resume` + product-tap flow (§4) already reaches book(13). No
+hook, no extra peripheral, no special load step is required — the firmware
+detects, loads, and jumps to the blob itself. A debugger/TUI can *observe* the
+path with read-only PC watchpoints on 0x080AADD8 (loader), 0x080AA934 (launcher)
+and 0x08132000 (blob entry); `run_session(on_prepared=…)` is the wiring point.
+
+**Evidence** (`tests/test_main_binary.py`, firmware unmodified): a minimal blob
+that writes a marker word and calls `is_audio_playing` + `play_sound` produces
+the state chain `splash(1)→standby(3)→mount(12)→book(13)→69`, hits 0x080AADD8 /
+0x080AA934 / 0x08132000, and leaves `MARK[0]=0xDEADBEEF` + the post-call
+sentinels at 0x08141F00 — i.e. the embedded code ran and its `system_api` calls
+reached firmware and returned.
+
+> **Note — address conventions.** The addresses above are for the **N0038MT**
+> image this emulator boots (loader 0x080AADD8, launcher 0x080AA934). Other
+> tiptoi firmware images/generations (e.g. the non-MT Update3202 or the ZC3201
+> variant) place the loader/launcher at different addresses (around 0x080A0894 /
+> 0x080A03F0); the load address 0x08132000 and the `system_api` slot layout are
+> the same across them.
