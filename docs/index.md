@@ -31,6 +31,8 @@ Every fact below is drawn from the component docs (each marks items **Observed**
 - *Serve NAND reads/writes at the register or function seam* → `nand-and-nfc-controller.md`
   (the chip + controller + the row/AU **address decode**).
 - *Build a bootable flash image (what bytes go where)* → `nand-image-layout.md`.
+- *Get a book to actually load and play (drive `b:` mount, the autonomous discovery
+  scan, booklist, the tap sequence)* → `nand-image-layout.md` §7.
 - *Inject an OID tap the firmware decodes itself* → `oid-sensor.md`.
 - *Capture audio / drive the DMA-done interrupt* → `audio-dac-dma.md`.
 - *Present pins: buttons, power-hold, amp, straps* → `gpio-buttons-led.md` (the
@@ -65,7 +67,7 @@ Every fact below is drawn from the component docs (each marks items **Observed**
 | `system-control-and-clock.md` | Core block `0x04000000–FF`: chip-ID `+0x00`=`0x30393031`; clock/PLL `+0x04` (bits 13/14/21 read 0); audio clock `+0x08`; clock gate `+0x0C` (**not** a watchdog — there is none); analog-PD `+0x10` bit8 reads 0; standby handshake; boot-tag `+0x54`; **no reset register — power-off is GPIO15**. |
 | `interrupts-and-timers.md` | Three IRQ lines (0 audio, 6 USB, 10 timer/GPIO); regs `0x04000034` enable / `0x040000cc` pending / `0x0400004c` 2nd-level / `0x04000018` timer1 (reload 240000 = 20 ms, ack bit28); vector `0x08000018`, IRQ SP `0x0841f000`; system tick `0x08008d24`; 6-slot software-timer table `0x0800895c`; pacing rules. |
 | `nand-and-nfc-controller.md` | NFC `0x0404A000` (cmd-list `+0x100`, GO/status `+0x158` bit31), ECC `0x0405B000` (answer `0x7000040`), L2/DMA `0x04010000` + SRAM window `0x08006800`; logical geometry; the **(row,col)→byte-offset AU decode**; primitive ops; the reactive register-level model. |
-| `nand-image-layout.md` | On-flash layout: boot blob, system bins (PROG+codepage, linear), block-0 metadata rows (zone table @row 255, bin-info @253/254, maps @200/201); NFTL 8-byte spare tags; two FAT16 superfloppy partitions A: (system) / B: (user `.gme`); the image-builder recipe. |
+| `nand-image-layout.md` | On-flash layout: boot blob, system bins (PROG+codepage, linear), block-0 metadata rows (zone table @row 255, bin-info @253/254, maps @200/201); NFTL 8-byte spare tags; two FAT16 superfloppy partitions A: (system) / B: (user `.gme`); the image-builder recipe; **§7 the runtime mount→discovery→tap chain** (drive registration, the autonomous standby-entry discovery scan, `a:/oidfilelist.lst`, booklist, the product-product-content tap sequence, failure signatures). |
 | `oid-sensor.md` | Two-wire sensor on GPIO2 (clock) / GPIO9 (data); 32-bit frame `((0x400000\|(N&0x3FFFF))<<9)\|0x100\|0xF0`; capture state `0x08008c08`; tap posts event `0x1060`; 40 ms poll; the inject-a-tap state machine. |
 | `audio-dac-dma.md` | DMA engine `0x04010000` (kick bit16, start bit13, spurious-check `0x0401001c`=0); DAC `0x04080000`; S16LE stereo, GME=22050 Hz; line-0 done IRQ; ring `0x08008d30` (vol Q10 `+0x14`=0x108, size `+0x40`); **pace completion = bytes/(4·rate)**; never touch the tick. |
 | `gpio-buttons-led.md` | GPIO regs (dir `0x7C`, out `0x80` reads-back, in `0xBC`, int-en/pol `0xE0/E4/F0/F4` read 0); **full pin map**; idle `GPIO_IN` = `0x00003201`; buttons → event `0x105F`; power-hold GPIO15; test-mode chord; no LED, no watchdog. |
@@ -124,7 +126,7 @@ buffers at `0x08006A00..` (`nand-and-nfc-controller.md` §7).
 | `0x08121d44` | Statechart state-descriptor table (static .data, in PROG.bin) | memory-map-and-boot |
 | `0x08122718` | USB BOT phase byte (.data initializer = 3) | usb-musb-device |
 | `0x081da07c` | Standby auto-off counter (u16; > 300 heartbeats → power off) | battery-and-power |
-| `0x081da080` | Booklist head | memory-map-and-boot |
+| `0x081da080` | Booklist head (non-NULL ⇔ the standby entry action ran; count u16 at +0) | memory-map-and-boot, nand-image-layout §7 |
 | `0x081db730` | Codepage-active flag byte | memory-map-and-boot |
 | `0x081db904` | `g_state` | memory-map-and-boot |
 | `0x081db984` | Mem-driver vtable "keystone" (.bss; self-built by NFTL init) | memory-map-and-boot |

@@ -325,7 +325,9 @@ a value the skipped stage would have produced (not a behaviour patch):
    splash/standby (entry-only, no exit actions); from .bss it is 0, which triggers a
    spurious full root→…→book descent whose state-0 *exit* action clobbers a
    product-load gate byte. Seed it before (or at the first call of) `sm_state_entry`
-   `0x080f2e0c`.
+   `0x080f2e0c`. (The clobbered gate byte is `akoid_buf[0x21]` — it must still read
+   `0xFF` at the first product tap or the tap is silently ignored; see the image
+   doc's runtime chain, `nand-image-layout.md` §7.3.)
 
 3. **HAL leaf return override `0x07ffe740 → 1`** (see §5.4 item 2), *if* your timer HW
    model isn't faithful enough for the calibration to pass on its own.
@@ -336,6 +338,29 @@ a value the skipped stage would have produced (not a behaviour patch):
    not guaranteed to be it. If the vtable copy garbles (symptom: mount populates
    nothing, later bogus divide-by-zero), implement a plain memcpy leaf at
    `0x08003118` (args r0=dst, r1=src, r2=len, return via lr).
+
+**Runtime state the discovery/book-load chain depends on** (Observed; *not* seeds —
+the firmware produces all of it by itself once the items above and the GPIO defaults
+hold; listed here because a from-entry boot that gets any of them wrong fails
+*silently*, with an empty booklist as the only symptom):
+
+- **Game discovery runs inside the standby(3) ENTRY action**, once per boot, on the
+  splash→standby transition — autonomous, before and independent of any tap. So the
+  run must *actually enter standby through the statechart* (timer IRQs delivered,
+  GPIO8 = 0 so the USB-detect state falls through to standby). Proof it happened:
+  the booklist head pointer `0x081da080` is non-NULL (it is written unconditionally
+  by the entry action, *before* any gating) — if it is still 0, the entry action
+  never executed and no tap can ever mount anything.
+- **Game-context byte `+0x1e` (base `0x080089a4`) must not be 2** at standby entry
+  (2 = USB-session marker) or discovery is skipped; GPIO8 = 0 keeps it 0.
+- **Game-context byte `+0x1d` == 2 and `akoid_buf[0x21]` == 0xFF at the first
+  product tap** (both firmware-written: standby entry / OID-subsystem init; the
+  frame seed above is what keeps `[0x21]` alive). Tap reasonably soon after standby
+  entry — prolonged no-product idling re-arms `+0x1d` to 8 and the ~300-heartbeat
+  auto-off powers the pen down.
+
+The full mount→discovery→tap contract, tap sequence (product, product, content) and
+failure-signature table live in `nand-image-layout.md` §7.
 
 Explicitly **not** needed (they self-build; earlier beliefs to the contrary were wrong):
 the mem-driver vtable "keystone" `0x081db984` (the firmware's own NFTL init writes
@@ -350,7 +375,10 @@ allocator (PROG's own heap works). **Zero RAM-dump seeding is required.**
 driver: geometry checks → a full ~4096-block NFTL scan → partition build →
 **codepage load** (reads the codepage bin by physical row; a valid read is a hard
 success precondition — an empty answer takes the mount-failure branch = LED-blink
-hang) → FAT partition scan of A: (if no FAT16 signature is found the firmware
+hang; a *garbled* load is worse — the boot proceeds but every later ANSI→UTF-16
+device-path conversion produces garbage, so all opens/opendirs fail silently and
+discovery finds nothing, `nand-image-layout.md` §7.4) → FAT partition scan of A:
+(if no FAT16 signature is found the firmware
 *formats* A: itself — presenting a valid A: image avoids that detour). All of this is
 served by the NAND model (reconstructed from the .upd per §3); the seam can be at the
 NFC-register level or at the blob's physical page-read leaves — both work; details in
@@ -365,6 +393,9 @@ the NAND/NFC documents. No RAM-side seeding substitutes for it.
 | Mount OK | `fs_storage_mount_init` returns 0; no format path, no LED-blink hang |
 | Main loop idle | event pump spinning at `0x0800b4ac–0x0800b4d4` (ring head==tail at `0x08008958/0x0800895a`), ~9–15 M instructions in |
 | Statechart alive | with timer IRQs + GPIO bit8=0: states walk 0→1(splash)→3(standby)→…→13(book) on an OID product tap |
+| Standby truly entered | booklist head `*0x081da080` != 0 (written unconditionally by the standby entry action) |
+| Discovery ran | `a:/oidfilelist.lst` opened/created + booklist count (u16 at iterator +0) > 0 — see `nand-image-layout.md` §7.2/§7.4 |
+| Book plays | product tap ×2 then a content tap → header match (magic 0x238B, product-id@+0x14) → media decodes (`nand-image-layout.md` §7.3) |
 
 ---
 

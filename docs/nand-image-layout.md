@@ -98,7 +98,7 @@ geometry.
 `dev[0x14]` = 256 (row stride per block — see `nand-and-nfc-controller.md` §3).
 Reads at these rows fetch a **0x1000-byte payload**. The exact correspondence
 between "row 255" and "page 63 of block 0" in the authentic AU row space is an
-open point (§7); an emulator sidesteps it by serving these specific row numbers
+open point (§8); an emulator sidesteps it by serving these specific row numbers
 with the payloads below — Observed to satisfy both the boot loader and the mount.
 
 The 4-byte magics double as the payload prefix for the map/bin-info pages (the
@@ -221,7 +221,7 @@ Factory-side equivalent (Observed from the factory programmer, page 61/62 forms)
 bin-info records are `{u32 len_bytes; u32 load_addr; u32 map_page; u32 start_block;
 u32 0; char name[16]}` with a `{3,0,0,nbins}` header page — same stride and name
 offset; the field-for-field correspondence to the row-253/254 form is not fully
-reconciled (§7). Emulators should serve the row form above.
+reconciled (§8). Emulators should serve the row form above.
 
 ### 2.4 System-bin region
 
@@ -502,15 +502,176 @@ resurrects stale FAT sectors and the scan sees two heads for one logical block);
 copy-back moves data+tag verbatim. That is all — every higher NFTL/FAT structure
 is firmware RAM state rebuilt through these seams.
 
-Boot outcome (Observed under emulation): the boot loader finds PROG via rows
-254/253/200, the mount reads row 255, builds the medium over blocks 134–4095,
-mounts A (drive `a:`) and B (drive `b:`), discovery enumerates the `.gme` on B:
-and writes `B:/<name>.gme` into `a:/oidfilelist.lst`, and the firmware's own
-writes (log, profile, `.lst`) COW into free blocks and read back consistently.
+Boot outcome: the boot loader finds PROG via rows 254/253/200, the mount reads
+row 255, builds the medium over blocks 134–4095, and registers **both** drives —
+A (`a:`) and B (`b:`) — when both FAT images are valid (Observed under emulation).
+The firmware's own writes (log, profile, `.lst`) COW into free blocks and read
+back consistently (Observed). **Caveat:** the *end-to-end play chain* (discovery →
+booklist → tap-mount → media) is Observed with the `.gme` reachable on **A:**
+(discovery's second pass); the B:-pass *directory enumeration* of placed B:
+content returned 0 entries in the reference validation and is an **open issue**
+(§7.5, §8) — until it is proven, place the `.gme` on A: as well. The full runtime
+chain and its failure signatures are in §7.
 
 ---
 
-## 7. Gaps / open questions
+## 7. ★ Runtime: mount → discovery → tap — how a book actually starts
+
+Building the image (§6) is necessary but not sufficient: the firmware only plays a
+book after a specific runtime chain has run over that image. This section is the
+behavioural contract the emulator must let happen (all firmware-side — the emulator
+presents hardware and taps, nothing else). Statechart state numbers follow the boot
+doc's convention: 1 = splash, 3 = standby, 12 = mount, 13 = book.
+
+### 7.1 The mount: what registers drives `a:` and `b:` (Observed)
+
+`fs_storage_mount_init` (from `app_init_main`), in order:
+
+1. Reads the zone table (row 255) and builds the ONE FS-area medium over
+   `[fs_start, 4096)`.
+2. Carves partition A = sectors `[0, 8·AddrCnt_A)` and B = `[8·AddrCnt_A,
+   8·(AddrCnt_A+AddrCnt_B))` from the medium (AddrCnt in AU; §2.2).
+3. **Loads the codepage bin** (by physical row, below the FS area). A valid load is
+   a hard mount precondition (empty answer → mount-failure branch → LED-blink
+   hang). It matters *twice*: the loaded NLS tables also perform every later
+   **ANSI→UTF-16 device-path conversion** — a garbled codepage load produces
+   garbled paths and every subsequent `open`/`opendir` fails *silently* (§7.4).
+4. **FAT-scans A** at partition-relative sector 0 (§5 rules). On failure the
+   firmware **formats A in place** and proceeds. Registers the volume as
+   **drive 0 = `a:`**.
+5. **FAT-scans B.** On failure it only sets an error flag — **B is never
+   auto-formatted, and drive 1 = `b:` stays unregistered**; the boot continues
+   normally with no other symptom.
+
+So **B: mounts iff** the image provides: a Symbol-1 `Zone_Group` record with a sane
+AU `AddrCnt` (§2.2), and a valid FAT16 superfloppy VBR at B's partition-relative
+sector 0 = physical block `fs_start + AddrCnt_A/32` (= 614 with the §6 constants),
+whose placed blocks carry valid head tags (`logical = physical − fs_start`, i.e.
+B's first block is logical 480).
+
+**Signature of an unregistered `b:`** (Observed mechanism): path resolution maps
+`toupper(path[0]) − 'A'` into the registered-drive array and rejects out-of-range
+indices **before any device I/O** — so *zero reads in B's physical block range,
+ever*, is what "B: didn't mount" looks like. It is not a scan that skipped B:; it
+is every `B:/…` open/opendir being rejected at the drive-letter check.
+
+### 7.2 Game discovery: autonomous, at standby entry, once per boot (Observed)
+
+Discovery is **not** triggered by a tap. It runs inside the **standby(3) entry
+action** when the statechart transitions splash→standby (once per boot — re-entering
+standby from book/USB does not re-run the entry hook). The entry action, in order:
+
+1. Sets the game-context byte `+0x1d = 2` (context base `0x080089a4`; the "fresh
+   standby" marker, §7.3).
+2. **Unconditionally** allocates the 0x240-byte booklist iterator, stores its
+   pointer at **`0x081da080`** ("booklist head") and zeroes it.
+   → *Diagnostic:* `*0x081da080 == 0` means **the standby entry action never
+   executed at all** (the run never truly entered standby via the statechart);
+   non-zero with count 0 (u16 at iterator +0) means discovery was skipped or
+   found/wrote nothing.
+3. Opens/creates serial + log files on A: (real FAT writes — A: must be mounted
+   and writable through the normal write path).
+4. **Gate:** if game-context byte `+0x1e != 2` (the USB-session marker; it stays 0
+   when GPIO8 = 0), runs the discovery scan:
+   - opens **`a:/oidfilelist.lst`** read/write, creating it if absent;
+   - recursively enumerates root **`"B:"`** for `*.gme` (wildcard applied by the
+     FAT enumeration; subdirectories recursed, `./`/`../` skipped), then patches
+     the root's drive letter to `'A'` and enumerates **A:** the same way;
+   - writes a 0x424-byte header + one **0x214-byte record per file** — 3
+     bookkeeping u32s + the UTF-16 absolute path (`L"B:/name.gme"` /
+     `L"A:/name.gme"`), nothing else (no product-id, no OID data);
+   - sets the booklist count from the **in-RAM** record counter, flushes, and
+     **keeps the file handle open** — every later record fetch is a real
+     `seek(0x424 + i·0x214)` + `read(0x214)` on that same handle.
+
+Properties that matter for the emulator:
+
+- The `.lst` is a **rebuilt-per-boot cache**. The tap-time mount consults *only*
+  this boot's scan; a pre-existing `.lst` on disk never supplies the count. The
+  **write and the read-back are both on the critical path** — the whole chain runs
+  through the real FAT/NFTL write model.
+- **Silent degradations** (no crash, no error output): `.lst` unopenable → the
+  scan runs in a probe mode that writes nothing (count 0); `b:` unregistered → the
+  B: pass no-ops (§7.1); no `.gme` found → count 0. Count 0 surfaces only later,
+  as error voice 0x2D on the mount tap.
+- A second discovery site exists in the standby idle handler: **GPIO11 == 1**
+  triggers a rescan **plus a soft reboot** — keep GPIO11 = 0 (see the GPIO doc).
+
+### 7.3 The tap sequence: product, product, content (Observed)
+
+Loading and playing a book takes **three taps** (values read off the GME file
+itself, so this works for arbitrary GMEs):
+
+- **product OID** = the u32 at GME header offset **0x14** (must be ≤ 0x3E7 = 999);
+- **content OID** = any OID in the GME's script range (e.g. its first script OID).
+
+**Tap 1 — product OID at fresh standby → book mode (no mount yet).** The global
+classifier's *first-load* branch fires for any tapped code ≤ 0x3E7, gated on five
+bytes of firmware-produced state (no seeding — they arise naturally given the boot
+doc's frame seed and GPIO defaults; `akoid_buf` = the OID working buffer, pointer at
+game-context `+0x20` — see the OID sensor doc):
+`akoid_buf[0] == 1` (pen-down, set by the decode), game-context `+0x1d == 2` (set
+by standby entry), `akoid_buf[0x21] == 0xFF` ("no product loaded", set by the OID
+subsystem init and *preserved* only if the boot never runs the spurious root-exit —
+the frame-seed's purpose), the OID capture-state byte `0x08008C0D != 0xFF`
+(firmware-initialised), plus `akoid_buf[0xB3] == 0` (production-test flag; stays 0
+unless the test-mode button chord is held). It posts events 0x104A + 0x1058 →
+**state 12** (its entry
+scans `B:/` for `*.bnl` retail archives — an empty result is harmless) → 0x1059 →
+**book(13)**. Book entry zeroes the script context, clears `akoid_buf[0x21]`, and
+plays the book-open system voice. **The GME is not mounted by this tap.**
+
+**Tap 2 — the same product OID, in book(13) → the real mount.** The classifier
+gate now fails (`[0x21] == 0`), so the event reaches the book handler's OID
+dispatch: product band → **linear probe over the booklist** — for each recorded
+path: open the file; accept iff magic **0x238B at +0x08**, language field at
+**+0x59** matches the pen language (an all-zero field passes; default GERMAN), and
+product-id at **+0x14 == the tapped value**. On success the handle is kept (ptr at
+`0x08121ed0`), the header is parsed (current product → `0x081da08c`, content-OID
+range, media XOR key from hdr@0x71, cover selectors from hdr@0x94). On a count-0
+or no-match booklist: error voice 0x2D.
+
+**Tap 3 — a content OID → the script runs and media plays.**
+
+**Pacing** (Observed under emulation): arm each tap only at the event-pump idle
+(see the OID doc §6). Tap 1 should come reasonably soon after standby entry —
+prolonged no-product idling re-arms `+0x1d` from 2 to 8 and the standby auto-off
+(~300 heartbeats) powers the pen down. Before tap 2, the book-entry voice must
+reach EOF: the dispatch **stops audio before mounting** and spins until playback
+drains, so the audio model must deliver DMA-done completions to EOF. Between
+mount and tap 3, likewise let the pump go idle.
+
+### 7.4 Failure signatures — fast diagnosis (Observed mechanisms)
+
+| symptom | meaning |
+|---|---|
+| `*0x081da080 == 0` at "standby" | the standby **entry action never ran** — the run is not actually in statechart standby (frame seed / timer-IRQ / event-delivery problem), so discovery was never invoked |
+| booklist allocated, no `a:/oidfilelist.lst` open ever attempted | discovery gate closed: game-context `+0x1e == 2` (USB marker — check GPIO8 = 0) |
+| `.lst` open attempted with garbled path bytes (or fails), 0 reads on **both** drives' data | codepage NLS misload — path conversion broken; verify the codepage load served the real bin bytes (the cached NLS header at `0x081db748` must equal the codepage bin's bytes at file offset 0x2E0) |
+| `.lst` created, header only, count 0; **zero I/O ever in B's block range** | drive `b:` unregistered — B FAT invalid/absent at physical `fs_start + AddrCnt_A/32` (§7.1); and no `.gme` was on A: |
+| booklist count 0 → tap 2 yields voice 0x2D | discovery ran but wrote no records (combine with the rows above) |
+| tap 1 does nothing at standby | first-load gate bytes wrong — usually `akoid_buf[0x21] != 0xFF` (root-exit clobber → frame seed missing) or `+0x1d != 2` (tap too late / entry never ran) |
+| tap 2 never reaches the mount | book-entry audio never reached EOF — the pre-mount audio-stop spins (audio completion model) |
+
+### 7.5 Verification status
+
+- **Observed end-to-end** (reference emulation): image with the `.gme` reachable on
+  **A:** → mount → standby-entry discovery (B: pass no-op, A: pass finds it) →
+  booklist ≥ 1 → product-tap ×2 + content-tap → header match → media decodes and
+  plays.
+- **Observed:** two-FAT image (A: system + B: game) → both drives register; B's
+  VBR at physical 614 is read and accepted; mount returns success.
+- **NOT yet Observed (open):** the discovery B: pass *enumerating* placed B:
+  content — in the reference validation the directory enumeration over the mounted
+  `b:` returned 0 entries (cause unresolved; possibly a translation-layer detail
+  for logical blocks ≥ 480, possibly a reference-model artifact). Until proven,
+  ship the `.gme` on **A:** (alone or in addition to B:) — the A: pass finds it
+  through exactly the same firmware path, and a `.gme` on A: is also found on a
+  real pen.
+
+---
+
+## 8. Gaps / open questions
 
 - **Real-pen values of `fs_start` and the bin start block** — host-chosen at the
   factory, never read off a physical pen; 134/8 are self-consistent choices, and
@@ -532,3 +693,8 @@ writes (log, profile, `.lst`) COW into free blocks and read back consistently.
   no parity).
 - **ASA and RB/UB dual copies** are documented but not modelled; needed only for
   bad-block or self-update emulation.
+- **B:-pass discovery enumeration** (§7.5): with a two-FAT image both drives
+  mount, but the reference validation's directory enumeration over `b:` returned
+  0 entries where the same enumeration over `a:` works. Unresolved whether this is
+  a firmware-side translation subtlety for partition-B logical blocks (≥ 480) or a
+  reference-model artifact. Workaround (fully authentic): keep the `.gme` on A:.
