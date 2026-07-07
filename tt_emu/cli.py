@@ -1,15 +1,14 @@
 """Command-line entry point: ``python -m tt_emu`` / ``tt-emu``.
 
-Boots the firmware headless and prints the run log (§5.8 checkpoints and the
-stop condition). With ``--tap`` a scripted session runs instead: boot into
-book mode (the power-on descent, ``nand-image-layout.md`` §7.3.1a), inject
-the taps through the OID sensor model, capture the audio the firmware plays
-and (with ``--wav``) write it out — the full
-boot → tap product → tap content → WAV chain.
+By default ``tt-emu`` launches the interactive TUI (:mod:`tt_emu.tui`). With
+``--headless`` it runs the scripted, no-UI flow instead: boot the firmware,
+optionally inject taps through the OID sensor model, capture the audio the
+firmware plays and (with ``--wav``) write it out — the full
+boot → tap product → tap content → WAV chain — printing the run log.
 
-The firmware argument is optional: when omitted, the official
-``update3202MT.upd`` is downloaded from Ravensburger's CDN, SHA-256 verified
-and cached (see :mod:`tt_emu.firmware_fetch`).
+The firmware argument is optional in both modes: when omitted, the official
+``update3202MT.upd`` is downloaded from Ravensburger's CDN, SHA-256 verified and
+cached (see :mod:`tt_emu.firmware_fetch`).
 """
 
 from __future__ import annotations
@@ -37,8 +36,8 @@ DEFAULT_SESSION_BUDGET = 800_000_000
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="tt-emu",
-        description="Headless tiptoi 2N ('MT') pen emulator — boot the real firmware.",
+        prog="tt-emu --headless",
+        description="Scripted (no-UI) tiptoi 2N ('MT') pen emulator — boot, tap, capture.",
     )
     parser.add_argument(
         "firmware",
@@ -82,13 +81,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="host directory mirrored onto NAND partition B: (user .gme files)",
     )
     parser.add_argument(
-        "--game", metavar="GME", action="append", default=[],
+        "--gme", metavar="GME", action="append", default=[],
         help=".gme file placed on partition B: (repeatable)",
     )
     parser.add_argument(
         "--tap", metavar="OID", action="append", default=[],
         help="OID to tap once the pen is idle (repeatable, in order); "
-        "'product' = the product code of the first --game",
+        "'product' = the product code of the first --gme",
     )
     parser.add_argument(
         "--wav", metavar="FILE", default=None,
@@ -100,7 +99,8 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
+def run_headless(argv: list[str] | None = None) -> int:
+    """The scripted, no-UI flow (``tt-emu --headless``)."""
     args = build_parser().parse_args(argv)
     level = logging.WARNING
     if args.verbose == 1:
@@ -118,15 +118,15 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     b_files: dict[str, bytes] = {}
-    for game in args.game:
-        p = Path(game)
+    for gme in args.gme:
+        p = Path(gme)
         b_files[p.name] = p.read_bytes()
 
     taps: list[int] = []
     for spec in args.tap:
         if spec == "product":
             if not b_files:
-                print("--tap product requires --game", file=sys.stderr)
+                print("--tap product requires --gme", file=sys.stderr)
                 return 2
             taps.append(gme_product_code(next(iter(b_files.values()))))
         else:
@@ -161,6 +161,17 @@ def main(argv: list[str] | None = None) -> int:
         )
     print(report.format_log())
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Entry point: launch the TUI by default; ``--headless`` runs the scripted flow."""
+    args = list(sys.argv[1:] if argv is None else argv)
+    if "--headless" in args:
+        args.remove("--headless")
+        return run_headless(args)
+    from .tui import main as tui_main
+
+    return tui_main(args)
 
 
 if __name__ == "__main__":

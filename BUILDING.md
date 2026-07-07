@@ -33,7 +33,7 @@ their own) and keeps the emulator faithful to the hardware rather than to any on
 | `docs/` | hardware-interface documentation (start at [`docs/index.md`](docs/index.md)) |
 | `docs/firmware-2n-mt.md` | the specific firmware build the debugger understands |
 | `tt_emu/` | the emulator implementation |
-| `tt-emu`, `tt-emu-tui` | executable wrappers to run straight from a checkout |
+| `tt-emu` | executable wrapper to run straight from a checkout |
 | `tests/` | test suite + the in-repo test-firmware toolchain (`tests/firmware/`) |
 | `scripts/` | tooling — e.g. `screenshot.py`, which regenerates the README screenshot |
 | `PLAN.md` | roadmap / build plan |
@@ -52,12 +52,12 @@ from a checkout as long as the dependencies are in your active environment — n
 install of the package needed:
 
 ```sh
-python -m tt_emu.tui --game game.gme     # or: python -m tt_emu … (headless)
-./tt-emu-tui --game game.gme             # the executable wrappers, equivalently
+python -m tt_emu --gme game.gme          # the TUI; add --headless for the scripted flow
+./tt-emu --gme game.gme                  # the executable wrapper, equivalently
 ```
 
-The editable install above additionally puts the `tt-emu` / `tt-emu-tui` console commands
-on your PATH; it's a convenience, not a requirement for running the code.
+The editable install above additionally puts the `tt-emu` console command on your PATH;
+it's a convenience, not a requirement for running the code.
 
 ## The test-firmware toolchain
 

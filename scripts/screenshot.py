@@ -10,7 +10,7 @@ saves an SVG screenshot. Regenerate with:
 
 The firmware argument is optional — omitted, it downloads/caches the official
 .upd (see tt_emu.firmware_fetch). The game/yaml default to the taschenrechner
-sources; override with --game / --yaml.
+sources; override with --gme / --yaml.
 """
 from __future__ import annotations
 
@@ -65,7 +65,7 @@ async def _drive(firmware: str, game: Path, yaml: Path | None, out: Path, timeou
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Generate the README TUI screenshot (SVG).")
     parser.add_argument("--firmware", default=None, help="path to the .upd (default: auto-download)")
-    parser.add_argument("--game", type=Path, default=_DEFAULT_GAME)
+    parser.add_argument("--gme", type=Path, default=_DEFAULT_GAME)
     parser.add_argument("--yaml", type=Path, default=_DEFAULT_YAML)
     parser.add_argument("--out", type=Path, default=_DEFAULT_OUT)
     parser.add_argument("--timeout", type=float, default=120.0)
@@ -74,7 +74,7 @@ def main(argv: list[str] | None = None) -> int:
     firmware = str(ensure_firmware(args.firmware))
     yaml = args.yaml if args.yaml and args.yaml.exists() else None
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    asyncio.run(_drive(firmware, args.game, yaml, args.out, args.timeout))
+    asyncio.run(_drive(firmware, args.gme, yaml, args.out, args.timeout))
     print(f"wrote {args.out}")
     return 0
 

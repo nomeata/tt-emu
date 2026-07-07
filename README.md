@@ -18,9 +18,9 @@ YAML.](docs/tui-screenshot.svg)
 
 ## Installation
 
-tt-emu is a Python package (3.10+, cross-platform: Linux / macOS / Windows) that installs
-two commands, `tt-emu` (headless) and `tt-emu-tui` (interactive). Install it straight from
-GitHub with [uv](https://docs.astral.sh/uv/) — no clone, no PyPI:
+tt-emu is a Python package (3.10+, cross-platform: Linux / macOS / Windows). It installs one
+command, `tt-emu` — the interactive TUI by default, or the scripted flow with `--headless`.
+Install it straight from GitHub with [uv](https://docs.astral.sh/uv/) — no clone, no PyPI:
 
 ```sh
 uv tool install git+https://github.com/nomeata/tt-emu
@@ -29,7 +29,7 @@ uv tool install git+https://github.com/nomeata/tt-emu
 Or run it once without installing, using `uvx`:
 
 ```sh
-uvx --from git+https://github.com/nomeata/tt-emu tt-emu-tui --game game.gme
+uvx --from git+https://github.com/nomeata/tt-emu tt-emu --gme game.gme
 ```
 
 pipx and pip take the same git URL if you prefer them (`pipx install
@@ -47,14 +47,14 @@ servers, verifies it against a pinned SHA-256, and caches it (reused offline aft
 Pass a path to use your own `.upd` instead. (Games — `.gme` files — you supply yourself.)
 
 ```sh
-# headless: boot, tap a game's product code + a content code, capture the audio to a WAV
-tt-emu --game game.gme --tap product --tap 4716 --wav out.wav
-
-# interactive TUI: tap OID codes and hear the audio live
-tt-emu-tui --game game.gme
+# interactive TUI (the default): tap OID codes and hear the audio live
+tt-emu --gme game.gme
 
 # ...with the game's tttool source, for symbolic names in the debugger
-tt-emu-tui --game game.gme --yaml book.yaml
+tt-emu --gme game.gme --yaml book.yaml
+
+# headless (scripted): boot, tap the product + a content code, capture audio to a WAV
+tt-emu --headless --gme game.gme --tap product --tap 4716 --wav out.wav
 ```
 
 In the TUI, tap the game's **product code** button first (the game mounts), then any

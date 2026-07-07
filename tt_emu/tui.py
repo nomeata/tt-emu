@@ -1141,8 +1141,9 @@ class TtEmuApp(App[None]):
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="tt-emu-tui",
+        prog="tt-emu",
         description="Interactive tiptoi 2N ('MT') pen emulator — tap OIDs, hear the audio.",
+        epilog="Add --headless for the scripted, no-UI mode: `tt-emu --headless --help`.",
     )
     parser.add_argument(
         "firmware", nargs="?", default=None,
@@ -1154,7 +1155,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="directory for the downloaded-firmware cache (default: platform cache dir)",
     )
     parser.add_argument(
-        "--game", metavar="GME", action="append", default=[],
+        "--gme", metavar="GME", action="append", default=[],
         help=".gme file placed on partition B: (repeatable; the first one's "
         "product/content codes become quick-tap buttons)",
     )
@@ -1184,7 +1185,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     session = EmulatorSession(
         firmware,
-        args.game,
+        args.gme,
         yaml_path=args.yaml,
         instructions_per_tick=args.instructions_per_tick,
     )

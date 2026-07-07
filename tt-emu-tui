@@ -1,9 +1,0 @@
-#!/usr/bin/env python3
-"""Run the tt-emu TUI straight from a checkout: `./tt-emu-tui --game game.gme`.
-
-Needs the dependencies available (e.g. an active venv after `pip install -e .`).
-Equivalent to `python -m tt_emu.tui` or the installed `tt-emu-tui` console command.
-"""
-from tt_emu.tui import main
-
-raise SystemExit(main())

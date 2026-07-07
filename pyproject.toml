@@ -26,7 +26,6 @@ dev = ["pytest>=7", "ruff", "mypy"]
 
 [project.scripts]
 tt-emu = "tt_emu.cli:main"
-tt-emu-tui = "tt_emu.tui:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["tt_emu"]
