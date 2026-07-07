@@ -643,9 +643,16 @@ Properties that matter for the emulator:
   B: pass no-ops (§7.1); no `.gme` found → count 0. Count 0 surfaces only later,
   as error voice 0x2D on the mount tap.
 - A second discovery site exists in the standby idle handler: **GPIO11 == 1**
-  triggers a rescan **plus a soft reboot** — keep GPIO11 = 0 (see the GPIO doc).
+  triggers a rescan **plus a soft reboot** — keep GPIO11 = 0 *after boot* (see
+  the GPIO doc). GPIO11 is the power button; at the *boot-time* app-init sample
+  it should read 1 — that is the authentic normal-boot descent, §7.3.1a.
 
 ### 7.3 The tap sequence: product, product, content (Observed)
+
+> **Note:** this three-tap sequence describes the *tap-at-standby* route. A real
+> pen normally never takes it — it auto-descends to book(13) at every power-on via
+> the `+0x24` latch and needs only **two** taps (mount + content). See §7.3.1a for
+> the resolved normal-boot mechanism and what the emulator should model.
 
 Loading and playing a book takes **three taps** (values read off the GME file
 itself, so this works for arbitrary GMEs):
@@ -701,7 +708,8 @@ Game-context byte `+0x1d` (base `0x080089a4`, i.e. `0x080089C1`) is the
   (the periodic **0x1046 heartbeat** among them — the global heartbeat handler
   deliberately lets it through to the current leaf). On the **first** accepted
   event after standby entry, when the USB-session byte `+0x1e != 2` (it is 0 on
-  battery) and the resume byte `+0x24 == 0` (no `B:/FLAG.bin`), the handler
+  battery) and the resume byte `+0x24 == 0` (see §7.3.1a — on a real pen this
+  byte is normally **1**), the handler
   re-arms the sensor and **sets `+0x1d = 8`** ("idle mode"). Every *further*
   accepted heartbeat increments the ~300-count auto-off counter. **Nothing inside
   standby ever sets `+0x1d` back to 2.**
@@ -709,9 +717,11 @@ Game-context byte `+0x1d` (base `0x080089a4`, i.e. `0x080089C1`) is the
   therefore **one heartbeat wide (≤ ~100 ms of emulated time)**. Any realistically
   paced tap arrives at `+0x1d == 8`, fails the gate, and is dropped (see above).
   This is a property of the unmodified firmware, not an emulator timing bug —
-  reordering event delivery cannot widen the window. (How a *physical* pen opens a
-  book from long-idle standby is unresolved — plausibly the sensor-wake path
-  re-enters standby entry, re-writing 2. Open question; do not block on it.)
+  reordering event delivery cannot widen the window. **Resolved:** a physical pen
+  never needs to win this window, because on a normal power-on it does not idle at
+  standby at all — it auto-descends to book(13) via `+0x24 == 1` (§7.3.1a). The
+  one-heartbeat window only matters on the `+0x24 == 0` boot shape the emulator
+  has been reproducing.
 
 **What the reference emulation does (Observed, proven end-to-end):** present
 `+0x1d = 2` **at the classifier's first-load gate** — concretely: when execution
@@ -726,7 +736,7 @@ standby makes tap 1 open book mode; 0 at book(13), written by book entry, makes
 tap 2's gate *fail*, which is exactly what routes the event to the OID dispatch
 and the mount). Forcing `[0x21] = 0xFF` per-tap breaks the tap-2 mount (Observed).
 
-Alternatives, for the record (neither is reference-proven):
+Alternatives, for the record:
 
 - *Win the race*: arm the tap frame **before** standby entry (pen already on the
   page during boot). The 40 ms OID poll can then decode and post 0x1060 ahead of
@@ -736,8 +746,70 @@ Alternatives, for the record (neither is reference-proven):
   `+0x24 = 1`, and at standby the first accepted heartbeat posts 0x1058 itself —
   the pen descends to book(13) **autonomously, with no tap and no `+0x1d` gate**
   (this is real-pen-observed post-update behaviour). Tap 1 becomes unnecessary;
-  the sequence shrinks to product-tap (mount) + content-tap. Side effects of the
-  FLAG.bin splash branch are not fully mapped (Inferred viability).
+  the sequence shrinks to product-tap (mount) + content-tap. — This is the same
+  descent a normal boot takes anyway (§7.3.1a); FLAG.bin is just the second,
+  post-update setter of the same `+0x24` byte.
+
+### 7.3.1a ★ RESOLVED: how a real pen normally reaches book mode (no FLAG.bin)
+
+The `+0x24` "resume" byte has **two** authentic setters, and the second one fires
+on essentially **every** physical power-on:
+
+1. **Splash's `B:/FLAG.bin` branch** (post-firmware-update resume) — the shortcut
+   the emulator has been using.
+2. **The early app-init latches `+0x24 = (GPIO11 == 1)`** right after configuring
+   the power-hold pin. **GPIO11 is the power button.** On a physical power-on the
+   user's finger is still on the button when this sample runs (a fraction of a
+   second after power comes up — the same press that powered the SoC), so a real
+   pen boots with `+0x24 = 1` virtually every time. (Observed: firmware disasm of
+   the app-init latch; confirmed by a live-pen RAM dump showing `+0x24 == 1` on a
+   boot with no FLAG.bin.)
+
+Consequence — the authentic normal-boot chain, end to end:
+
+```
+power-on (button held) → app-init latches +0x24=1 → splash → standby entry
+  (writes +0x1d=2, allocs booklist, runs the discovery scan → oidfilelist.lst)
+→ first accepted standby heartbeat (~100 ms): handler sees +0x24==1
+  → posts 0x1058 itself → book_mount(12) → 0x1059 → book(13)  [power-on jingle]
+→ book entry: +0x1d=2, akoid_buf[0x21]=0, capture on
+→ FIRST physical tap of a product OID → OID dispatch product band
+  → linear probe over this boot's booklist → GME mounts        [one tap!]
+→ content taps play.
+```
+
+So the real pen **never idles at standby waiting for tap 1**: the `+0x1d`
+one-heartbeat window (§7.3.1), the classifier first-load branch, and the
+"three-tap" sequence of §7.3 are all properties of the `+0x24 == 0` boot shape —
+which a physical pen only exhibits if the button is released before the early-boot
+sample (in which case it idles ~30 s at standby, unresponsive to taps, and powers
+off). The familiar real-pen behaviour — jingle at power-on, first cover tap plays
+the book — is exactly the `+0x24 == 1` descent.
+
+**Emulator implication (the authentic replacement for the FLAG.bin shortcut and
+the scoped `+0x1d` write):** present **GPIO11 = 1 during the app-init sample**
+(power button held through boot) and **release it (0) afterwards**. The release
+matters: later, in standby idle mode, the same GPIO11 read means "power button
+pressed" and triggers a discovery **rescan + soft reboot** (this is the §7.2
+"keep GPIO11 = 0" rule — it applies *after* boot, not to the boot-time sample).
+With that one pin modeled, the unmodified firmware auto-descends to book(13) on
+every boot and needs only product-tap (mount) + content-tap.
+
+Two adjacent findings, for completeness (both Observed in firmware code):
+
+- **Discovery is NOT gated on prior USB activity.** The standby-entry scan runs on
+  every cold boot; its only suppression is `+0x1e == 2`, which means "a PC/USB
+  session is being entered / active *right now*" (set by the USB-detect/connect
+  path, never persisted). There is no "content changed since last boot" flag, in
+  RAM or on A:; the persisted `a:/oidfilelist.lst` is never used as a booklist
+  source (the count always comes from the fresh in-RAM scan). Content added over
+  USB is picked up because a PC session ends with the pen powering off or
+  rebooting — the next cold boot rescans unconditionally.
+- **"Nobody has ever seen B:" is a naming artifact, not a hidden drive.** The USB
+  mass-storage stack exports exactly one LUN, and it **is** partition B: — the
+  "tiptoi" drive every user sees on the PC. A: (system: `VOIMG/`, the `.lst`
+  indexes, logs) is never exported. "B:" is only the firmware-internal drive
+  letter; discovery scans it on every boot regardless of USB history.
 
 ### 7.3.2 Pacing (Observed in the reference emulation)
 
