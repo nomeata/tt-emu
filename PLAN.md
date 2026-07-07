@@ -28,7 +28,7 @@ Implemented from **only** `docs/`. High-quality, cross-platform Python.
 - [x] CPU + memory map skeleton (Unicorn ARMv5), MMIO dispatch framework, .upd loader, boot recipe, ZC90B; boots to the storage-mount checkpoint (16 tests)
 - [ ] Each hardware peripheral as a model (one module per component doc)
 - [x] Boot: authentic NAND image + NAND/NFC controller; firmware mounts A:, reads codepage, passes auth, reaches the event-pump statechart (39 tests)
-- [ ] Headless / scripted mode (load a GME, inject taps, capture audio → WAV)
+- [x] Headless / scripted mode: load a GME, boot via FLAG.bin resume, tap product+content, capture audio → WAV (byte-identical media)
 - [ ] Interactive TUI (Textual): tap OIDs, live audio (sounddevice), controls
 - [ ] Test suite (pytest) + **in-repo test-firmware toolchain**: a C header + Makefile
       (arm cross-compiler only, no external checkout) building tiny dumper.gme-style
@@ -90,3 +90,13 @@ Found during the write-round-trip fix (gap 1, code fixed — fold into docs):
   `Utl_UStr*` validates every pointer against that range and silently no-ops out-of-range strings,
   so a stack above `0x08400000` makes discovery build garbage `"B:/"/"A:/"` paths. Use SVC top
   `0x08400000`, IRQ top `0x083F0000`.
+
+Found while closing the play milestone (code fixed — fold into docs):
+- **audio-dac-dma.md §8** — the DMA source-window base: firmware writes `(cpu_ptr − 0x4000) & 0x3ffff`
+  to `0x04010004` (resolves the open item; capture is fully hook-free during real playback).
+- **audio-dac-dma.md** — DAC rate divider: live playback programs **0x28 → 22050 Hz** (idle 0x74 →
+  8000 Hz bring-up); the doc's `0x46→22050` point does not reproduce. This firmware builds the
+  **0x6000 (24 KiB) PCM ring** (read the size from ring `+0x40`, don't assume 0x3000).
+- **memory-map-and-boot.md / statechart** — `g_state` (`0x081db904`) lags on the FLAG.bin auto-descent
+  (stays 3 in book). The authoritative leaf is the **QHsm frame stack at `0x08007e80`** (12-byte frames,
+  deepest non-zero frame → e.g. [3,12,13]).

@@ -30,6 +30,8 @@ from tt_emu.peripherals.audio import (
     RING_BODY,
     RING_READ,
     RING_SIZE,
+    SRC_WINDOW_CPU_OFFSET,
+    SRC_WINDOW_MASK,
     SWALLOW_FLAG_ADDR,
     rate_from_divider,
 )
@@ -271,15 +273,20 @@ def audio_rig() -> tuple[Machine, AudioDma, IntcTimer, SysCon]:
     machine.write_u32(RING_BODY + RING_BASE, RING_PTR)
     machine.write_u32(RING_BODY + RING_SIZE, 0x3000)
     machine.write_u32(RING_BODY + RING_READ, 0)
-    # DAC rate divider: the Observed 22050 Hz code (§5 data point).
-    syscon.write_reg(0x08, (0x46 << 13) | (1 << 24))
+    # DAC rate divider: the live-Observed 22050 Hz code (GME playback).
+    syscon.write_reg(0x08, (0x28 << 13) | (1 << 24))
     return machine, audio, intc, syscon
 
 
 def _submit(audio: AudioDma, src: int, length: int) -> None:
-    """The firmware's §2 submit protocol at register level."""
+    """The firmware's §2 submit protocol at register level.
+
+    ``src`` is the chunk's CPU pointer; the register value is the firmware's
+    virt→phys translation ``(src - 0x4000) & 0x3ffff`` (the Observed
+    ``SRC_WINDOW_CPU_OFFSET`` data point).
+    """
     assert audio.read(DMA_WORDCOUNT, 4) & DMA_START == 0  # slot free (§2)
-    audio.write(DMA_SRC, 4, src & 0x3FFFF)
+    audio.write(DMA_SRC, 4, (src - SRC_WINDOW_CPU_OFFSET) & SRC_WINDOW_MASK)
     audio.write(DMA_DST, 4, DAC_PORT_DST)
     audio.write(DMA_WORDCOUNT, 4, (length // 4) | DMA_START)
     audio.write(DMA_CTRL, 4, audio.read(DMA_CTRL, 4) | DMA_KICK)
@@ -349,7 +356,7 @@ def test_audio_spurious_status_reads_zero(audio_rig) -> None:
 
 @pytest.mark.parametrize(
     "divider,rate",
-    [(0x46, 22050), (0, 22050), (0x61, 16000), (0x30, 32000), (0x22, 44100), (0xC3, 8000)],
+    [(0x28, 22050), (0, 22050), (0x37, 16000), (0x1B, 32000), (0x13, 44100), (0x74, 8000)],
 )
 def test_rate_from_divider(divider: int, rate: int) -> None:
     assert rate_from_divider(divider) == rate

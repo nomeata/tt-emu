@@ -26,10 +26,12 @@ Extends the NAND L2-buffer model (:class:`~tt_emu.peripherals.nand.L2NandBuffer`
   (``+0x00 &= ~0x10000``) — that write is the line-0 ACK (§3);
 * **sample rate** (§7 item 5): decoded from the DAC rate-divider field
   ``0x04000008`` bits[20:13] (``system-control-and-clock.md`` §4), scaled from
-  the one Observed data point (divider ``0x46`` → 22050 Hz) and snapped to the
-  standard rate set. DOC GAP: the §5 OSR-table formula
-  (``rate ≈ master/(div+1)/OSR``, master ≤ 14 MHz) does not reproduce the
-  22050→0x46 data point for any table OSR, so the emulator scales the data
+  the live-Observed data point (divider ``0x28`` → 22050 Hz during GME media
+  playback; the idle divider ``0x74`` then decodes to the 8000 Hz bring-up
+  default, consistently) and snapped to the standard rate set. DOC GAP: both
+  the doc's older 0x46 → 22050 point and its §5 OSR-table formula
+  (``rate ≈ master/(div+1)/OSR``, master ≤ 14 MHz) fail to reproduce the live
+  programming (the OSR field stays 0), so the emulator scales the live data
   point instead (exact for GME content, which is all 22050 Hz).
 
 Memory-to-memory transfers cannot be performed (both addresses are 18-bit
@@ -79,10 +81,25 @@ SWALLOW_FLAG_ADDR = 0x0800_8C91  #: teardown "swallow one done" flag (§6)
 #: 18-bit physical-window mask of the source-address encoding (§2 caveat).
 SRC_WINDOW_MASK = 0x3FFFF
 
+#: DOC GAP (new Observed data point for the §2 caveat / §8 open item): the
+#: firmware's virt→phys translation for the DMA source register subtracts
+#: **0x4000** from the CPU address — during live GME playback every ring
+#: dequeue submit satisfied ``src == (cpu_ptr - 0x4000) & 0x3ffff`` (e.g. ring
+#: chunk at CPU 0x0814d000 → source register 0x09000; 487 consecutive submits
+#: consistent). Equivalently the 256-KiB physical window's base is congruent
+#: to CPU 0x…4000 mod 0x40000.
+SRC_WINDOW_CPU_OFFSET = 0x4000
+
 # --- Sample-rate decode (§7 item 5 + system-control-and-clock.md §4) -------------------
 
-#: Observed data point: DAC divider code 0x46 → 22050 Hz.
-_DIV_REF, _RATE_REF = 0x46, 22050
+#: Observed data point (live GME playback under emulation): DAC divider code
+#: **0x28 → 22050 Hz** (the media track rate; source OGGs byte-verified
+#: 22050). Cross-check: the idle/bring-up divider the same run programs is
+#: 0x74 → estimate 7727 → snaps to the §1 8000 Hz bring-up default. DOC GAP:
+#: the doc's earlier 0x46 → 22050 point does not fit this scheme (nor its own
+#: OSR formula — the OSR field 0x04000064 stays 0 throughout the run); the
+#: live pair above supersedes it.
+_DIV_REF, _RATE_REF = 0x28, 22050
 _RATE_K = _RATE_REF * (_DIV_REF + 1)
 STANDARD_RATES = (8000, 11025, 16000, 22050, 32000, 44100, 48000)
 REG_CLK_AUDIO = 0x08  #: SysCon register holding bits[20:13] = DAC rate divider
@@ -95,8 +112,8 @@ PIN_MUTE = 13
 def rate_from_divider(divider: int) -> int:
     """Decode the achieved DAC rate from the ``0x04000008`` divider code.
 
-    Scaled from the Observed 0x46 → 22050 Hz point (see module docstring DOC
-    GAP note) and snapped to the standard rate set when within 8 %.
+    Scaled from the live-Observed 0x28 → 22050 Hz point (see module docstring
+    DOC GAP note) and snapped to the standard rate set when within 8 %.
     """
     if divider <= 0:
         return _RATE_REF  # divider never programmed: assume the GME track rate
@@ -131,6 +148,7 @@ class AudioDma(L2NandBuffer):
         self.flush_submits = 0     #: teardown silence flushes (§6, not captured)
         self.unresolved_submits = 0  #: DAC submits whose source didn't match the ring
         self.completions = 0       #: line-0 completion asserts delivered
+        self.last_dac_submit_at = 0  #: machine clock of the last DAC submit
 
     # --- register behaviour ----------------------------------------------------------------
 
@@ -172,6 +190,7 @@ class AudioDma(L2NandBuffer):
             return
 
         self.dac_submits += 1
+        self.last_dac_submit_at = machine.clock
         rate = self.current_rate()
         if machine.read_u8(SWALLOW_FLAG_ADDR):
             self.flush_submits += 1  # §6 silence flush: complete, don't capture
@@ -207,7 +226,7 @@ class AudioDma(L2NandBuffer):
         rp %= size
         candidates = (base + rp, base + (rp - length) % size)
         for addr in candidates:
-            if (addr & SRC_WINDOW_MASK) == (src & SRC_WINDOW_MASK):
+            if ((addr - SRC_WINDOW_CPU_OFFSET) & SRC_WINDOW_MASK) == (src & SRC_WINDOW_MASK):
                 wrap = addr + length - (base + size)
                 if wrap <= 0:
                     return machine.read_bytes(addr, length)

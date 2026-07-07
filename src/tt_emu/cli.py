@@ -72,6 +72,12 @@ def build_parser() -> argparse.ArgumentParser:
         "'product' = the product code of the first --game",
     )
     parser.add_argument(
+        "--flag-resume", action="store_true",
+        help="provision B:/FLAG.bin (the post-update resume marker): the "
+        "firmware auto-descends into book mode, so --tap product mounts the "
+        "game directly (the authentic route, nand-image-layout.md §7.3.1)",
+    )
+    parser.add_argument(
         "--wav", metavar="FILE", default=None,
         help="write the captured audio (S16LE stereo) to FILE",
     )
@@ -116,6 +122,7 @@ def main(argv: list[str] | None = None) -> int:
         report = run_session(
             args.firmware,
             taps,
+            flag_resume=args.flag_resume,
             wav_path=args.wav,
             max_instructions=args.max_instructions or DEFAULT_SESSION_BUDGET,
             config=make_config(SESSION_INSTRUCTIONS_PER_TICK),

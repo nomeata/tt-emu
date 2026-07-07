@@ -122,6 +122,10 @@ class OidSensor(Peripheral):
         #: Completed tap-frame captures (both 23- and 32-bit reads count;
         #: status frames are not counted).
         self.taps_served = 0
+        #: Tap frames consumed by the 23-bit **gameplay** capture (§4.1) — the
+        #: only capture that posts event 0x1060. One increment = the firmware
+        #: latched the tap; a physical tap-and-lift ends here.
+        self.gameplay_frames_served = 0
         #: Status frames consumed by a 32-bit poll (sleep handshakes answered).
         self.status_frames_served = 0
         gpio.watch_output(PIN_CLOCK, self._on_clock)
@@ -357,6 +361,8 @@ class OidSensor(Peripheral):
             # and is dropped; keep it pending so the next poll gets it.
         else:
             self.taps_served += 1
+            if self._bit_count != FRAME_BITS:
+                self.gameplay_frames_served += 1
             log.debug("OID tap served: %d (%d bits)", self._oid, self._bit_count)
 
     # --- deferred release (tap-and-lift, §6 item 5) -------------------------------------------
