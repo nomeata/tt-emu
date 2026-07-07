@@ -5,10 +5,12 @@ MMIO range; instead it watches the GPIO output-latch and direction changes and
 drives the GPIO5 input level, exactly as §4 prescribes.
 
 Protocol (§2/§4): MSB-first, 8 clocks/byte, 3 challenge bytes out then 3
-response bytes back. During the challenge phase GPIO5 is a firmware *output*;
-each GPIO10 falling edge (1→0) shifts the current GPIO5 output into the buffer.
-After 24 challenge bits the response is computed from three 256-byte S-boxes
-read out of the loaded firmware image (§3.2):
+response bytes back. The challenge is delimited by the GPIO5 **direction**, not
+by a raw clock count (§4): GPIO5 → output starts the challenge, GPIO5 → input
+ends it. During the challenge phase GPIO5 is a firmware *output*; each GPIO10
+falling edge (1→0) shifts the current GPIO5 output into the buffer. When GPIO5
+switches back to input the response is computed from three 256-byte S-boxes read
+out of the loaded firmware image (§3.2):
 
     B = tableB[c2 & 0xbe]
     C = tableC[(c1 ^ B) & 0xff]
@@ -90,8 +92,6 @@ class Zc90bAuth(Peripheral):
             if old == 1 and new == 0:
                 # Falling edge latches the challenge bit: sample GPIO5 output level.
                 self._challenge_bits.append(self._gpio.out_level(PIN_DATA))
-                if len(self._challenge_bits) == 24:
-                    self._compute_response()
         elif self._phase == _PHASE_RESPONSE:
             if old == 0 and new == 1:
                 # Rising edge: present the next response bit, hold it through the
@@ -101,17 +101,37 @@ class Zc90bAuth(Peripheral):
                     self._response_index += 1
 
     def _on_data_dir(self, _pin: int, _old: int, new: int) -> None:
-        # new == 1: GPIO5 switched to input (ready handshake after the 24
-        # challenge bits). new == 0: GPIO5 driven as output again — the start of
-        # a fresh challenge; re-arm so a second boot-time exchange works (§4:
-        # "require 24 fresh challenge bits per exchange").
-        if new == 1 and self._phase == _PHASE_RESPONSE:
-            # ready handshake: pull DATA high so the firmware's poll loop breaks.
-            self._gpio.set_input(PIN_DATA, 1)
-        elif new == 0 and self._phase == _PHASE_RESPONSE:
-            self._reset_state()
+        # The challenge is delimited by the GPIO5 DIRECTION, not by a bit count
+        # (§4: "detect this via the direction-register write that sets GPIO5 to
+        # input"). GPIO5 → output = the firmware starting to clock the challenge
+        # out; GPIO5 → input = challenge complete, ready-handshake, read the
+        # response. Counting raw clock edges instead is wrong: the firmware emits
+        # a spurious leading clock fall *before* it drives GPIO5 to output, which
+        # a bit-count model would miscount as challenge bit 0 (Observed —
+        # off-by-one challenge → wrong reply → the fatal power-off at 0x804e50c).
+        if new == 0:
+            # GPIO5 → output: (re)start a fresh challenge. Discard any bits
+            # latched before this point (the pre-output spurious edge, or a prior
+            # exchange / event-pump idling — §4 "require 24 fresh challenge bits
+            # per exchange"). The event pump also idles GPIO5 this way, harmlessly
+            # (it toggles no GPIO10 clock, so no challenge bits accumulate).
+            self._phase = _PHASE_CHALLENGE
+            self._challenge_bits = []
+            self._response_index = 0
+            self._gpio.clear_input(PIN_DATA)
+        else:  # new == 1: GPIO5 → input
+            if self._phase == _PHASE_CHALLENGE and len(self._challenge_bits) >= 24:
+                # Challenge complete: compute the response (drives DATA = 1 for
+                # the ready handshake and enters the response phase).
+                self._compute_response()
+            elif self._phase == _PHASE_RESPONSE:
+                # Ready handshake re-assert: pull DATA high so the firmware's
+                # ≤48-try poll loop breaks.
+                self._gpio.set_input(PIN_DATA, 1)
 
     def _compute_response(self) -> None:
+        # The challenge is the first 24 bits latched since GPIO5 went to output
+        # (a trailing extra clock fall before the direction change is ignored).
         c1 = self._bits_to_byte(self._challenge_bits[0:8])
         c2 = self._bits_to_byte(self._challenge_bits[8:16])
         c3 = self._bits_to_byte(self._challenge_bits[16:24])

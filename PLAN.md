@@ -61,3 +61,16 @@ Deferred (fold into docs in a final pass — the emulator code already accounts 
   blocks. (Runtime home of the ASA data; "omittable" is true for the boot loader, not the mount.)
 - **nand-and-nfc-controller.md §7** — streaming record size: the boot loader's metadata/scan
   reads use **1024-byte** ECC records (payload from the ECC config word), not a fixed 512.
+
+Found during Step 2c/2d (code fixed or precisely characterized):
+- **zc90b-auth.md** — the challenge is delimited by the **GPIO5 direction** (output = start /
+  discard stale bits, input = complete → compute), NOT a raw 24-edge count. A spurious
+  pre-challenge clock fall exists; an edge-counting model shifts the challenge by one, fails
+  auth, and the pen powers off — easily misread as a "standby auto-off". (Fixed in code.)
+- **nand-image-layout.md §7.2** — the A: FAT/NFTL **write/create path must commit a directory
+  entry that round-trips**: discovery creates a:/oidfilelist.lst (+ log/profile); currently the
+  writes reach NAND but a re-read shows no new dir entry, so discovery persists 0 games. (Open —
+  the milestone blocker.)
+- **oid-sensor.md §7.3** — the standby **decode-vs-(+0x1d re-arm) timing**: the model must
+  deliver pen-down and the classified OID in one dispatch (or classify on the first gameplay
+  poll), else the first-load gate loses the fresh-standby race. (Open.)

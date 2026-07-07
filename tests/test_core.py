@@ -202,6 +202,53 @@ def test_zc90b_bitbang_exchange() -> None:
     assert got == expected
 
 
+def test_zc90b_spurious_leading_edge_before_challenge() -> None:
+    """Regression: the firmware emits a spurious clock fall *before* it drives
+    GPIO5 to output (Observed on the real boot exchange). The challenge must be
+    delimited by the GPIO5 direction, not a raw bit count — otherwise that stray
+    edge is miscounted as challenge bit 0, the whole challenge shifts by one, the
+    reply is wrong, and the auth gate powers the pen off (0x804e50c)."""
+    g = GpioBlock()
+    z = Zc90bAuth(g)
+    boxes = _fake_sboxes()
+    z.load_tables(lambda addr, size: boxes[addr][:size])
+
+    c1, c2, c3 = 0x71, 0x06, 0x3E
+    b = boxes[0x080B0178][c2 & 0xBE]
+    c = boxes[0x080B0278][(c1 ^ b) & 0xFF]
+    a = boxes[0x080B0078][c3 & 0xD7]
+    expected = bytes((c, b, a))
+
+    # GPIO5 idle as an input before the exchange (as on the real boot).
+    g.write(GPIO_DIR0, 4, g.read(GPIO_DIR0, 4) | (1 << PIN_DATA))
+    # A stray high→low clock edge while GPIO5 is still an input (pre-challenge).
+    _set_out(g, PIN_CLOCK, 1)
+    _set_out(g, PIN_CLOCK, 0)  # spurious fall — must NOT count as a challenge bit
+
+    # Now the real challenge: GPIO5 → output (the delimiting transition), 24 bits.
+    g.write(GPIO_DIR0, 4, g.read(GPIO_DIR0, 4) & ~(1 << PIN_DATA))
+    for byte in (c1, c2, c3):
+        for i in range(8):
+            _set_out(g, PIN_CLOCK, 1)
+            _set_out(g, PIN_DATA, (byte >> (7 - i)) & 1)
+            _set_out(g, PIN_CLOCK, 0)
+    # A trailing extra clock fall before the direction change (Observed too).
+    _set_out(g, PIN_CLOCK, 1)
+    _set_out(g, PIN_CLOCK, 0)
+
+    # GPIO5 → input ends the challenge and triggers the response.
+    g.write(GPIO_DIR0, 4, g.read(GPIO_DIR0, 4) | (1 << PIN_DATA))
+    assert (g.input_word() >> PIN_DATA) & 1 == 1
+
+    got_bits = []
+    for _ in range(24):
+        _set_out(g, PIN_CLOCK, 1)
+        _set_out(g, PIN_CLOCK, 0)
+        got_bits.append((g.input_word() >> PIN_DATA) & 1)
+    got = bytes(sum(got_bits[byte * 8 + i] << (7 - i) for i in range(8)) for byte in range(3))
+    assert got == expected
+
+
 def _set_out(g: GpioBlock, pin: int, level: int) -> None:
     word = g.read(GPIO_OUT0, 4)
     if level:

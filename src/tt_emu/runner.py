@@ -307,6 +307,15 @@ class _TapSession:
     def _pump_running(self) -> bool:
         return any(addr == EVENT_PUMP_ADDR for _, addr, _ in self._hits)
 
+    def _standby_entered(self, machine: Machine) -> bool:
+        """True once the statechart's standby(3) ENTRY action has run — proven by
+        a non-NULL booklist head (``memory-map-and-boot.md`` §5.8 "standby truly
+        entered"; ``nand-image-layout.md`` §7.2). This is the authoritative
+        "at fresh standby" signal: ``g_state`` alone flips to 3 early during init,
+        long before the statechart actually reaches standby through the event
+        pump, so gating a tap on it fires far too early."""
+        return machine.read_u32(BOOKLIST_HEAD_ADDR) != 0
+
     def _classifier_oid(self, machine: Machine) -> int:
         """The OID the firmware's classifier last stored (``akoid_buf+4``, §5).
 
@@ -357,15 +366,19 @@ class _TapSession:
             )
 
         if self._phase == "standby-wait":
+            # Fire the first tap as soon as the standby ENTRY action has run
+            # (booklist head allocated) and the event pump is idle. The window
+            # before the firmware re-arms the fresh-standby marker +0x1d from 2
+            # to 8 (~1 tick after discovery, nand-image-layout.md §7.3) is
+            # short, so tap promptly — do not wait out a settle timer.
             if (
-                g == STATE_STANDBY
+                self._standby_entered(machine)
                 and self._pump_running()
-                and self._ticks(machine, now - self._g_changed_at) >= self.settle_ticks
                 and self._pump_idle(machine)
             ):
                 self._press(machine)
             elif self._ticks(machine, now) >= self.standby_timeout_ticks:
-                self._fail(machine, f"standby (g_state {STATE_STANDBY}) never reached")
+                self._fail(machine, "standby entry action never ran (booklist head 0)")
 
         elif self._phase == "tap-wait":
             oid = self.taps[self._tap_index]
@@ -377,13 +390,21 @@ class _TapSession:
                 decoded = self._classifier_oid(machine) == oid
                 if decoded:
                     # The firmware's own capture decoded the tap (classifier
-                    # holds it) but nothing loaded: no book is registered for
-                    # this code — see run_session's discovery-gap note.
+                    # holds akoid_buf+4 == our OID) but the statechart did not
+                    # advance to book(13). On the first (product) tap this is the
+                    # first-load gate losing the fresh-standby race: the OID is
+                    # classified only *after* the firmware has re-armed the
+                    # fresh-standby marker game-context +0x1d from 2 back to 8
+                    # (Observed simultaneity — see run_session's note), and the
+                    # first-load branch requires +0x1d == 2 (nand-image-layout.md
+                    # §7.3). akoid_buf[0x21] stays 0xFF (the frame seed holds),
+                    # so this is purely a decode-vs-rearm timing loss.
                     self._fail(
                         machine,
                         f"OID {oid} decoded by firmware (classifier holds it) but "
-                        f"no book/script reacted — booklist empty (game discovery "
-                        f"did not run; see report)",
+                        f"the statechart stayed at standby — first-load gate lost the "
+                        f"fresh-standby race (game-context +0x1d re-armed 2->8 before "
+                        f"the standby OID decode completed; see report)",
                     )
                 else:
                     self._fail(
@@ -461,31 +482,41 @@ def run_session(
     akoid_ptr = machine.read_u32(AKOID_BUF_PTR_ADDR)
     if akoid_ptr:
         report.last_oid_seen = machine.read_u32(akoid_ptr + 4)
-    # Discovery diagnostic: a product tap decoded by the firmware (classifier
-    # holds our OID) but no book loaded means the booklist is empty — the boot
-    # never scanned B: for the .gme. Distinguish that from a tap that never
-    # decoded (an OID-model fault).
+    # Discovery/tap diagnostic. The boot now *does* enter statechart standby (the
+    # ZC90B auth exchange passes — see peripherals/zc90b.py — so the run no longer
+    # powers off at the auth-fail hang) and the standby(3) ENTRY action runs
+    # discovery: booklist head 0x081da080 becomes non-NULL (the §5.8/§7.2 health
+    # checkpoints "standby truly entered" + "discovery ran"). Two gaps remain
+    # before audio; report whichever applies.
     if taps and not booted.audio.capture.chunks:
         booklist = machine.read_u32(BOOKLIST_HEAD_ADDR)
+        count = machine.read_u16(booklist) if booklist else 0
         decoded = (report.last_oid_seen & 0xFFFF) == (taps[0] & 0xFFFF)
+        entered = "YES" if booklist else "NO"
         report.discovery_note = (
-            f"No audio: booklist head is {booklist:#x} (empty) — the from-entry boot "
-            "mounts A: but never scans partition B: for the .gme, so no game is "
-            "registered and a product tap resolves to no book (statechart stays at "
-            f"standby, g_state={machine.read_u8(G_STATE_ADDR)}). "
+            f"No audio. Standby entered (booklist head {booklist:#x}, discovery ran="
+            f"{entered}), booklist count={count}. "
             + (
-                f"The product OID {taps[0]} WAS decoded by the unmodified firmware "
-                f"(classifier akoid_buf+4 = {report.last_oid_seen & 0xFFFF}), proving "
-                "the OID sensor path is correct end-to-end; only the book-mount lookup "
-                "has nothing to resolve against. "
+                "The first product tap was decoded by the unmodified firmware "
+                f"(classifier akoid_buf+4 = {report.last_oid_seen & 0xFFFF} == OID "
+                f"{taps[0]}) but the statechart did not reach book(13): the first-load "
+                "gate needs game-context +0x1d == 2, and at standby the OID decode "
+                "completes only as the firmware re-arms +0x1d 2->8 (a decode-vs-rearm "
+                "race, nand-image-layout.md §7.3). "
                 if decoded else
-                "The pen also idles to sleep (~28M insns, firmware standby timeout) "
-                "before the held tap's 23-bit gameplay poll decodes it amid the 32-bit "
-                "status polls (oid-sensor.md §6 standby fragility). "
+                "The first product tap was not decoded in time (frames served="
+                f"{report.taps_served}). "
             )
-            + "This is a storage/statechart game-discovery gap, not an OID or audio "
-            "fault (both are unit-verified). Clean-room doc gap: docs/ do not specify "
-            "the discovery trigger or the B:-drive registration path."
+            + (
+                "Discovery also found 0 games: even with the .gme on A:, the standby "
+                "entry action creates no files on A: (no a:/oidfilelist.lst, no log) — "
+                "A: writes reach NAND but no directory entry is ever committed, a "
+                "FAT/NFTL file-creation gap in the write path. "
+                if count == 0 else
+                f"Booklist has {count} entries. "
+            )
+            + "The OID and audio peripherals are unit-verified; these are "
+            "storage-write and standby-timing gaps."
         )
     if booted.audio.capture.chunks:
         report.audio_stats = booted.audio.capture.stats()
