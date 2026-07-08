@@ -411,8 +411,19 @@ def build_nand_image(
     _place_bin(img, firmware.codepage.data, SYS_START + PROG_BLOCKS, logical_base=PROG_BLOCKS)
 
     # Step 4 — FAT16 superfloppies (pure Python, §5 checks enforced inside).
+    # ``au_sectors`` couples the FAT geometry to the NFTL allocation unit (§4.2:
+    # AU = 4 KiB = 8 sectors) so cluster boundaries land on AU boundaries and
+    # files occupy whole AUs — otherwise the firmware's AU-granular read of a
+    # file's last (partial-AU) cluster misresolves and returns zeros, truncating
+    # the tail of the .gme (the welcome playlist, firmware-2n-mt.md §4/§5).
+    # Only B: carries the pre-placed ``.gme`` files whose tails the AU-straddle
+    # bug truncates; A: holds no such static tails (its runtime files —
+    # ``oidfilelist.lst`` — the firmware writes itself through the COW path), and
+    # coupling A: shifts its system area enough to make the mount recycle blocks,
+    # so leave A: on the plain geometry and AU-couple B: only.
+    au_sectors = AU_SIZE // SECTOR_SIZE
     vol_a = build_fat16(A_VOLUME_BYTES, label="SYSTEM", files=a_files)
-    vol_b = build_fat16(B_VOLUME_BYTES, label="tiptoi", files=b_files)
+    vol_b = build_fat16(B_VOLUME_BYTES, label="tiptoi", files=b_files, au_sectors=au_sectors)
 
     # Step 5 — place them: A at FS_START, B at FS_START + A_BLOCKS.
     _place_fat_volume(img, vol_a, FS_START)

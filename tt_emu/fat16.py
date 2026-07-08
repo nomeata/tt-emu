@@ -141,6 +141,7 @@ def build_fat16(
     root_entries: int = 512,
     num_fats: int = 2,
     volume_id: int = 0x1090_2026,
+    au_sectors: int = 1,
 ) -> Fat16Volume:
     """Build a FAT16 superfloppy volume of ``total_bytes`` (multiple of 512).
 
@@ -148,14 +149,41 @@ def build_fat16(
     (``nand-image-layout.md`` §6 step 4: ``-F 16 -s 4 -R 4 -r 512 -f 2``).
     ``files`` maps slash-separated relative paths to file contents;
     intermediate directories are created.
+
+    ``au_sectors`` couples the volume geometry to the NFTL's **allocation unit**
+    (``nand-and-nfc-controller.md`` §4.2 / ``nand-image-layout.md``: AU = 4 KiB =
+    8 sectors). The firmware's medium reads the NAND in whole AU-aligned chunks,
+    so a data cluster that straddles an AU boundary makes the firmware read the
+    *other* cluster of that AU as well; when a file's last cluster leaves the
+    second half of its AU unallocated, that AU read resolves to the wrong
+    physical block and returns zeros — silently truncating the tail of every
+    ``.gme`` (the power-on/welcome playlist lives in the last bytes of the file,
+    ``firmware-2n-mt.md`` §4/§5, so it is the first casualty). Passing
+    ``au_sectors = 8`` makes the builder (a) **AU-align the data region** so
+    clusters start on AU boundaries and (b) **round every file's cluster chain
+    up to a whole number of AUs**, so no read ever straddles an unallocated
+    cluster. ``1`` (the default) is a no-op — the plain FAT geometry.
     """
     if total_bytes % SECTOR_SIZE:
         raise Fat16BuildError("volume size must be a multiple of 512")
     total_sectors = total_bytes // SECTOR_SIZE
     spc = sectors_per_cluster
+    #: Clusters per NFTL allocation unit (files are allocated in whole-AU
+    #: multiples of this; 1 when the geometry is not AU-coupled).
+    clusters_per_au = max(1, -(-au_sectors // spc)) if au_sectors > 1 else 1
     root_sectors = (root_entries * DIR_ENTRY_SIZE + SECTOR_SIZE - 1) // SECTOR_SIZE
     fat_sectors = _fat_sectors_for(total_sectors, spc, reserved_sectors, root_entries, num_fats)
     first_data_sector = reserved_sectors + num_fats * fat_sectors + root_sectors
+    # AU-align the data region (see ``au_sectors``): bump the reserved sectors so
+    # cluster 2 begins on an AU boundary. Re-derive the FAT size each step (it can
+    # grow as reserved sectors take space) until the first data sector is aligned.
+    if au_sectors > 1:
+        while first_data_sector % au_sectors:
+            reserved_sectors += 1
+            fat_sectors = _fat_sectors_for(
+                total_sectors, spc, reserved_sectors, root_entries, num_fats
+            )
+            first_data_sector = reserved_sectors + num_fats * fat_sectors + root_sectors
     total_clusters = (total_sectors - first_data_sector) // spc
     if not MIN_CLUSTERS <= total_clusters <= MAX_CLUSTERS:
         raise Fat16BuildError(
@@ -203,9 +231,16 @@ def build_fat16(
         return (first_data_sector + (cluster - 2) * spc) * SECTOR_SIZE
 
     def alloc_chain(nbytes: int) -> int:
-        """Allocate a cluster chain for ``nbytes`` (>=1 cluster); return its head."""
+        """Allocate a cluster chain for ``nbytes`` (>=1 cluster); return its head.
+
+        Rounded up to a whole number of NFTL allocation units (see the
+        ``au_sectors`` note) so a file never leaves the second half of an AU
+        unallocated — that would make the firmware's AU-granular read of the
+        file's last cluster straddle an unallocated cluster and misresolve.
+        """
         nonlocal next_free
         count = max(1, (nbytes + cluster_bytes - 1) // cluster_bytes)
+        count = -(-count // clusters_per_au) * clusters_per_au  # whole AUs
         if next_free + count > total_clusters + 2:
             raise Fat16BuildError("volume full")
         head = next_free
