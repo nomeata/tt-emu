@@ -14,18 +14,16 @@ Architecture (all cross-platform, no firmware hooks — observation only):
   deque for the log panel, and the audio ring below.
 * :class:`AudioRing` — a byte FIFO between the emulation thread (fed live by
   :attr:`tt_emu.audio_capture.AudioCapture.listener`, i.e. every chunk the DAC
-  DMA moves) and the audio accumulator below.
-* :class:`AudioOutput` — buffered, **one complete sound at a time** playback
-  via sounddevice at the firmware's rate (22050 Hz S16LE stereo,
-  ``audio-dac-dma.md`` §1). The emulator runs at only a fraction of the pen's
-  real speed, so a live output stream underruns (choppy). Instead an
-  *accumulator thread* drains the ring and watches the emulated clock: it
-  collects the PCM of a single firmware sound and, when the firmware pauses
-  (the clock advances past ``PAUSE_INSTRUCTIONS`` with no new PCM) or a ~5 s
-  cap is hit, hands the whole buffer to a *player thread*. The player does one
-  blocking ``stream.write`` of the complete buffer — which cannot underrun
-  because all the PCM is already present. Each sound plays cleanly.
-  **Degrades gracefully**: if PortAudio / an output device is missing
+  DMA moves) and the audio writer below.
+* :class:`AudioOutput` — live playback via sounddevice at the firmware's rate
+  (22050 Hz S16LE stereo, ``audio-dac-dma.md`` §1). A single **writer thread**
+  pulls fixed-size blocks from the ring and blocking-writes them to one
+  persistent ``RawOutputStream`` — real PCM when the ring has data, silence
+  when it's empty, so the device is always fed and never underruns. With fast
+  DAC pacing the firmware produces audio faster than real time, so the ring
+  stays ahead and every sound (jingles, prompts, content) reaches the speaker
+  in order. ``stream.write`` releases the GIL, so the UI and emulation keep
+  running. **Degrades gracefully**: if PortAudio / an output device is missing
   it reports "audio unavailable" and the TUI keeps running.
 * :class:`TtEmuApp` — the Textual app: state / tap / audio panels + a log.
 * **Firmware-aware debugger** — when the loaded image is the recognized 2N
@@ -53,7 +51,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import queue
 import sys
 import struct
 import threading
@@ -204,23 +201,6 @@ class AudioRing:
             parts.append(b"\x00" * (nbytes - got))
         return b"".join(parts), got
 
-    def drain(self) -> bytes:
-        """Remove and return *all* currently-buffered real PCM at once.
-
-        Unlike :meth:`pull` this pads nothing: it returns exactly the bytes
-        the emulation thread has pushed since the last drain (``b""`` if
-        none), leaving the ring empty. The accumulator uses this to gather one
-        firmware sound without injecting any silence.
-        """
-        with self._lock:
-            if not self._chunks:
-                return b""
-            data = b"".join(self._chunks)
-            self._chunks.clear()
-            self.pulled_bytes += self._fill
-            self._fill = 0
-        return data
-
     @property
     def fill_bytes(self) -> int:
         with self._lock:
@@ -275,70 +255,47 @@ def _silence_alsa_error_output() -> None:
 
 
 class AudioOutput:
-    """Buffered, one-complete-sound-at-a-time audio out via sounddevice.
+    """Live audio out via one persistent sounddevice stream.
 
-    The emulator runs at a fraction of real time, so a live output stream
-    can't be fed fast enough and underruns (choppy). Instead two dedicated
-    threads cooperate through a thread-safe queue of complete PCM buffers:
-
-    * an **accumulator thread** drains the :class:`AudioRing` every ~20 ms and
-      appends the PCM to the current sound. When the firmware *pauses* — the
-      emulated :attr:`clock` advances ``PAUSE_INSTRUCTIONS`` past the last PCM
-      it produced (~0.2 s of emulated time), meaning one sound has finished —
-      or the buffer reaches ``max_bytes`` (~5 s), it enqueues the whole buffer
-      as one complete sound and starts a fresh one. It never blocks, so
-      boundary detection keeps running while a sound plays.
-    * a **player thread** blocks on the queue; for each complete buffer it
-      opens a fresh ``RawOutputStream`` and does a single blocking
-      ``stream.write`` of the entire buffer — which cannot underrun because
-      all the PCM is already present. One sound at a time.
+    A single writer thread pulls fixed-size blocks from the :class:`AudioRing`
+    and blocking-writes them to a persistent ``RawOutputStream`` — real PCM
+    when the ring has data, silence when it's empty — so the device is always
+    fed and never underruns. With fast DAC pacing the firmware produces audio
+    faster than real time, so the ring stays ahead and every sound it plays
+    (jingles, prompts, content) reaches the speaker in order, at real-time
+    pitch, with no boundary guessing and no per-sound stream churn.
+    ``stream.write`` blocks the writer thread only (``Pa_WriteStream`` releases
+    the GIL), so the Textual UI and the emulation keep running.
 
     ``start()`` never raises: on any failure (no PortAudio library, no output
     device, …) it records the error and the TUI shows "audio unavailable".
-    Each sound is buffered and played complete, cleanly and intelligibly.
     """
 
-    #: A firmware pause of this many emulated instructions ends one sound.
-    #: ~0.2 s of emulated time: the session runs ``SESSION_INSTRUCTIONS_PER_TICK``
-    #: instructions per 20 ms tick, so emulated seconds ≈ instructions /
-    #: (SESSION_INSTRUCTIONS_PER_TICK / 0.020).
-    PAUSE_INSTRUCTIONS = int(0.2 * SESSION_INSTRUCTIONS_PER_TICK / 0.020)
-    #: Cap one buffered sound so a long track still starts playing (seconds).
-    MAX_SECONDS = 5.0
-    #: Accumulator poll period / player queue-wait granularity (wall seconds).
-    _POLL_SECONDS = 0.020
+    #: Writer block: ~46 ms of 22050 Hz stereo — small enough that the meter and
+    #: shutdown stay responsive, large enough that the blocking write dominates.
+    BLOCK_FRAMES = 1024
 
     def __init__(
         self,
         ring: AudioRing,
         rate: int = DEFAULT_RATE,
-        clock: Callable[[], int] = lambda: 0,
     ) -> None:
         self.ring = ring
         self.rate = rate
-        #: Reads the current emulated instruction count (racy-but-atomic int).
-        self.clock = clock
         self.available = False
         self.error: str | None = None
-        self.level = 0.0  #: peak of the sound currently playing, 0..1
+        self.level = 0.0  #: peak of the block currently playing, 0..1
         self.state = "off"  #: off / idle / playing
-        self.sounds_played = 0  #: complete buffered sounds handed to the player
-        #: Backlog display: the sound currently accumulating, and complete
-        #: sounds queued but not yet playing (both PCM bytes).
-        self.buffering_bytes = 0
-        self.queued_bytes = 0
-        #: Cap for one buffered sound (bytes of interleaved S16LE stereo PCM).
-        self.max_bytes = int(self.MAX_SECONDS * rate) * FRAME_BYTES
-        self._queue: queue.Queue[bytes] = queue.Queue()
+        self.played_bytes = 0  #: real (non-silence) PCM written to the device
+        self._block_bytes = self.BLOCK_FRAMES * FRAME_BYTES
         self._stop = threading.Event()
-        self._accumulator: threading.Thread | None = None
-        self._player: threading.Thread | None = None
+        self._writer: threading.Thread | None = None
         #: Test seam: builds a fresh output stream. ``start()`` points it at
         #: ``sd.RawOutputStream``; unit tests can substitute a fake.
         self._stream_factory: Callable[[], object] | None = None
 
     def start(self) -> bool:
-        """Import sounddevice and spawn the accumulator + player threads.
+        """Import sounddevice and spawn the writer thread.
 
         Never raises: on any failure (no PortAudio library, no output device,
         …) it records :attr:`error`, leaves ``available`` False and returns
@@ -354,136 +311,87 @@ class AudioOutput:
             self.state = "off"
             return False
         # RawOutputStream: write() takes a raw interleaved S16LE byte buffer —
-        # the exact layout the ring (and so each buffered sound) already holds.
+        # the exact layout the ring already holds.
         self._stream_factory = lambda: sd.RawOutputStream(
             samplerate=self.rate, channels=2, dtype="int16"
         )
         self._stop.clear()
         self.available = True
         self.state = "idle"
-        self._accumulator = threading.Thread(
-            target=self._accumulate, name="tt-emu-audio-acc", daemon=True
+        self._writer = threading.Thread(
+            target=self._run, name="tt-emu-audio", daemon=True
         )
-        self._player = threading.Thread(
-            target=self._play, name="tt-emu-audio-play", daemon=True
-        )
-        self._accumulator.start()
-        self._player.start()
+        self._writer.start()
         return True
 
     def close(self) -> None:
-        """Signal both threads and join them briefly; never raises.
+        """Signal the writer and join it briefly; never raises.
 
-        The join timeout is short: the accumulator wakes every ``_POLL_SECONDS``
-        and the player wakes between sounds, so both exit promptly *unless* the
-        player is mid-``write`` of a sound (up to :attr:`MAX_SECONDS`). Both are
-        daemon threads, so an in-progress playback is abandoned cleanly on
-        process exit rather than delaying it.
+        The writer blocks at most one block (~46 ms) inside ``stream.write``, so
+        it exits promptly; it is a daemon thread regardless, so an in-progress
+        write is abandoned cleanly on process exit rather than delaying it.
         """
         self._stop.set()
-        for thread in (self._accumulator, self._player):
-            if thread is not None:
-                try:
-                    thread.join(timeout=2.0)
-                except Exception:  # noqa: BLE001 — shutdown must not raise
-                    pass
-        self._accumulator = None
-        self._player = None
+        if self._writer is not None:
+            try:
+                self._writer.join(timeout=2.0)
+            except Exception:  # noqa: BLE001 — shutdown must not raise
+                pass
+        self._writer = None
         self.available = False
         self.state = "off"
         self.level = 0.0
 
-    # --- accumulator thread: detect sound boundaries, enqueue complete sounds ---
-    def _accumulate(self) -> None:
-        buffer = bytearray()
-        last_data_clock = self.clock()
-        while not self._stop.is_set():
-            self._stop.wait(self._POLL_SECONDS)
-            last_data_clock = self._accumulate_step(buffer, last_data_clock)
-            self.buffering_bytes = len(buffer)  # for the backlog display
-
-    def _accumulate_step(self, buffer: bytearray, last_data_clock: int) -> int:
-        """One accumulator iteration: drain the ring, extend/flush ``buffer``.
-
-        Returns the (possibly updated) ``last_data_clock``. Enqueues a complete
-        sound and clears ``buffer`` when the size cap is hit or the firmware has
-        paused; otherwise leaves ``buffer`` growing. Split out from
-        :meth:`_accumulate` so the boundary logic is unit-testable with a fake
-        clock and no threads.
-        """
-        data = self.ring.drain()
-        now = self.clock()
-        if data:
-            buffer += data
-            if len(buffer) >= self.max_bytes:
-                # Long track: flush the cap so it starts playing now.
-                self._enqueue(bytes(buffer))
-                buffer.clear()
-            return now
-        if buffer and now - last_data_clock >= self.PAUSE_INSTRUCTIONS:
-            # The firmware paused: one complete sound has finished.
-            self._enqueue(bytes(buffer))
-            buffer.clear()
-        return last_data_clock
-
-    def _enqueue(self, pcm: bytes) -> None:
-        if pcm:
-            self.queued_bytes += len(pcm)
-            self._queue.put(pcm)
-
-    # --- player thread: one blocking write of each complete buffer -------------
-    def _play(self) -> None:
-        while not self._stop.is_set():
-            try:
-                pcm = self._queue.get(timeout=self._POLL_SECONDS)
-            except queue.Empty:
-                continue
-            self.queued_bytes = max(0, self.queued_bytes - len(pcm))  # now playing
-            if pcm:
-                self._play_one(pcm)
-            if self._queue.empty():
-                self.state = "idle"
-                self.level = 0.0
-
-    def _play_one(self, pcm: bytes) -> None:
-        """Play one complete PCM buffer with a single blocking write.
-
-        All the PCM is in hand before the write starts, so playback cannot
-        underrun. ``stream.write`` blocks the *player* thread only — the
-        underlying ``Pa_WriteStream`` releases the GIL, so the Textual UI and
-        the emulation thread keep running throughout. Errors (e.g. no output
-        device) are recorded, not raised — the accumulator keeps detecting
-        boundaries regardless.
-        """
+    def _run(self) -> None:
+        """Writer thread: open the stream once, feed it block by block."""
         assert self._stream_factory is not None
-        self.state = "playing"
-        self.level = _peak_level(pcm)
         try:
             stream = self._stream_factory()
             stream.start()  # type: ignore[attr-defined]
+        except Exception as exc:  # noqa: BLE001 — a bad device must not kill the app
+            self.error = str(exc) or type(exc).__name__
+            self.available = False
+            self.state = "off"
+            return
+        try:
+            while not self._stop.is_set():
+                self._write_block(stream)
+        except Exception as exc:  # noqa: BLE001 — record, don't crash the thread
+            self.error = str(exc) or type(exc).__name__
+        finally:
             try:
-                stream.write(pcm)  # type: ignore[attr-defined]  # blocks until played
-            finally:
                 stream.stop()  # type: ignore[attr-defined]
                 stream.close()  # type: ignore[attr-defined]
-        except Exception as exc:  # noqa: BLE001 — a bad device must not kill the thread
-            self.error = str(exc) or type(exc).__name__
-        self.sounds_played += 1
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _write_block(self, stream: object) -> None:
+        """Pull one block from the ring and play it (or silence).
+
+        Split out from :meth:`_run` so the pull/meter logic is unit-testable
+        with a stub stream. ``stream.write`` blocks until the block is consumed,
+        pacing the writer to real time; a full block is always supplied, so the
+        device never underruns.
+        """
+        data, got = self.ring.pull(self._block_bytes)
+        if got:
+            self.state = "playing"
+            self.level = _peak_level(data[:got])
+            self.played_bytes += got
+        else:
+            self.state = "idle"
+            self.level = 0.0
+        stream.write(data)  # type: ignore[attr-defined]  # blocks; releases the GIL
 
     @property
     def backlog_seconds(self) -> float:
-        """Captured audio not yet played — ring + accumulating sound + queue.
-
-        How far the audio lags the emulation: everything the DAC has produced
-        that the speaker hasn't reached yet.
-        """
-        pending = self.ring.fill_bytes + self.buffering_bytes + self.queued_bytes
-        return pending / (self.rate * FRAME_BYTES)
+        """Audio buffered in the ring, not yet played — the playback latency."""
+        return self.ring.fill_bytes / (self.rate * FRAME_BYTES)
 
     @property
-    def buffering_seconds(self) -> float:
-        """Length of the sound currently being accumulated."""
-        return self.buffering_bytes / (self.rate * FRAME_BYTES)
+    def played_seconds(self) -> float:
+        """Total real (non-silence) audio written to the device."""
+        return self.played_bytes / (self.rate * FRAME_BYTES)
 
 
 # --- The emulation thread --------------------------------------------------------------
@@ -1245,20 +1153,17 @@ class TtEmuApp(App[None]):
             out_line = f"[b]Output[/b]   unavailable ({reason})"
             state = "capture only"
             level_bar = "-" * 16
-            sounds = "-"
+            played = "-"
             buffered = f"{self.session.ring.fill_seconds():.2f} s (never drained)"
         else:
             out_line = f"[b]Output[/b]   {self.audio.rate} Hz stereo, sounddevice"
             state = self.audio.state
             filled = round(self.audio.level * 16)
             level_bar = "#" * filled + "." * (16 - filled)
-            sounds = str(self.audio.sounds_played)
+            played = f"{self.audio.played_seconds:.1f}s"
             backlog = self.audio.backlog_seconds
-            capturing = self.audio.buffering_seconds
-            bar_n = min(20, int(round(backlog / 10.0 * 20)))  # ~10 s spans the bar
-            buffered = f"{backlog:5.1f}s behind [{'#' * bar_n}{'.' * (20 - bar_n)}]"
-            if capturing > 0.05:
-                buffered += f"  +{capturing:.1f}s capturing"
+            bar_n = min(20, int(round(backlog / 2.0 * 20)))  # ~2 s spans the bar
+            buffered = f"{backlog:4.1f}s buffered [{'#' * bar_n}{'.' * (20 - bar_n)}]"
         chain = "playing (chain active)" if snap.chain_active else "idle"
         duration = snap.captured_bytes / (FRAME_BYTES * snap.capture_rate)
         last = (
@@ -1269,14 +1174,14 @@ class TtEmuApp(App[None]):
         note = ""
         if 0 < snap.speed_ratio < 0.9:
             note = (
-                f"\n[dim]emulation at {snap.speed_ratio:.2f}x real time — each sound"
-                f" is buffered and played complete[/dim]"
+                f"\n[dim]emulation at {snap.speed_ratio:.2f}x real time — audio streams"
+                f" live from the ring[/dim]"
             )
         return (
             f"{out_line}\n"
             f"[b]Status[/b]   {state}   [b]Firmware[/b] {chain}\n"
             f"[b]Level[/b]    {level_bar}\n"
-            f"[b]Lag[/b]      {buffered}   [b]Sounds[/b] {sounds}\n"
+            f"[b]Buffered[/b] {buffered}   [b]Played[/b] {played}\n"
             f"[b]Captured[/b] {snap.captured_chunks} chunks, {duration:.1f} s"
             f" @ {snap.capture_rate} Hz ({snap.dac_submits} DAC submits)\n"
             f"[b]Last[/b]     {last}"
@@ -1288,9 +1193,18 @@ class TtEmuApp(App[None]):
 
     # --- tap list ------------------------------------------------------------------------
 
+    def _sort_modes(self) -> tuple[str, ...]:
+        """The sort modes offered right now — ``name`` only when a tttool YAML
+        supplies symbolic names to sort by; otherwise it would just repeat the
+        OID order and make ``s`` look like it does nothing."""
+        if self.session.symbols is not None:
+            return self.SORT_MODES
+        return tuple(m for m in self.SORT_MODES if m != "name")
+
     @property
     def _sort_mode(self) -> str:
-        return self.SORT_MODES[self._sort_index]
+        modes = self._sort_modes()
+        return modes[self._sort_index % len(modes)]
 
     def _tap_rows(self) -> list[tuple[int, str]]:
         """``(OID code, prompt)`` rows for the tap list in the current sort order.
@@ -1352,7 +1266,7 @@ class TtEmuApp(App[None]):
         )
 
     def action_cycle_sort(self) -> None:
-        self._sort_index = (self._sort_index + 1) % len(self.SORT_MODES)
+        self._sort_index = (self._sort_index + 1) % len(self._sort_modes())
         self._populate_tap_list()
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
@@ -1479,13 +1393,7 @@ def main(argv: list[str] | None = None) -> int:
     audio = (
         None
         if args.no_audio
-        else AudioOutput(
-            session.ring,
-            # Read the live emulated instruction count (a plain int; the machine
-            # only exists once the worker thread has built it). The accumulator
-            # uses it to detect firmware pauses between sounds.
-            clock=lambda: session.booted.machine.clock if session.booted is not None else 0,
-        )
+        else AudioOutput(session.ring)
     )
     app = TtEmuApp(session, audio)
     app.run()

@@ -214,8 +214,7 @@ def test_app_tap_list_sort_and_lru() -> None:
             tap_list.highlighted = tap_list.get_option_index("tap-4718")
             await pilot.press("enter")
             assert fake.taps == [4718]
-            await pilot.press("s")  # OID -> name
-            await pilot.press("s")  # name -> recent
+            await pilot.press("s")  # OID -> recent ('name' skipped: this game has no YAML)
             assert "sort: recent" in str(app.query_one("#tap-panel").border_title)
             # LRU: the just-tapped 4718 jumps to the top (after the pinned product).
             assert codes()[:2] == ["tap-42", "tap-4718"]
