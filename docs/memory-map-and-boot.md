@@ -36,30 +36,50 @@ with an effectively identity mapping, see §1.3). Byte order is little-endian th
   semihosting write call (or at least logging and returning) is useful for diagnosis;
   it is not on the happy path.
 
-### 1.2 CP15 / caches
+### 1.2 CP15 / MMU / caches
 
 - The mask ROM never touches MMU or caches (runs physical, caches off).
-- The boot blob's reset handler executes `mcr p15, c1` to force the MMU **off**, later
-  builds MMU **section tables** (page-table area `0x08004000`/`0x08004400`) and enables
-  I/D caches via SCTLR. One init step enables the D-cache bit while the MMU is still
-  off. **Observed.**
-- PROG contains a software page-table walker (`hal_virt_to_phys`, nandboot
-  `0x08001990`) used to hand physical addresses to the DMA engine, and the NAND driver
-  toggles per-4K page attributes as a cache-coherence measure. **Observed.**
+- nandboot's **`init2`** (`0x080018d4`) builds the ARMv5 L1/L2 page tables (base `TTBR0 =
+  0x08004000`, coarse L2 tables just above) and enables the MMU (`SCTLR.M = 1`; the live
+  pen reads `SCTLR = 0x0005107d`, `DACR = 0x55555551`). **The emulator runs `init2` and
+  Unicorn honours the resulting page table — PROG executes under its own real MMU** (this
+  is "Path B"; see `mmu_boot.py` and §5). The tables start most PROG pages no-access
+  (`AP=00`); the firmware **demand-refines** them on abort (§1.4). **Observed.**
+- `hal_virt_to_phys` (nandboot `0x08001990`) hands **physical** addresses to the DMA
+  engine. Because the MMU is emulated, the DAC/NAND DMA is a plain **physical** `mem_read`
+  — no Python page-table inversion. The NAND driver also toggles per-4K page `AP` bits as
+  a cache-coherence measure; on a cacheless model these are no-ops. **Observed.**
 
-**Emulator guidance:** do **not** emulate the MMU. The effective mapping is identity for
-all RAM and MMIO the firmware uses (the software page-walk resolving virt==phys on the
-relevant ranges confirms this — Observed in emulation; the only non-identity artifact is
-the HAL alias, §2 note). Accept and **ignore/neutralize all CP15 writes** (SCTLR, cache
-ops, TLB ops). Note for QEMU/Unicorn-class cores: "D-cache enable with MMU off" can raise
-a spurious data abort — neutralizing the SCTLR write is required and behaviour-neutral.
+**Emulator guidance:** run the firmware's own MMU. Neutralize **cache/TLB** CP15 ops (no
+cache is modelled) but **honour the MMU** (SCTLR.M, TTBR0, DACR). Note for QEMU/Unicorn:
+Unicorn honours the ARMv5 page table but does **not** vector ARMv5 exceptions natively — a
+prefetch/data abort surfaces via `UC_HOOK_INTR` (intno 3/4) with no FAR; the harness does
+the exception entry itself (§1.4).
 
-### 1.3 Why identity works
+### 1.3 The demand-pager (why PROG runs under the MMU)
 
-The whole system (boot blob, PROG) is linked at its physical load addresses; all literal
-pools bake absolute `0x08xxxxxx` / `0x07ffxxxx` / `0x04xxxxxx` addresses. Emulating with
-a flat physical address space and the blob mapped at those addresses reproduces exactly
-what the code expects. **Observed** (a complete cold boot to the main loop runs this way).
+PROG (~3.6 MB) does not sit resident; the runtime image at `0x08009000+` is **demand-paged**
+through a small pool of **37 physical frames** (allocator loop `0x08000b20`, `cmp #0x25`).
+On an `AP=00` access the CPU aborts; nandboot's abort handler calls the **refiner**
+(`0x080014d8`), which hashes the fault VA to a frame (allocator/LRU scan `0x08001314`),
+evicts the current occupant, and maps the page. The victim is the **least-recently-used**
+frame, ranked by a per-frame usage-clock array the pager reads from MMIO `0x04010124`
+(see `audio-dac-dma.md` §2.1) — a hardware unit the emulator must model, or the pager
+thrashes a handful of frames.
+
+The emulator supplies only what the silicon+romboot would (never firmware behaviour): the
+**exception entry** (decode the fault addr → FAR → bank to abort mode → jump to nandboot's
+own vector `0x0800000c`/`0x08000010`), a **backing store** (write PROG's bytes into the
+frame the refiner chose, via a per-VA shadow that survives re-zeroing), and the **frame
+usage clock**. See `mmu_boot.py`.
+
+### 1.3.1 Why absolute addressing still works
+
+The whole system (boot blob, PROG) is linked at its load addresses; literal pools bake
+absolute `0x08xxxxxx` / `0x07ffxxxx` / `0x04xxxxxx` addresses. The page table maps each
+runtime VA to a frame holding the linked bytes, so absolute references resolve exactly as
+the code expects. **Observed** (a complete cold boot to the main loop + book/product audio
+runs this way).
 
 ---
 

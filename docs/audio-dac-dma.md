@@ -73,6 +73,25 @@ All **Observed** from the firmware's submit routine and its interrupt handler.
 | `0x0401000c` | **Word count + START/BUSY.** Written `((len_bytes / 4) & 0x7ff) \| 0x2000`: an 11-bit word count with **bit13 = START/BUSY**. The submit routine polls `while (reg & 0x2000)` *before* programming (slot free); memory-to-memory transfers also spin on it afterwards for completion. Must read with bit13 **clear** when the engine is idle, or the firmware hangs in the pre-submit poll. |
 | `0x04010010` | Per-port status word (read by an internal poll helper). |
 | `0x0401001c` | Status word checked **first** by the DMA-done interrupt handler as a spurious-IRQ test: **must read 0** when the ISR runs, or the handler returns without ACKing and line 0 storms (see `interrupts-and-timers.md`). |
+| `0x04010014` / `0x04010018` | **Pager frame lock bitmasks** — read **and** written by the nandboot demand-pager (not the DAC). One bit per pager frame, split at frame 22: `0x14` covers frames 0–22 (bit `frame+9`), `0x18` covers frames 23–36 (bit `frame−23`). The pager's victim scan consults them to bias/skip frames. The firmware writes them (mostly 0); the emulator RAM-backs them so reads return what was written. **Observed** (pager hash `0x08001314`). |
+| `0x04010124`–`0x040101b4` | **Pager per-frame usage clock** — a 37-entry array (one word per pager frame), **read-only** to the firmware (read ~30 k×/boot, written 0×). The demand-pager evicts the frame with the **smallest** entry, i.e. the least-recently-used. This is a *hardware* frame-usage tracker; the emulator models it (§2.1). |
+
+### 2.1 The block is shared with the demand-pager (frame-usage tracker)
+
+Beyond the DAC/DMA registers, this MMIO block hosts the nandboot demand-pager's
+frame bookkeeping: the lock bitmasks (`0x14`/`0x18`) and the per-frame usage-clock
+array (`0x124`). The pager's frame allocator (`0x08001314`, scans its 37 frames)
+picks its eviction victim as the frame whose `0x04010124[frame]` entry is smallest
+— the least-recently-used. On silicon the hardware stamps a frame's entry when a
+page is mapped into it. The emulator reproduces this: `AudioDma.touch_frame(idx)`
+advances a per-frame clock, driven from `mmu_boot` when the pager records a page in
+a frame (its eviction-table write at `0x0800878c`).
+
+This matters for **audio**: without the model every entry reads 0, the pager can't
+rank frames, and its eviction collapses onto ~5 frames. The audio-decode working
+set (~22 hot code pages) then thrashes through them — thousands of re-faults per
+page — and the book/product audio never drains within a tap budget. Modelling the
+array spreads eviction across all 37 frames and removes the thrash.
 
 **Peripheral port codes** (argument < 10 to the submit routine selects a port instead of a
 memory address): 0 → `0x6000` (ADC/mic capture), **1 → `0x6200` (DAC out)**, 2 → `0x6400`,
@@ -322,3 +341,11 @@ same with a ring/callback instead of a file):
 - The exact divider search arithmetic for arbitrary rates (only the inverse table lookup
   and the observed data points — 22050 Hz → 0x28 live, 8000 Hz → 0x74 bring-up — are
   needed for emulation).
+- **Open bug — digit-media playback.** After a product mount, tapping a content OID (e.g.
+  4716 → media `'acht'`) starts a playback (metadata fires) but produces **no PCM**: the
+  firmware loops in the teardown silence-flush (`dac_flush_silence`, `0x08032eb0`) roughly
+  every 55 M instructions instead of decoding real audio. The swallow flag `0x08008C91` is
+  set/cleared cleanly, so it is not a stuck flag — the media-playback state after the
+  product-mount-sound teardown never transitions to real output. The mount sound itself now
+  plays and captures correctly (surfaced by the pager-LRU fix, §2.1). Reproduces as
+  `tests/test_scripting`.
