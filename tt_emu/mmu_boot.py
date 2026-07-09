@@ -33,7 +33,7 @@ import struct
 import unicorn.arm_const as ac
 from capstone import CS_ARCH_ARM, CS_MODE_ARM, CS_MODE_THUMB, Cs
 from capstone.arm_const import ARM_OP_MEM, ARM_OP_REG
-from unicorn import UC_HOOK_CODE, UcError
+from unicorn import UC_HOOK_CODE, UC_HOOK_MEM_WRITE, UcError
 from unicorn.arm_const import (
     UC_ARM_REG_CPSR,
     UC_ARM_REG_LR,
@@ -43,8 +43,13 @@ from unicorn.arm_const import (
     UC_ARM_REG_CP_REG,
 )
 
+from typing import TYPE_CHECKING
+
 from .loader import Firmware, PROG_LOAD_ADDR
 from .machine import Machine
+
+if TYPE_CHECKING:
+    from .peripherals.audio import AudioDma
 
 log = logging.getLogger(__name__)
 
@@ -72,6 +77,14 @@ SP_ABT = 0x0800_6000
 #: the exact point to snapshot the outgoing page's content before the refiner reuses it.
 PAGER_REFINER_CAPTURE = 0x0800_14F8
 PAGER_FRAME_BASE = 0x0800_9000
+#: The pager's per-frame globals base (the refiner's ``[pc,#-0x8d0]`` literal) and
+#: its eviction table (``[base+0x800+idx*4]`` = the page VA resident in frame idx,
+#: 0 = free). The pager writes an entry when it maps a page into a frame; we watch
+#: those writes to stamp the hardware frame-usage clock (:meth:`AudioDma.touch_frame`)
+#: so the pager's LRU victim scan can rank frames instead of thrashing a few.
+PAGER_SB_BASE = 0x0800_7F8C
+PAGER_EVICT_TABLE = PAGER_SB_BASE + 0x800
+PAGER_FRAME_COUNT = 37
 #: The loader keeps the work/data region **resident** (identity, AP=11) and demand-pages
 #: only the code range below it. These nandboot literals bound it: the allocator's frame
 #: threshold (page-aligned) is the code/data split, and its dynamic-alloc VA pool base is
@@ -106,9 +119,10 @@ class MmuBoot:
     interrupt dispatch (SVC vs. abort).
     """
 
-    def __init__(self, machine: Machine, firmware: Firmware) -> None:
+    def __init__(self, machine: Machine, firmware: Firmware, audio: "AudioDma") -> None:
         self.m = machine
         self.uc = machine.uc
+        self.audio = audio
         self.prog = firmware.prog.data
         self.prog_hi = PROG_LOAD_ADDR + len(self.prog)
 
@@ -160,6 +174,11 @@ class MmuBoot:
         # Snapshot each page the instant the refiner evicts it (scoped hook).
         uc.hook_add(UC_HOOK_CODE, self._on_refiner_evict,
                     begin=PAGER_REFINER_CAPTURE, end=PAGER_REFINER_CAPTURE)
+        # Model the hardware per-frame usage clock: when the pager records a page
+        # in a frame (eviction-table write), stamp that frame so its LRU victim
+        # scan (the 0x04010124 array) can rank frames instead of thrashing a few.
+        uc.hook_add(UC_HOOK_MEM_WRITE, self._on_frame_map,
+                    begin=PAGER_EVICT_TABLE, end=PAGER_EVICT_TABLE + PAGER_FRAME_COUNT * 4 - 1)
         # Restore page content at the handlers' return instructions (scoped hooks: they fire
         # only at these two PCs, so there is no per-instruction cost).
         for ret in (PABT_RET, DABT_RET):
@@ -316,6 +335,16 @@ class MmuBoot:
             return
         frame = PAGER_FRAME_BASE + self.uc.reg_read(ac.UC_ARM_REG_R4) * 0x1000
         self.shadow[old_va & ~0xFFF] = bytes(self.uc.mem_read(frame, 0x1000))
+
+    def _on_frame_map(self, _uc: object, _access: int, addr: int, _size: int,
+                      _value: int, _ud: object) -> None:
+        """Stamp the pager frame whose eviction-table entry was just written.
+
+        The pager writes ``eviction_table[idx]`` when it maps a page into frame
+        ``idx``; that is exactly when the hardware frame-usage clock advances for
+        that frame, so we forward it to :meth:`AudioDma.touch_frame`. Observation
+        only — the firmware's own write proceeds unchanged."""
+        self.audio.touch_frame((addr - PAGER_EVICT_TABLE) // 4)
 
     def _on_abort(self, intno: int) -> None:
         """Vector a prefetch(3)/data(4) abort into nandboot's own handler.

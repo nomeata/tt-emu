@@ -72,6 +72,17 @@ DMA_KICK = 1 << 16
 DMA_START = 1 << 13
 WORDCOUNT_MASK = 0x7FF
 
+#: Per-frame usage-clock array the nandboot demand-pager reads to pick LRU
+#: eviction victims. The pager's frame allocator (hash ``0x08001314``) scans its
+#: 37 frames and evicts the one with the smallest entry here — i.e. the
+#: least-recently-used. The hardware stamps a frame's entry when a page is mapped
+#: into it; :class:`~tt_emu.mmu_boot.MmuBoot` drives :meth:`touch_frame` on that
+#: event. Without this the array reads 0 for every frame, the pager cannot rank
+#: them, and the audio-decode working set thrashes through ~5 frames instead of
+#: spreading across all 37 (``firmware`` demand-pager, §pager-lru).
+PAGER_FRAME_LRU_OFF = 0x124
+PAGER_FRAME_COUNT = 37
+
 #: Peripheral-port destination for DAC playback: port 1 = 0x6200 | 0x08080000 (§2).
 DAC_PORT_DST = 0x0808_6200
 PORT_FLAG = 0x0808_0000
@@ -148,8 +159,27 @@ class AudioDma(L2NandBuffer):
         self.unresolved_submits = 0  #: DAC submits whose physical source mapped nowhere
         self.completions = 0       #: line-0 completion asserts delivered
         self.last_dac_submit_at = 0  #: machine clock of the last DAC submit
+        #: The pager per-frame usage clock (see :data:`PAGER_FRAME_LRU_OFF`).
+        self._frame_clock = 0
+        self._frame_lru = [0] * PAGER_FRAME_COUNT
+
+    def touch_frame(self, index: int) -> None:
+        """Stamp pager frame ``index`` as just-used.
+
+        Called when the demand-pager maps a page into the frame; the value is
+        read back by the pager's LRU victim scan at ``PAGER_FRAME_LRU_OFF +
+        index*4``. Models the hardware frame-usage tracker (observation only —
+        no firmware state is written)."""
+        if 0 <= index < PAGER_FRAME_COUNT:
+            self._frame_clock += 1
+            self._frame_lru[index] = self._frame_clock
 
     # --- register behaviour ----------------------------------------------------------------
+
+    def read_reg(self, offset: int) -> int:
+        if PAGER_FRAME_LRU_OFF <= offset < PAGER_FRAME_LRU_OFF + PAGER_FRAME_COUNT * 4:
+            return self._frame_lru[(offset - PAGER_FRAME_LRU_OFF) // 4]
+        return super().read_reg(offset)
 
     def write_reg(self, offset: int, value: int) -> None:
         if offset == DMA_CTRL:

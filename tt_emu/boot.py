@@ -209,7 +209,7 @@ def build_machine(
     # --- MMU handoff: run nandboot init2 to build the page table + enable the MMU,
     # and install the abort-driven demand-paging + romboot backing store (mmu_boot).
     # The DMA engines then read physical memory directly (no page-table inversion).
-    mmu = MmuBoot(machine, firmware)
+    mmu = MmuBoot(machine, firmware, audio)
     mmu.setup()
 
     # --- CPU entry state (§5.2): PROG's pre-init entry, now under the MMU ----------
