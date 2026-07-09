@@ -72,6 +72,14 @@ SP_ABT = 0x0800_6000
 #: the exact point to snapshot the outgoing page's content before the refiner reuses it.
 PAGER_REFINER_CAPTURE = 0x0800_14F8
 PAGER_FRAME_BASE = 0x0800_9000
+#: The loader keeps the work/data region **resident** (identity, AP=11) and demand-pages
+#: only the code range below it. These nandboot literals bound it: the allocator's frame
+#: threshold (page-aligned) is the code/data split, and its dynamic-alloc VA pool base is
+#: the top of the fixed-data region (the pool above stays unmapped for the firmware to hand
+#: out). Without residency the data pages get demand-paged into code frames and the pager
+#: clobbers them (the DMA-pool aliasing that crashed the book/media path).
+ALLOC_THRESHOLD_LIT = 0x0800_0C2C   #: -> frame threshold ~0x08120a63; split @0x08120000
+ALLOC_POOL_START_LIT = 0x0800_0C34  #: -> dynamic-VA pool base ~0x081dcf44
 #: CP15 register selectors (coproc, is64, sec, CRn, CRm, opc1, opc2).
 _FAR = (15, 0, 0, 6, 0, 0, 0)   # fault address register (c6)
 _TTBR0 = (15, 0, 0, 2, 0, 0, 0)  # translation table base 0
@@ -141,6 +149,7 @@ class MmuBoot:
         self.l1_base = uc.reg_read(UC_ARM_REG_CP_REG, _TTBR0) & 0xFFFF_C000
         log.info("MMU boot: init2 built the page table, SCTLR=%#010x TTBR0=%#010x",
                  sctlr, self.l1_base)
+        self._make_data_resident()
 
         # Seed the abort-mode banked stack the fault handlers push onto.
         cpsr = uc.reg_read(UC_ARM_REG_CPSR)
@@ -157,6 +166,36 @@ class MmuBoot:
             uc.hook_add(UC_HOOK_CODE, self._on_handler_return, begin=ret, end=ret)
         # The machine's UC_HOOK_INTR delegates prefetch/data aborts (intno 3/4) here.
         self.m.set_abort_handler(self._on_abort)
+
+    def _make_data_resident(self) -> None:
+        """Pin the work/data region resident (identity, AP=11), like the loader does.
+
+        init2 leaves every page AP=00 (fault-on-access), which would demand-page the *data*
+        region too — mapping it into the small code-frame pool and letting the pager clobber
+        it. The real loader keeps data resident and demand-pages only code. We replicate that
+        for the fixed-data window ``[frame-threshold, dynamic-pool-base)`` (bounds read from
+        the firmware's own allocator literals), seeding each page's image content; the
+        dynamic-alloc pool above stays untouched for the firmware to manage.
+        """
+        uc = self.uc
+        lo = struct.unpack("<I", uc.mem_read(ALLOC_THRESHOLD_LIT, 4))[0] & ~0xFFF
+        hi = struct.unpack("<I", uc.mem_read(ALLOC_POOL_START_LIT, 4))[0] & ~0xFFF
+        n = 0
+        for va in range(lo, hi, 0x1000):
+            l1e = struct.unpack("<I", uc.mem_read(self.l1_base + (va >> 20) * 4, 4))[0]
+            if (l1e & 3) != 1:  # only coarse-mapped pages have an L2 entry to flip
+                continue
+            l2a = (l1e & 0xFFFFFC00) + ((va >> 12) & 0xFF) * 4
+            uc.mem_write(l2a, struct.pack("<I", (va & 0xFFFFF000) | 0xFFE))  # identity, AP=11
+            if va < self.prog_hi:
+                off = va - PROG_LOAD_ADDR
+                uc.mem_write(va, self.prog[off:off + 0x1000].ljust(0x1000, b"\x00"))
+            n += 1
+        try:
+            uc.ctl_remove_cache(lo, hi)
+        except UcError:
+            pass
+        log.info("MMU boot: pinned %d data pages resident [%#010x, %#010x)", n, lo, hi)
 
     # --- page-table walk (read the firmware's live tables) ------------------------------
 
