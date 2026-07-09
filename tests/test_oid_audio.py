@@ -17,6 +17,7 @@ import pytest
 
 from tt_emu.audio_capture import AudioCapture
 from tt_emu.machine import Machine, MachineConfig
+from tt_emu.machine import PHYS_RAM_BASE
 from tt_emu.peripherals.audio import (
     AudioDma,
     DAC_PORT_DST,
@@ -26,11 +27,6 @@ from tt_emu.peripherals.audio import (
     DMA_SRC,
     DMA_START,
     DMA_WORDCOUNT,
-    RING_BASE,
-    RING_BODY,
-    RING_READ,
-    RING_SIZE,
-    SRC_WINDOW_CPU_OFFSET,
     SRC_WINDOW_MASK,
     SWALLOW_FLAG_ADDR,
     rate_from_divider,
@@ -253,7 +249,10 @@ def test_oid_queued_taps_serve_in_order(oid_rig) -> None:
 
 # --- audio DMA (audio-dac-dma.md) -----------------------------------------------------
 
-RING_PTR = 0x0810_0000  # test PCM ring buffer location in main RAM
+#: Test PCM buffer inside the DAC engine's first 256-KiB physical aperture
+#: (``[PHYS_RAM_BASE, PHYS_RAM_BASE+0x40000)``), so with no address remap the
+#: source register's 18-bit offset reconstructs the buffer identically.
+BUF_PTR = PHYS_RAM_BASE + 0x9000
 IPT = 20_000  # instructions per 20 ms tick
 
 
@@ -271,24 +270,19 @@ def audio_rig() -> tuple[Machine, AudioDma, IntcTimer, SysCon]:
     machine.add_peripheral(syscon)
     machine.add_peripheral(audio)
     machine.intc = intc
-    # Build the PCM ring the firmware would have (§5): base/size/read pointer.
-    machine.write_u32(RING_BODY + RING_BASE, RING_PTR)
-    machine.write_u32(RING_BODY + RING_SIZE, 0x3000)
-    machine.write_u32(RING_BODY + RING_READ, 0)
     # DAC rate divider: the live-Observed 22050 Hz code (GME playback).
     syscon.write_reg(0x08, (0x28 << 13) | (1 << 24))
     return machine, audio, intc, syscon
 
 
-def _submit(audio: AudioDma, src: int, length: int) -> None:
+def _submit(audio: AudioDma, buf: int, length: int) -> None:
     """The firmware's §2 submit protocol at register level.
 
-    ``src`` is the chunk's CPU pointer; the register value is the firmware's
-    virt→phys translation ``(src - 0x4000) & 0x3ffff`` (the Observed
-    ``SRC_WINDOW_CPU_OFFSET`` data point).
+    ``buf`` is the buffer's physical address; the source register holds its low
+    18 bits (the 256-KiB aperture offset — the DAC engine reads physical RAM).
     """
     assert audio.read(DMA_WORDCOUNT, 4) & DMA_START == 0  # slot free (§2)
-    audio.write(DMA_SRC, 4, (src - SRC_WINDOW_CPU_OFFSET) & SRC_WINDOW_MASK)
+    audio.write(DMA_SRC, 4, buf & SRC_WINDOW_MASK)
     audio.write(DMA_DST, 4, DAC_PORT_DST)
     audio.write(DMA_WORDCOUNT, 4, (length // 4) | DMA_START)
     audio.write(DMA_CTRL, 4, audio.read(DMA_CTRL, 4) | DMA_KICK)
@@ -297,8 +291,8 @@ def _submit(audio: AudioDma, src: int, length: int) -> None:
 def test_audio_capture_and_paced_completion(audio_rig) -> None:
     machine, audio, intc, _syscon = audio_rig
     pattern = bytes(range(256)) * 4  # 0x400 bytes
-    machine.write_bytes(RING_PTR, pattern)
-    _submit(audio, RING_PTR, 0x400)
+    machine.write_bytes(BUF_PTR, pattern)
+    _submit(audio, BUF_PTR, 0x400)
 
     # Captured exactly the submitted bytes, tagged 22050 Hz.
     assert audio.capture.total_bytes == 0x400
@@ -327,8 +321,8 @@ def test_fast_pacing_completes_without_the_playback_wait(audio_rig) -> None:
     machine, audio, intc, _syscon = audio_rig
     machine.config.dac_pacing = "fast"
     pattern = bytes(range(256)) * 4  # 0x400 bytes
-    machine.write_bytes(RING_PTR, pattern)
-    _submit(audio, RING_PTR, 0x400)
+    machine.write_bytes(BUF_PTR, pattern)
+    _submit(audio, BUF_PTR, 0x400)
 
     # Same capture as faithful pacing — only the completion timing differs.
     assert audio.capture.chunks[0].data == pattern
@@ -339,31 +333,50 @@ def test_fast_pacing_completes_without_the_playback_wait(audio_rig) -> None:
     assert audio.completions == 1
 
 
-def test_audio_source_recovery_post_advance(audio_rig) -> None:
-    # The dequeue may advance the read pointer before the submit; the source
-    # register's low 18 bits disambiguate (§7 item 2).
+def test_audio_source_reads_the_aperture_offset(audio_rig) -> None:
+    # The DAC engine is a physical bus master: the source register's 18-bit
+    # offset into the 256-KiB aperture reconstructs the buffer regardless of any
+    # ring bookkeeping — a second buffer elsewhere in the window resolves too.
     machine, audio, _intc, _syscon = audio_rig
-    pattern = b"\x11\x22\x33\x44" * 0x100
-    machine.write_bytes(RING_PTR, pattern)
-    machine.write_u32(RING_BODY + RING_READ, 0x400)  # already advanced past chunk 0
-    _submit(audio, RING_PTR, 0x400)  # chunk really started at offset 0
+    a = b"\x11\x22\x33\x44" * 0x100
+    b = b"\xAA\xBB\xCC\xDD" * 0x100
+    machine.write_bytes(BUF_PTR, a)
+    machine.write_bytes(PHYS_RAM_BASE + 0x11000, b)
+    _submit(audio, BUF_PTR, 0x400)
+    _submit(audio, PHYS_RAM_BASE + 0x11000, 0x400)
+    assert audio.capture.chunks[0].data == a
+    assert audio.capture.chunks[1].data == b
+
+
+def test_audio_source_reads_physical_frame_directly(audio_rig) -> None:
+    # Path B: the DAC is a physical bus master and the CPU runs under its own MMU, so a
+    # buffer write has already landed at its physical frame — the engine reads that frame
+    # directly, with no virt→phys inversion (audio-dac-dma.md). The byte at src's aperture
+    # offset is what plays, whatever virtual address the firmware wrote it through.
+    machine, audio, _intc, _syscon = audio_rig
+    phys = PHYS_RAM_BASE + 0x9000  # src register carries phys & 0x3ffff = 0x9000
+    pattern = bytes((i * 5) & 0xFF for i in range(0x400))
+    machine.write_bytes(phys, pattern)
+    _submit(audio, phys, 0x400)
     assert audio.capture.chunks[0].data == pattern
 
 
-def test_audio_ring_wraparound_read(audio_rig) -> None:
+def test_audio_unmapped_source_not_captured(audio_rig, monkeypatch) -> None:
+    # A source that reads no physical RAM (read_phys -> None) is dropped, not captured as
+    # garbage. On the real pen the DAC aperture is always RAM-backed, so this is the
+    # engine's defensive path for a bad source register.
     machine, audio, _intc, _syscon = audio_rig
-    machine.write_bytes(RING_PTR + 0x3000 - 0x200, b"\xAA" * 0x200)
-    machine.write_bytes(RING_PTR, b"\xBB" * 0x200)
-    machine.write_u32(RING_BODY + RING_READ, 0x3000 - 0x200)
-    _submit(audio, RING_PTR + 0x3000 - 0x200, 0x400)
-    assert audio.capture.chunks[0].data == b"\xAA" * 0x200 + b"\xBB" * 0x200
+    monkeypatch.setattr(machine, "read_phys", lambda phys, size: None)
+    _submit(audio, BUF_PTR, 0x400)
+    assert audio.capture.total_bytes == 0
+    assert audio.unresolved_submits == 1
 
 
 def test_audio_teardown_flush_not_captured(audio_rig) -> None:
     # §6: swallow-flag submits (the silence flush) complete but don't record.
     machine, audio, intc, _syscon = audio_rig
     machine.write_u8(SWALLOW_FLAG_ADDR, 1)
-    _submit(audio, RING_PTR, 0x800)
+    _submit(audio, BUF_PTR, 0x800)
     assert audio.capture.total_bytes == 0
     assert audio.flush_submits == 1
     audio.tick(10**9)  # completion must still be delivered (the firmware spins)

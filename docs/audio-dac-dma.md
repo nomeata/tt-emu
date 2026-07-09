@@ -68,7 +68,7 @@ All **Observed** from the firmware's submit routine and its interrupt handler.
 | register | role |
 |---|---|
 | `0x04010000` | **Control.** Written `0x00620024` once at HAL init. **bit16 = kick/GO** for peripheral-port transfers: the submit routine sets it (`|= 0x10000`) after programming the other registers; the DMA-done interrupt handler clears it (`&= ~0x10000`) — that clear is the interrupt ACK. |
-| `0x04010004` | **Source address.** Memory addresses are written as **`(cpu_ptr − 0x4000) & 0x3ffff`** — an 18-bit offset into a source window based at CPU address `0x08004000` (see the note below); peripheral-port codes as `port_addr \| 0x08080000`. |
+| `0x04010004` | **Source address.** For memory the register holds **`phys & 0x3ffff`** — an 18-bit offset into the DMA engine's 256-KiB physical-RAM aperture (based at the RAM base `0x08000000`, see the note below); peripheral-port codes as `port_addr \| 0x08080000`. |
 | `0x04010008` | **Destination address**, same encoding. For playback: **port 1 = DAC**, i.e. the value `0x6200 \| 0x08080000 = 0x08086200`. |
 | `0x0401000c` | **Word count + START/BUSY.** Written `((len_bytes / 4) & 0x7ff) \| 0x2000`: an 11-bit word count with **bit13 = START/BUSY**. The submit routine polls `while (reg & 0x2000)` *before* programming (slot free); memory-to-memory transfers also spin on it afterwards for completion. Must read with bit13 **clear** when the engine is idle, or the firmware hangs in the pre-submit poll. |
 | `0x04010010` | Per-port status word (read by an internal poll helper). |
@@ -95,12 +95,17 @@ For audio, the caller is `hal_ao_submit_tick` (runtime `0x08003a74`): dequeue th
 ring chunk (§5) → translate the chunk's virtual address to physical → `hal_dma_submit(phys,
 1, len)` → mark the chain active (flag byte, §4).
 
-> **The 18-bit source encoding — resolved (Observed in emulation during real
-> playback).** The firmware writes **`(cpu_ptr − 0x4000) & 0x3ffff`** into
-> `0x04010004`: the engine's 256-KiB source window is based at CPU address
-> **`0x08004000`** (for buffers in main RAM, `cpu_ptr = 0x08004000 + reg_value`).
-> The PCM ring is allocated inside this window, so decoding the register back to
-> the chunk's CPU address is exact and **capture is fully hook-free** (§7).
+> **The 18-bit source encoding — a physical-address aperture.** The DAC engine
+> is a **physical**-address bus master. `0x04010004` holds `phys & 0x3ffff`: an
+> 18-bit offset into a **256-KiB physical-RAM aperture based at the RAM base
+> `0x08000000`** (a hardware property, proven at runtime — reconstructing
+> `0x08000000 | (reg & 0x3ffff)` resolves every submit; every mapped page of the
+> firmware's DMA pool sits in this one window). The firmware allocates its
+> DMA-able pool (PCM ring, system-voice buffer, teardown-flush buffer) from a
+> physically-contiguous region and translates each buffer to physical with
+> `hal_virt_to_phys` before submitting; the emulator reads the reconstructed
+> physical address, translating physical→where-the-bytes-live through the same
+> map (§7). This resolves any source uniformly and needs no firmware ring/struct.
 
 ---
 
@@ -252,13 +257,15 @@ same with a ring/callback instead of a file):
 1. **RAM-back the register window** `0x04010000..0x0401001c`. Defaults: everything 0;
    in particular `0x0401000c` bit13 clear (else the first submit hangs) and `0x0401001c`
    = 0 always (else the ISR treats every interrupt as spurious).
-2. **Record the chunk source at submit — hook-free (proven).** Decode the register:
-   `src_cpu = 0x08004000 + [0x04010004]` (the firmware wrote
-   `(cpu_ptr − 0x4000) & 0x3ffff`, §2 — Observed exact during real playback).
-   Alternative (older, hook-based): capture the ring dequeue's return
-   (chunk ptr = `ring[+0x44] + ring[+0x38]` just before it advances). Track the
-   *last* recorded pointer plus a flag saying whether the current submit came from
-   the ring (to handle §6 correctly).
+2. **Read the chunk source at submit as a physical bus master.** Reconstruct the
+   physical address `phys = window_base | ([0x04010004] & 0x3ffff)` (window base =
+   the RAM base `0x08000000`, §2), then read physical memory at `phys`. A DMA
+   master reads physical RAM directly; model that as a `read_phys(phys, len)`
+   primitive in the memory layer. When the CPU-side MMU is not modelled, translate
+   `phys`→the flat/virtual address holding those bytes through the firmware's
+   active virt→phys map (the inverse of `hal_virt_to_phys`); when it is modelled,
+   physical == the address the CPU already wrote to. Either way the DMA engine
+   itself needs no knowledge of any firmware buffer or ring.
 3. **On the START write to `0x0401000c`** (value has bit13 and a nonzero word count)
    while the destination is the DAC port (`0x04010008 == 0x08086200`):
    - read `word_count × 4` bytes from the recorded source pointer — these are final,
@@ -305,9 +312,11 @@ same with a ring/callback instead of a file):
 
 ## 8. Open items
 
-- ~~The physical window base behind the 18-bit `0x04010004` encoding~~ — **resolved
-  (Observed):** the firmware writes `(cpu_ptr − 0x4000) & 0x3ffff`; window base
-  `0x08004000`, source decoding is fully hook-free during real playback (§2/§7).
+- ~~The physical window base behind the 18-bit `0x04010004` encoding~~ — **resolved:**
+  it is a 256-KiB physical-RAM aperture based at the RAM base `0x08000000`
+  (proven at runtime — the reconstructed physical address resolves every content
+  submit to the exact same bytes); the DAC engine is a physical bus master, so
+  source resolution needs no firmware ring/struct (§2/§7).
 - **Inferred:** which init path sets `INT_ENABLE` bit0 initially (see
   `interrupts-and-timers.md` for the enable-register default that sidesteps this).
 - The exact divider search arithmetic for arbitrary rates (only the inverse table lookup

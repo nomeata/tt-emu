@@ -257,9 +257,12 @@ def _fill_report(report: BootReport, booted: BootedMachine) -> None:
     machine = booted.machine
     report.timer_irqs = booted.machine.intc.timer_irqs if booted.machine.intc else 0  # type: ignore[attr-defined]
     report.irqs_delivered = machine.irqs_delivered
-    report.keystone = machine.read_u32(KEYSTONE_ADDR)
-    report.codepage_flag = machine.read_u8(CODEPAGE_FLAG_ADDR)
-    report.booklist_head = machine.read_u32(BOOKLIST_HEAD_ADDR)
+    # The mount-health globals live in PROG's demand-paged region: read them through the
+    # MMU (via the live frame or the paging shadow), not at their physical alias.
+    import struct as _struct
+    report.keystone = _struct.unpack("<I", booted.mmu.read_va(KEYSTONE_ADDR, 4))[0]
+    report.codepage_flag = booted.mmu.read_va(CODEPAGE_FLAG_ADDR, 1)[0]
+    report.booklist_head = _struct.unpack("<I", booted.mmu.read_va(BOOKLIST_HEAD_ADDR, 4))[0]
     report.nand_reads = booted.nand.reads
     report.nand_programs = booted.nand.programs
     report.nand_erases = booted.nand.erases
@@ -306,7 +309,6 @@ class SessionReport(BootReport):
     flush_submits: int = 0
     unresolved_submits: int = 0
     audio_completions: int = 0
-    ring_volume: int = 0
     last_oid_seen: int = 0
     stall: str | None = None
     discovery_note: str | None = None
@@ -327,7 +329,7 @@ class SessionReport(BootReport):
         lines.append(
             f"  audio: {self.dac_submits} DAC submits ({self.flush_submits} teardown "
             f"flushes, {self.unresolved_submits} unresolved), "
-            f"{self.audio_completions} completions, ring volume {self.ring_volume:#x}"
+            f"{self.audio_completions} completions"
         )
         if self.audio_stats is not None:
             s = self.audio_stats
@@ -662,7 +664,6 @@ def run_session(
     report.flush_submits = booted.audio.flush_submits
     report.unresolved_submits = booted.audio.unresolved_submits
     report.audio_completions = booted.audio.completions
-    report.ring_volume = booted.audio.ring_volume()
     report.stall = session.stall
     akoid_ptr = machine.read_u32(AKOID_BUF_PTR_ADDR)
     if akoid_ptr:

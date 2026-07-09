@@ -9,6 +9,9 @@ Implements ``memory-map-and-boot.md`` §5 (the recipe that works):
 * §5.6 seed the only state the skipped stages would have produced — the NAND
   geometry struct at 0x08008CA8 (96 bytes), the QHsm frame byte at 0x08007E80 =
   1, and (optionally, §5.4 item 2) the HAL leaf override 0x07FFE740 → 1;
+* hand off to PROG *through the MMU*: run nandboot ``init2`` to build the page table and
+  enable the MMU, and install the abort-driven demand-paging (:mod:`tt_emu.mmu_boot`), so
+  PROG runs under its real MMU and the DMA engines read physical memory directly;
 * the peripheral set: the real SysCon (chip-ID/clock gate), IntcTimer, GPIO,
   BatteryAdc, the ZC90B auth chip, and the storage subsystem (NFC + ECC + L2
   buffer serving a built NAND image — ``nand-and-nfc-controller.md`` §10,
@@ -31,6 +34,7 @@ from .loader import (
     PROG_LOAD_ADDR,
 )
 from .machine import Machine, MachineConfig
+from .mmu_boot import MmuBoot
 from .nand_image import NandImage, build_nand_image
 from .peripherals.audio import AudioDma
 from .peripherals.battery import BatteryAdc
@@ -110,6 +114,7 @@ class BootedMachine:
         oid: OidSensor,
         audio: AudioDma,
         gpio: GpioBlock,
+        mmu: MmuBoot,
     ) -> None:
         self.machine = machine
         self.firmware = firmware
@@ -118,6 +123,7 @@ class BootedMachine:
         self.oid = oid
         self.audio = audio
         self.gpio = gpio
+        self.mmu = mmu
 
     def tap(self, oid: int) -> None:
         """Arm an OID tap; the firmware's own 40 ms poll captures and decodes
@@ -200,7 +206,13 @@ def build_machine(
     if override_hal_timer_leaf:
         machine.write_bytes(HAL_LEAF_TIMER_ADDR, _RETURN_ONE_STUB)
 
-    # --- CPU entry state (§5.2) ----------------------------------------------------
+    # --- MMU handoff: run nandboot init2 to build the page table + enable the MMU,
+    # and install the abort-driven demand-paging + romboot backing store (mmu_boot).
+    # The DMA engines then read physical memory directly (no page-table inversion).
+    mmu = MmuBoot(machine, firmware)
+    mmu.setup()
+
+    # --- CPU entry state (§5.2): PROG's pre-init entry, now under the MMU ----------
     machine.set_entry_state(PROG_ENTRY, SVC_STACK_TOP, CPSR_SVC_IRQS_ON)
 
     log.info(
@@ -212,4 +224,4 @@ def build_machine(
         PROG_LOAD_ADDR,
         firmware.nandboot.size,
     )
-    return BootedMachine(machine, firmware, zc90b, nand, oid, audio, gpio)
+    return BootedMachine(machine, firmware, zc90b, nand, oid, audio, gpio, mmu)

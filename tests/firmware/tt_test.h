@@ -104,7 +104,7 @@ typedef signed short i16;
  *     nand-and-nfc-controller.md §7) --------------------------------------------- */
 
 #define DMA_CTRL REG32(0x04010000)      /* bit16 kick/GO; ISR clear = line-0 ACK */
-#define DMA_SRC REG32(0x04010004)       /* memory source: (phys - 0x4000) & 0x3ffff */
+#define DMA_SRC REG32(0x04010004)       /* memory source: phys & 0x3ffff (aperture offset) */
 #define DMA_DST REG32(0x04010008)       /* DAC port destination 0x08086200 */
 #define DMA_WORDCOUNT REG32(0x0401000C) /* (len/4)|bit13 START; bit13 reads clear */
 #define L2_BUF_STATUS REG32(0x04010010) /* bits[19:16] = buffer-4 fill (64-B chunks) */
@@ -112,7 +112,7 @@ typedef signed short i16;
 #define DMA_KICK (1u << 16)
 #define DMA_START (1u << 13)
 #define DAC_PORT_DST 0x08086200u
-#define DMA_SRC_WINDOW(cpu_addr) ((((u32)(cpu_addr)) - 0x4000u) & 0x3FFFFu)
+#define DMA_SRC_WINDOW(cpu_addr) (((u32)(cpu_addr)) & 0x3FFFFu)
 
 /* --- Audio clock (system-control-and-clock.md; boot checklist) ------------------ */
 

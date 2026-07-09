@@ -9,13 +9,16 @@ Extends the NAND L2-buffer model (:class:`~tt_emu.peripherals.nand.L2NandBuffer`
   ``(len/4) | 0x2000`` to ``+0x0c`` (START), then kicks ``+0x00 |= 0x10000``;
 * **capture** (§7 items 2/3): on a START whose destination is the DAC port
   (``0x08086200``), the chunk's source bytes — final, post-volume S16LE stereo
-  (§1/§5) — are read from RAM and appended to an
-  :class:`~tt_emu.audio_capture.AudioCapture`. The source register only holds
-  ``phys & 0x3ffff`` (§2 caveat), so the CPU pointer is recovered from the
-  firmware's own PCM ring (singleton body ``0x08008d30``: base ``+0x44``, read
-  pointer ``+0x38``, size ``+0x40``, §5) and *verified* against the register's
-  18-bit value — hook-free, and it disambiguates whether the dequeue advanced
-  the read pointer before or after the submit;
+  (§1/§5) — are read and appended to an
+  :class:`~tt_emu.audio_capture.AudioCapture`. The DAC engine is a **physical**
+  bus master: its source register holds ``phys & 0x3ffff``, an 18-bit offset
+  into the hardware's 256-KiB physical-RAM aperture (base
+  :data:`~tt_emu.machine.PHYS_RAM_BASE`). The model reconstructs the physical
+  address ``window_base | (src & 0x3ffff)`` and reads it via
+  :meth:`~tt_emu.machine.Machine.read_phys`, which translates physical→flat
+  through the firmware's active address map (§2). This resolves **every** DAC
+  source uniformly — content ring, system-voice buffer, teardown flush — with
+  no reference to any firmware ring/struct;
 * **teardown flush** (§6): a submit made while the swallow flag ``0x08008c91``
   is set is the silence flush — completion is still delivered (the firmware
   spins on the flag), but the bytes are not captured;
@@ -37,9 +40,9 @@ Extends the NAND L2-buffer model (:class:`~tt_emu.peripherals.nand.L2NandBuffer`
   programming (the OSR field stays 0), so the emulator scales the live data
   point instead (exact for GME content, which is all 22050 Hz).
 
-Memory-to-memory transfers cannot be performed (both addresses are 18-bit
-window offsets with an unresolved base, §2 caveat / §7 item 6); they are logged
-if ever seen. None occur on the boot/playback paths exercised so far.
+Memory-to-memory transfers are not performed (both addresses are 18-bit window
+offsets into the physical aperture); they are logged if ever seen. None occur on
+the boot/playback paths exercised so far.
 """
 
 from __future__ import annotations
@@ -47,6 +50,7 @@ from __future__ import annotations
 import logging
 
 from ..audio_capture import AudioCapture
+from ..machine import PHYS_RAM_BASE
 from .gpio import GpioBlock
 from .intc import IntcTimer, LINE_AUDIO
 from .nand import L2NandBuffer, NfcController
@@ -72,26 +76,18 @@ WORDCOUNT_MASK = 0x7FF
 DAC_PORT_DST = 0x0808_6200
 PORT_FLAG = 0x0808_0000
 
-# --- Firmware RAM the model observes (all Observed addresses, §3/§5/§6) ---------------
+# --- DMA source addressing + teardown handshake (§2/§6) -------------------------------
 
-RING_BODY = 0x0800_8D30    #: PCM ring structure body (singleton ptr at 0x08008d2c)
-RING_VOLUME = 0x14         #: u16 Q10 volume (health check: 0x108 after boot)
-RING_READ = 0x38           #: u32 read pointer (byte offset)
-RING_SIZE = 0x40           #: u32 ring size (0x3000 this generation; do not hard-code)
-RING_BASE = 0x44           #: u32 ring base pointer
-SWALLOW_FLAG_ADDR = 0x0800_8C91  #: teardown "swallow one done" flag (§6)
-
-#: 18-bit physical-window mask of the source-address encoding (§2 caveat).
+#: 18-bit physical-window mask of the source-address encoding: the DAC engine's
+#: source register indexes a 256-KiB physical-RAM aperture based at
+#: :data:`~tt_emu.machine.PHYS_RAM_BASE` (§2, proven at runtime).
 SRC_WINDOW_MASK = 0x3FFFF
 
-#: DOC GAP (new Observed data point for the §2 caveat / §8 open item): the
-#: firmware's virt→phys translation for the DMA source register subtracts
-#: **0x4000** from the CPU address — during live GME playback every ring
-#: dequeue submit satisfied ``src == (cpu_ptr - 0x4000) & 0x3ffff`` (e.g. ring
-#: chunk at CPU 0x0814d000 → source register 0x09000; 487 consecutive submits
-#: consistent). Equivalently the 256-KiB physical window's base is congruent
-#: to CPU 0x…4000 mod 0x40000.
-SRC_WINDOW_CPU_OFFSET = 0x4000
+#: Teardown "swallow one done" flag (§6): a submit made while this is set is the
+#: silence flush — completion is delivered but the constant bytes are not
+#: captured. The one firmware datum the model still consults (a documented
+#: handshake, verified separately), independent of source resolution.
+SWALLOW_FLAG_ADDR = 0x0800_8C91
 
 # --- Sample-rate decode (§7 item 5 + system-control-and-clock.md §4) -------------------
 
@@ -149,7 +145,7 @@ class AudioDma(L2NandBuffer):
         self._warned_mem2mem = False
         self.dac_submits = 0       #: DAC-port START writes seen
         self.flush_submits = 0     #: teardown silence flushes (§6, not captured)
-        self.unresolved_submits = 0  #: DAC submits whose source didn't match the ring
+        self.unresolved_submits = 0  #: DAC submits whose physical source mapped nowhere
         self.completions = 0       #: line-0 completion asserts delivered
         self.last_dac_submit_at = 0  #: machine clock of the last DAC submit
 
@@ -201,8 +197,8 @@ class AudioDma(L2NandBuffer):
             data = self._resolve_and_read(src, length)
             if data is None:
                 self.unresolved_submits += 1
-                log.warning("DAC submit source %#07x (len %#x) not resolvable "
-                            "against the PCM ring — chunk not captured", src, length)
+                log.warning("DAC submit source %#07x (len %#x) maps to no physical "
+                            "RAM page — chunk not captured", src, length)
             else:
                 self.capture.append(machine.clock, rate, data, audible=self._audible())
 
@@ -219,28 +215,19 @@ class AudioDma(L2NandBuffer):
         self._complete_at = machine.clock + delay
 
     def _resolve_and_read(self, src: int, length: int) -> bytes | None:
-        """Recover the chunk's CPU pointer from the PCM ring and read it (§7 item 2).
+        """Read the chunk the DAC engine plays, as a physical bus master (§2/§7).
 
-        Both dequeue orders are handled: the read pointer may or may not have
-        been advanced by ``length`` before the submit; the candidate whose low
-        18 bits match the source register is the true one.
+        The source register holds ``phys & 0x3ffff`` — an 18-bit offset into the
+        256-KiB physical aperture based at :data:`~tt_emu.machine.PHYS_RAM_BASE`.
+        Reconstruct the physical address and read it through
+        :meth:`~tt_emu.machine.Machine.read_phys`, which resolves physical→flat
+        via the firmware's active address map. ``None`` when the source maps to
+        no physical page (not a live DMA buffer).
         """
         machine = self.machine
         assert machine is not None
-        base = machine.read_u32(RING_BODY + RING_BASE)
-        size = machine.read_u32(RING_BODY + RING_SIZE)
-        rp = machine.read_u32(RING_BODY + RING_READ)
-        if not base or not size:
-            return None
-        rp %= size
-        candidates = (base + rp, base + (rp - length) % size)
-        for addr in candidates:
-            if ((addr - SRC_WINDOW_CPU_OFFSET) & SRC_WINDOW_MASK) == (src & SRC_WINDOW_MASK):
-                wrap = addr + length - (base + size)
-                if wrap <= 0:
-                    return machine.read_bytes(addr, length)
-                return machine.read_bytes(addr, length - wrap) + machine.read_bytes(base, wrap)
-        return None
+        phys = PHYS_RAM_BASE | (src & SRC_WINDOW_MASK)
+        return machine.read_phys(phys, length)
 
     def _audible(self) -> bool:
         """Amp on (GPIO16=1) and mute released (GPIO13=0) — §1 audibility."""
@@ -251,12 +238,6 @@ class AudioDma(L2NandBuffer):
     def current_rate(self) -> int:
         """The DAC rate per the divider field ``0x04000008`` bits[20:13] (§7 item 5)."""
         return rate_from_divider((self._syscon.read_reg(REG_CLK_AUDIO) >> 13) & 0xFF)
-
-    def ring_volume(self) -> int:
-        """The ring's Q10 volume field (health check: 0x108 after boot, §5)."""
-        if self.machine is None:
-            return 0
-        return self.machine.read_u16(RING_BODY + RING_VOLUME)
 
     # --- completion delivery (§3/§4) --------------------------------------------------------------
 

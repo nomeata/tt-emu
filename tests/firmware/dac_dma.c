@@ -3,10 +3,9 @@
  * Performs one DAC playback submit exactly as the firmware does (§2/§7):
  * poll bit13 idle, program source/destination, START with the word count,
  * kick bit16 — then waits for the paced line-0 completion IRQ and ACKs it by
- * clearing the kick bit (§3).  The emulator recovers the CPU pointer of the
- * chunk from the firmware's PCM ring singleton (body 0x08008D30), so this
- * test also seeds a minimal ring pointing at its PCM buffer; the pytest side
- * additionally verifies the captured bytes equal the pattern below.
+ * clearing the kick bit (§3).  The DAC engine is a physical bus master: it
+ * reads the buffer at the source register's 18-bit aperture offset (§2); the
+ * pytest side verifies the captured bytes equal the pattern below.
  *
  * Pattern contract with tests/test_firmware_blobs.py:
  *   pcm[i] = (i16)(i * 3 - 128), 256 samples = 512 bytes.
@@ -15,12 +14,6 @@
 #include "tt_test.h"
 
 #define FAILV(n, got) TEST_FAIL(((u32)(n) << 28) | ((got)&0x0FFFFFFFu))
-
-/* The firmware's PCM ring singleton body (audio-dac-dma.md §5). */
-#define RING_BODY 0x08008D30u
-#define RING_READ REG32(RING_BODY + 0x38)
-#define RING_SIZE REG32(RING_BODY + 0x40)
-#define RING_BASE REG32(RING_BODY + 0x44)
 
 static i16 pcm[256]; /* 512 bytes of S16LE samples */
 static volatile u32 done;
@@ -45,11 +38,6 @@ int main(void)
 {
     for (u32 i = 0; i < 256; i++)
         pcm[i] = (i16)(i * 3 - 128);
-
-    /* Minimal PCM ring: one chunk at the buffer, read pointer at 0 (§5). */
-    RING_BASE = (u32)pcm;
-    RING_SIZE = sizeof pcm;
-    RING_READ = 0;
 
     done = 0;
     INT_ENABLE = IRQ_LINE_AUDIO;

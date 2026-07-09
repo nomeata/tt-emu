@@ -13,8 +13,13 @@ sector-0 checks (§5, Observed instruction-level):
 * ``0x55AA`` at offset 0x1fe (kept for the MBR fallback / USB hosts).
 
 No external tools (mkfs.fat / mtools) are used — the volume is assembled in
-memory, cross-platform. Short 8.3 names only (no LFN); directory trees are
-supported so host directories can be mirrored in (§5.1/§5.2 content).
+memory, cross-platform. Directory trees are supported so host directories can be
+mirrored in (§5.1/§5.2 content). Names that do not fit a lossless 8.3 short name
+(lowercase, too long, spaces) get **VFAT long-filename (LFN)** entries plus a
+unique ``NAME~n`` short alias — the firmware opens the system-voice bank and the
+update prompts by their long paths (``A:/VOIMG/Chomp_Voice.bin``,
+``A:/Language/UpdateGERMAN.wav``), so a short-name-only directory makes every
+such ``fs_open`` miss the name and return −1.
 """
 
 from __future__ import annotations
@@ -78,19 +83,114 @@ def _fat_sectors_for(total_sectors: int, spc: int, reserved: int, root_entries: 
         fat_sectors = needed
 
 
+#: Characters allowed unescaped in an 8.3 short name (upper-cased first).
+_SHORT_OK = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-!#$%&@^`~(){}'")
+
+
 def _short_name(name: str) -> bytes:
-    """Encode a host name as an 8.3 directory-entry name (11 bytes, no LFN)."""
-    name = name.upper()
-    if name in (".", ".."):
-        return name.ljust(11).encode("ascii")
+    """Encode ``.``/``..`` as an 11-byte directory name (dot entries only)."""
+    return name.ljust(11).encode("ascii")
+
+
+def _split_83(name: str) -> tuple[str, str]:
+    """Split a name into an upper-cased, character-sanitised (stem, ext)."""
     stem, dot, ext = name.rpartition(".")
     if not dot:
         stem, ext = name, ""
-    keep = "".join(c if c.isalnum() or c in "_-~!#$%&@" else "_" for c in stem)[:8]
-    kext = "".join(c if c.isalnum() or c in "_-~!#$%&@" else "_" for c in ext)[:3]
-    if not keep:
-        raise Fat16BuildError(f"cannot express {name!r} as an 8.3 name")
-    return (keep.ljust(8) + kext.ljust(3)).encode("ascii")
+    up = lambda s: "".join(c if c in _SHORT_OK else "_" for c in s.upper())
+    return up(stem), up(ext)
+
+
+def _is_lossless_83(name: str) -> bool:
+    """True iff ``name`` needs no long-name entry to be opened by the firmware.
+
+    A name fits an 8.3 short entry (case-insensitively — the firmware upper-cases
+    the query before the short-name compare) when its upper-cased form is at most
+    8 stem + 3 ext characters, all from the short-name set, with at most one dot.
+    Longer names, spaces, or short-set-invalid characters force an LFN.
+    """
+    up = name.upper()
+    if up.count(".") > 1:
+        return False
+    stem, dot, ext = up.rpartition(".")
+    if not dot:
+        stem, ext = up, ""
+    return (
+        1 <= len(stem) <= 8
+        and len(ext) <= 3
+        and all(c in _SHORT_OK for c in stem + ext)
+    )
+
+
+def _unique_short(name: str, used: set[bytes]) -> bytes:
+    """Build a unique 11-byte 8.3 alias for ``name`` (``STEM~n`` on collision)."""
+    stem, ext = _split_83(name)
+    if not stem:
+        stem = "_"
+    for n in range(1, 1_000_000):
+        tail = f"~{n}"
+        base = (stem[: 8 - len(tail)] + tail) if (len(stem) > 8 or True) else stem
+        short = (base.ljust(8)[:8] + ext.ljust(3)[:3]).encode("ascii")
+        if short not in used:
+            used.add(short)
+            return short
+    raise Fat16BuildError(f"cannot allocate a unique short name for {name!r}")
+
+
+def _short_for(name: str, used: set[bytes]) -> bytes:
+    """The 11-byte short name for ``name``, reserving it in ``used``."""
+    if _is_lossless_83(name):
+        stem, ext = _split_83(name)
+        short = (stem.ljust(8) + ext.ljust(3)).encode("ascii")
+        if short not in used:
+            used.add(short)
+            return short
+    return _unique_short(name, used)
+
+
+def _lfn_checksum(short11: bytes) -> int:
+    """The 8.3 checksum every LFN entry of a name must carry (FAT/VFAT spec)."""
+    s = 0
+    for c in short11:
+        s = (((s & 1) << 7) + (s >> 1) + c) & 0xFF
+    return s
+
+
+def _lfn_entries(name: str, short11: bytes) -> list[bytes]:
+    """The VFAT long-name entries for ``name`` (physical order, before the 8.3).
+
+    Each entry (attr 0x0F) carries 13 UTF-16LE code units; entries are numbered
+    from 1 (holding the first 13 units) and stored in **reverse** so the highest
+    sequence number (ORed with 0x40 = last-logical) sits first in the directory,
+    immediately followed by decreasing sequence numbers and then the 8.3 entry.
+    """
+    units = list(struct.unpack(f"<{len(name)}H", name.encode("utf-16-le")))
+    units.append(0)  # NUL terminator
+    while len(units) % 13:
+        units.append(0xFFFF)  # 0xFFFF padding
+    checksum = _lfn_checksum(short11)
+    nparts = len(units) // 13
+    entries: list[bytes] = []
+    for part in range(nparts):
+        seq = part + 1
+        if part == nparts - 1:
+            seq |= 0x40
+        block = units[part * 13 : part * 13 + 13]
+        entries.append(
+            struct.pack(
+                "<B5HBBB6HH2H",
+                seq,
+                *block[0:5],
+                0x0F,  # attr LFN
+                0,     # type
+                checksum,
+                *block[5:11],
+                0,     # first cluster (always 0 for LFN)
+                *block[11:13],
+            )
+        )
+    entries.reverse()
+    return entries
 
 
 def _dir_entry(name11: bytes, attr: int, first_cluster: int, size: int) -> bytes:
@@ -274,6 +374,7 @@ def build_fat16(
 
     def emit_tree(node: _Tree, *, is_root: bool, parent_cluster: int) -> int:
         entries: list[bytes] = []
+        used: set[bytes] = set()
         if is_root:
             entries.append(_dir_entry(
                 label.upper().encode("ascii", "replace")[:11].ljust(11),
@@ -282,7 +383,12 @@ def build_fat16(
             entries.append(_dir_entry(_short_name("."), _ATTR_DIRECTORY, 0, 0))
             entries.append(_dir_entry(_short_name(".."), _ATTR_DIRECTORY, 0, 0))
         for name, child in node.items():
-            name11 = _short_name(name)
+            # 8.3-representable names keep their bare short entry; others get
+            # VFAT long-name entries plus a unique ``NAME~n`` short alias, so
+            # the firmware's own long-path ``fs_open`` matches (§ module doc).
+            name11 = _short_for(name, used)
+            if not _is_lossless_83(name):
+                entries.extend(_lfn_entries(name, name11))
             if isinstance(child, _Tree):
                 sub = emit_tree(child, is_root=False, parent_cluster=0)  # patched below
                 entries.append(_dir_entry(name11, _ATTR_DIRECTORY, sub, 0))

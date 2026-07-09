@@ -311,10 +311,25 @@ RAM structure (maps, chains, free pool) is rebuilt from tags at each mount.
 > physical blocks `base+1 .. base+7` (the row "carries" from `base<<8|0xFF` into
 > the next block; `nand-and-nfc-controller.md` §4). Head tags carry the **1-MiB
 > block number**: for a span with base physical block `base`,
-> `logical = (base − fs_start) / 8`. Placed spans therefore carry their tags in the
-> *base* block's row window; and an emulator's tag store must be keyed by the
-> **raw row** `block<<8 | unit` — a flattened sector base aliases a span's
+> `logical = (base − fs_start) / 8`. Only the span **base** is a chain head; the
+> read resolver reaches the other 7 blocks by the linear offset within the span,
+> so they need no head tag of their own. Placed spans therefore carry their tags
+> in the *base* block's row window; and an emulator's tag store must be keyed by
+> the **raw row** `block<<8 | unit` — a flattened sector base aliases a span's
 > unit-32.. tags onto neighbour blocks' page-0 tags and destroys the span.
+>
+> **The 7 follower blocks must be reserved, not left free.** `mtd_init` reads one
+> page-0 tag per *physical* block; a follower's page-0 row is blank, so it reads
+> **free** and the COW allocator hands it out — overwriting the placed span's
+> static content the moment the firmware writes the partition. On **A:** (written
+> every boot: the log, `SYSTEM/profile.dat`, `oidfilelist.lst`) that corrupts the
+> factory voice/prompt files; B: is never written, so its followers are harmless
+> either way. Record every follower in the **factory bad-block bitmap** (row 2,
+> §2.1): `mtd_init` then classifies it *reserved* — kept out of the free pool and
+> out of the head→map inversion — while the resolver still reads its content by
+> offset from the span base. (Giving a follower its own `[4:6]=logical` head tag
+> does **not** work: it collides with the base at that logical number and the
+> mount's duplicate-head arbitration frees one of them.)
 
 ### 4.1 The spare tag (8 bytes, one per program unit)
 
@@ -425,9 +440,13 @@ The mount's sector-0 checks (Observed, instruction-level):
 
 ### 5.1 A: content (system)
 
-Factory-fresh content — all **optional for booting** (each has a graceful
-fallback: missing FAT → auto-format, missing voices → silence, missing prompts →
-skipped):
+A:'s factory content is the firmware container's own **`to_udisk` payload** — the
+7 files the pen's updater writes to A: after reformatting it (records at
+container header +0x28/+0x2c = directory map, +0x30/+0x34 = file TOC; the payload
+sits in the container tail, remapped `voice\…` → `VOIMG/…`, `Language\…` →
+`Language/…`). Extract it straight from the container and drop it onto A:. All of
+it is **optional for booting** (each has a graceful fallback: missing FAT →
+auto-format, missing voices → silence, missing prompts → skipped):
 
 ```
 A:/VOIMG/Chomp_Voice.bin        system-voice archive: u32 offset table [0..48]
@@ -445,6 +464,16 @@ Created by the firmware itself at runtime (leave room; do not pre-create):
 
 An **empty formatted A:** (or even an erased A: — the firmware formats it) boots
 and discovers games; the authentic files only add audible system feedback.
+
+**Long file names need VFAT LFN entries.** The firmware opens the voice bank and
+the prompts by their exact long paths (`A:/VOIMG/Chomp_Voice.bin`,
+`A:/Language/UpdateGERMAN.wav`), and its directory search matches the 8.3 short
+name *only* when the query already fits 8.3 (case-insensitively). A name that is
+too long, mixed-case-but-over-8.3, or has spaces therefore needs a run of VFAT
+long-name entries (attr `0x0F`, 13 UTF-16 units each, stored highest-sequence
+first before the 8.3 entry, carrying the 8.3 checksum) plus a unique `NAME~n`
+short alias — without them every such `fs_open` misses the name and returns −1
+even though the file's data and FAT chain are present and correctly resolved.
 
 ### 5.2 B: content (user)
 
@@ -509,11 +538,19 @@ identity rule produces. (The pre-correction recipe — per-physical-block tags
 `(b−FS_START)|0x8000` on every written page — made the mounted B: enumerate 0
 entries and FS writes mis-scan; do not use it.)
 
+Only the span **base** block carries a head tag. **Record every placed
+follower block** (`base+1 … base+7` of each placed span) in the row-2 bad-block
+bitmap (step 6) so the mount reserves it instead of recycling it into the free
+pool (§4 box) — this is what keeps A:'s factory content intact across the
+firmware's own boot-time writes.
+
 **Step 6 — metadata rows** (0x1000-byte payloads, zero-filled unless stated):
 
-- **Row 2 — factory bad-block bitmap:** 0x1000 **zero** bytes = no bad blocks
-  (§2.1). Mandatory: leaving it erased (0xFF = every block bad) makes the mount
-  loop forever.
+- **Row 2 — factory bad-block bitmap:** 0x1000 bytes, 1 bit per block MSB-first,
+  **set = withheld from the free pool** (§2.1). Mandatory: leaving it erased
+  (0xFF = every block bad) makes the mount loop forever. Zero every bit **except**
+  the placed spans' follower blocks (step 5, §4 box), which are set so the mount
+  reserves the static content instead of COW-recycling it.
 - **Row 255 — zone/partition table:**
 
   ```

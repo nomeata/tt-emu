@@ -2,9 +2,11 @@
 
 Implements:
 
-* the CPU and address-space map of ``memory-map-and-boot.md`` §1/§2
-  (ARM926EJ-S = ARMv5TEJ, little-endian, flat/identity address space, MMU not
-  emulated, CP15 writes neutralized per §1.2);
+* the CPU and address-space map of ``memory-map-and-boot.md`` §1/§2 (ARM926EJ-S =
+  ARMv5TEJ, little-endian). The firmware boots under its **own** MMU: nandboot ``init2``
+  builds the page table and Unicorn honours it (see :mod:`tt_emu.mmu_boot`); prefetch/data
+  aborts are delegated to the MMU-boot layer for demand-paging. CP15 writes the guest issues
+  during PROG (cache/TLB maintenance) are still neutralized per §1.2;
 * the MMIO dispatch layer: peripherals register address ranges
   (:class:`~tt_emu.peripheral.Peripheral`); the whole peripheral window is
   backed by RAM-like scratch registers as the §5.3 default, with registered
@@ -75,6 +77,13 @@ MMIO_SIZE = 0x0020_0000
 #: registers whose read value is *not* the last write (constants, self-clearing
 #: latches, computed status) keep a targeted ``UC_HOOK_MEM_READ``.
 CORE_PAGE_SIZE = 0x1000
+
+#: Base of the pen's main physical RAM (``memory-map-and-boot.md`` §2). This is
+#: also the base of the DMA engine's 256-KiB physical-address aperture (a
+#: hardware property, proven at runtime by :meth:`Machine.read_phys` resolving
+#: every content submit — ``audio-dac-dma.md``); the source register's low 18
+#: bits index into it.
+PHYS_RAM_BASE = 0x0800_0000
 
 #: RAM / RAM-like regions: (base, size, description).  Sizes are the emulator's
 #: safe mapping cover (§2).  The two HW-config blocks are "RAM-like stub
@@ -205,6 +214,9 @@ class Machine:
         self._fault: str | None = None
         self._irq_sp_initialized = False
         self._neutralized_cp15: set[int] = set()
+        #: Prefetch/data-abort handler (installed by the MMU-boot layer; see
+        #: :meth:`set_abort_handler`). ``None`` leaves aborts to the default path.
+        self._abort_handler: Callable[[int], None] | None = None
 
         self.uc = Uc(UC_ARCH_ARM, UC_MODE_ARM | UC_MODE_LITTLE_ENDIAN)
         self.uc.ctl_set_cpu_model(UC_CPU_ARM_926)
@@ -382,6 +394,35 @@ class Machine:
     def read_bytes(self, addr: int, size: int) -> bytes:
         return bytes(self.uc.mem_read(addr, size))
 
+    # --- abort delivery: the CPU MMU's demand-paging path --------------------------
+
+    def set_abort_handler(self, handler: Callable[[int], None] | None) -> None:
+        """Install the prefetch/data-abort handler (the MMU-boot layer).
+
+        The firmware boots under its own ARMv5 MMU (nandboot ``init2`` builds the page
+        table; Unicorn honours it — see :mod:`tt_emu.mmu_boot`). Unicorn surfaces a
+        translation/permission abort as ``UC_HOOK_INTR`` with ``intno`` 3 (prefetch) or 4
+        (data) but does not vector ARMv5 exceptions; :meth:`_on_intr` delegates those to
+        this handler, which performs the architectural entry into the firmware's own
+        handler so it can demand-refine the page.
+        """
+        self._abort_handler = handler
+
+    # --- physical-memory access: the DMA bus-master view ---------------------------
+
+    def read_phys(self, phys: int, size: int) -> bytes | None:
+        """Read ``size`` bytes of physical memory as a DMA bus master sees them.
+
+        A DMA engine is a **physical**-address bus master: it reads physical memory
+        directly, not through the CPU MMU. Under the emulated MMU the CPU's writes land at
+        their physical frames, so a physical read is just a host read at ``phys`` — no
+        page-table inversion. Returns ``None`` when ``phys`` is not backed by RAM.
+        """
+        try:
+            return self.read_bytes(phys, size)
+        except UcError:
+            return None
+
     def write_bytes(self, addr: int, data: bytes) -> None:
         self.uc.mem_write(addr, data)
 
@@ -551,11 +592,16 @@ class Machine:
     # --- semihosting (memory-map-and-boot.md §1.1) ------------------------------------
 
     def _on_intr(self, _uc: Uc, intno: int, _ud: object) -> None:
-        """SVC/SWI hook: log semihosting ``svc 0xab`` diagnostics, then continue.
+        """Interrupt hook: dispatch MMU aborts, else log semihosting ``svc 0xab``.
 
-        The firmware's fault handlers print via semihosting; it is not on the
+        Prefetch(3)/data(4) aborts go to the MMU-boot handler (demand-paging); the
+        firmware's fault handlers otherwise print via semihosting, which is not on the
         happy path (§1.1), so logging + returning is sufficient.
         """
+        if intno in (3, 4):
+            if self._abort_handler is not None:
+                self._abort_handler(intno)
+            return
         pc = self.uc.reg_read(UC_ARM_REG_PC)
         cpsr = self.uc.reg_read(UC_ARM_REG_CPSR)
         try:

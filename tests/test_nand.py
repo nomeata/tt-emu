@@ -151,31 +151,45 @@ def test_fat16_files_round_trip() -> None:
     root_off = (reserved + nfats * fat_sectors) * 512
     first_data = root_off + root_entries * 32
 
-    def read_file(dir_off: int, dir_len: int, name11: bytes) -> bytes:
+    def find_entry(dir_off: int, dir_len: int, want: str) -> tuple[int, int]:
+        """Resolve ``want`` (long name, case-insensitive) to (cluster, size).
+
+        Matches the way the firmware opens files: a run of VFAT long-name
+        entries (attr 0x0F) reconstructs the long name for the 8.3 entry that
+        follows; the 8.3 short name matches too (case-insensitively).
+        """
+        lfn = ""
         for i in range(dir_len // 32):
             e = d[dir_off + i * 32 : dir_off + (i + 1) * 32]
-            if e[:11] == name11 and not e[11] & 0x08:
-                cluster = struct.unpack_from("<H", e, 26)[0]
-                size = struct.unpack_from("<I", e, 28)[0]
-                out = b""
-                while cluster < 0xFFF8 and cluster >= 2:
-                    off = first_data + (cluster - 2) * spc * 512
-                    out += d[off : off + spc * 512]
-                    cluster = struct.unpack_from("<H", d, reserved * 512 + cluster * 2)[0]
-                return out[:size]
-        raise AssertionError(f"{name11!r} not found")
+            if e[0] == 0:
+                break
+            if e[11] == 0x0F:  # long-name entry: 13 UTF-16 units at 1/14/28
+                chunk = e[1:11] + e[14:26] + e[28:32]
+                part = chunk.decode("utf-16-le").split("\x00")[0].rstrip("￿")
+                lfn = part + lfn  # entries are stored highest-sequence first
+                continue
+            short = e[:11].decode("ascii").rstrip()
+            short = short[:8].rstrip() + ("." + short[8:].rstrip() if short[8:].strip() else "")
+            if want.upper() in (lfn.upper(), short.upper()) and not e[11] & 0x08:
+                return struct.unpack_from("<H", e, 26)[0], struct.unpack_from("<I", e, 28)[0]
+            lfn = ""
+        raise AssertionError(f"{want!r} not found")
 
-    assert read_file(root_off, root_entries * 32, b"GAME    GME") == payload
-    # subdirectory walk: Language/UpdateGERMAN.wav -> LANGUAGE / UPDATEGEWAV
-    for i in range(root_entries):
-        e = d[root_off + i * 32 : root_off + (i + 1) * 32]
-        if e[:11] == b"LANGUAGE   " and e[11] & 0x10:
-            sub_cluster = struct.unpack_from("<H", e, 26)[0]
-            sub_off = first_data + (sub_cluster - 2) * spc * 512
-            assert read_file(sub_off, spc * 512, b"UPDATEGEWAV") == b"RIFFxxxx"
-            break
-    else:
-        raise AssertionError("Language/ directory not found")
+    def read_file(dir_off: int, dir_len: int, want: str) -> bytes:
+        cluster, size = find_entry(dir_off, dir_len, want)
+        out = b""
+        while cluster < 0xFFF8 and cluster >= 2:
+            off = first_data + (cluster - 2) * spc * 512
+            out += d[off : off + spc * 512]
+            cluster = struct.unpack_from("<H", d, reserved * 512 + cluster * 2)[0]
+        return out[:size]
+
+    # The firmware opens by long path — the file must be findable by its full
+    # name (via the LFN entries), not only by an 8.3 short alias.
+    assert read_file(root_off, root_entries * 32, "game.gme") == payload
+    sub_cluster, _ = find_entry(root_off, root_entries * 32, "Language")
+    sub_off = first_data + (sub_cluster - 2) * spc * 512
+    assert read_file(sub_off, spc * 512, "UpdateGERMAN.wav") == b"RIFFxxxx"
 
 
 # --- Register-level NFC protocol (driven as the firmware drives it, §8) --------------
@@ -428,13 +442,24 @@ def test_image_builder_layout() -> None:
     vbr_b = img.read((FS_START + A_BLOCKS) * BLOCK_SIZE, 512)
     assert vbr_b[0x36:0x3E] == b"FAT16   "
     assert vbr_b[43:54].rstrip() == b"TIPTOI"
-    # Head tags per 1-MiB NFTL block (VBLOCK doc gap): A's first span is
-    # logical 0 at block 134, B's is logical 60 at block 614; the span's
-    # interior units carry append-form unit tags in the base row window.
+    # Head tag per 1-MiB NFTL span: A's first span is logical 0 at block 134,
+    # B's is logical 60 at block 614; the span's interior AUs carry append-form
+    # unit tags in the base row window, and only the base is a chain head.
     assert struct.unpack("<H", img.get_tag(134 << 8)[4:6])[0] == 0x8000
     assert struct.unpack("<H", img.get_tag(614 << 8)[4:6])[0] == 60 | 0x8000
     assert struct.unpack("<H", img.get_tag(614 << 8 | 1)[4:6])[0] == 60  # unit tag
     assert img.get_tag(615 << 8) == b"\xff" * 8  # follower page-0 row stays blank
+
+    # A: is written every boot, so its placed spans' follower blocks are reserved
+    # in the row-2 bad-block bitmap (1 bit/block, MSB-first) — kept out of the COW
+    # free pool so the firmware's own writes cannot recycle the factory content.
+    # A:'s first span (base 134) holds the FAT/VOIMG content, so 135..141 are set;
+    # an unplaced block stays available (0).
+    bitmap = img.read(2 * AU_SIZE, 0x1000)
+    for follower in range(135, 142):
+        assert bitmap[follower >> 3] & (0x80 >> (follower & 7)), follower
+    unplaced = 300
+    assert not bitmap[unplaced >> 3] & (0x80 >> (unplaced & 7))
 
 
 # --- Boot smoke test: the mount checkpoint ------------------------------------------

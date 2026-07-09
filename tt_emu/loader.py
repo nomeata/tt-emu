@@ -29,7 +29,7 @@ the NAND model at runtime, §5.7).
 from __future__ import annotations
 
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 #: Container magic (``memory-map-and-boot.md`` §3).
@@ -71,6 +71,10 @@ class Firmware:
     prog: Artifact
     codepage: Artifact
     producer: Artifact
+    #: A:'s factory content — the container's ``to_udisk`` payload keyed by
+    #: partition-relative path (``VOIMG/Chomp_Voice.bin``, ``Language/*.wav``);
+    #: see :func:`extract_udisk_files`.
+    udisk_files: dict[str, bytes] = field(default_factory=dict)
 
     @property
     def build_id(self) -> str:
@@ -89,6 +93,65 @@ class UpdFormatError(ValueError):
 
 def _u32(buf: bytes, off: int) -> int:
     return struct.unpack_from("<I", buf, off)[0]
+
+
+def _cstr(buf: bytes) -> str:
+    return buf.split(b"\x00", 1)[0].decode("latin-1")
+
+
+# --- to_udisk payload (A:'s factory content) --------------------------------------
+
+#: ``to_udisk`` directory-mapping records: count @+0x28, table @+0x2c, 0x210 B
+#: each = ``{u32; char pcpath[260]; char udiskpath[260]; u32 checksum}``.
+_UDISK_DIRS_COUNT, _UDISK_DIRS_ADR = 0x28, 0x2C
+_UDISK_DIR_STRIDE = 0x210
+#: ``to_udisk`` file records: count @+0x30, table @+0x34, 0x110 B each =
+#: ``{char path[260]; u32 size; u32 adr; u32 checksum}``. The payloads sit in
+#: the container tail at each record's ``adr``.
+_UDISK_FILES_COUNT, _UDISK_FILES_ADR = 0x30, 0x34
+_UDISK_FILE_STRIDE = 0x110
+_UDISK_PATH_LEN = 260
+
+
+def extract_udisk_files(raw: bytes) -> dict[str, bytes]:
+    """Extract the container's ``to_udisk`` payload as ``{relpath: bytes}``.
+
+    These are the factory files the pen's own updater writes to A: after
+    reformatting it: the system-voice archive (``voice\\Chomp_Voice.bin`` →
+    ``VOIMG/Chomp_Voice.bin``) and the language prompt WAVs (``Language\\*.wav``).
+    Each file's first path component is remapped through the directory records
+    (``voice`` → ``A:VOIMG``, ``Language`` → ``A:Language``); the drive prefix is
+    dropped and separators normalised so the result drops straight onto A:.
+    """
+    dir_map: dict[str, str] = {}
+    dcount, dadr = _u32(raw, _UDISK_DIRS_COUNT), _u32(raw, _UDISK_DIRS_ADR)
+    for i in range(dcount):
+        o = dadr + i * _UDISK_DIR_STRIDE
+        pcpath = _cstr(raw[o + 4 : o + 4 + _UDISK_PATH_LEN])
+        udiskpath = _cstr(raw[o + 4 + _UDISK_PATH_LEN : o + 4 + 2 * _UDISK_PATH_LEN])
+        dir_map[pcpath.lower()] = udiskpath
+
+    def to_rel(path: str) -> str:
+        parts = path.replace("\\", "/").split("/")
+        head, rest = parts[0], "/".join(parts[1:])
+        mapped = dir_map.get(head.lower(), head).replace("\\", "/")
+        if len(mapped) >= 2 and mapped[1] == ":":  # strip a drive prefix (A:)
+            mapped = mapped[2:]
+        mapped = mapped.strip("/")
+        return f"{mapped}/{rest}" if rest else mapped
+
+    out: dict[str, bytes] = {}
+    fcount, fadr = _u32(raw, _UDISK_FILES_COUNT), _u32(raw, _UDISK_FILES_ADR)
+    for i in range(fcount):
+        o = fadr + i * _UDISK_FILE_STRIDE
+        path = _cstr(raw[o : o + _UDISK_PATH_LEN])
+        size, adr = struct.unpack_from("<II", raw, o + _UDISK_PATH_LEN)
+        if not path or adr + size > len(raw):
+            raise UpdFormatError(
+                f"to_udisk file {path!r} [{adr:#x}+{size:#x}] exceeds the container"
+            )
+        out[to_rel(path)] = raw[adr : adr + size]
+    return out
 
 
 def load_upd(path: str | Path | None = None) -> Firmware:
@@ -129,7 +192,14 @@ def load_upd(path: str | Path | None = None) -> Firmware:
     # Codepage: directly after PROG; size is a documented constant (module docstring).
     codepage = artifact("codepage", prog.offset + prog.size, CODEPAGE_SIZE)
 
-    fw = Firmware(path=path, nandboot=nandboot, prog=prog, codepage=codepage, producer=producer)
+    fw = Firmware(
+        path=path,
+        nandboot=nandboot,
+        prog=prog,
+        codepage=codepage,
+        producer=producer,
+        udisk_files=extract_udisk_files(raw),
+    )
     generation = fw.boot_generation
     if not generation.startswith("ANYKANB"):
         raise UpdFormatError(

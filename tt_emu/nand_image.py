@@ -70,28 +70,13 @@ B_ADDRCNT = B_BLOCKS * AUS_PER_BLOCK   # 0x8000
 A_VOLUME_BYTES = A_BLOCKS * BLOCK_SIZE
 B_VOLUME_BYTES = 64 * 1024 * 1024
 
-#: DOC GAP (found empirically; refines ``nand-image-layout.md`` §4/§6 step 5):
-#: the NFTL's **logical block is 1 MiB** — 2048 sectors = 256 four-KiB program
-#: units — spanning **8 physical 128-KiB blocks**. The firmware's runtime row
-#: addressing is linear across the span (``row + 1`` = the next 4-KiB unit,
-#: carrying from ``base<<8 | 0xFF`` into the next physical block), its
-#: write-pointer probe scans all 256 unit tags of a span, and its own COW
-#: tags carry ``[4:6] = the 1-MiB logical block number`` (Observed: the COW
-#: chain for A:'s first MiB is tagged logical 0 while writing units > 31).
-#: Consequently the §6 step-5 per-128-KiB-block head tags are 8× off in both
-#: alignment and numbering; the misnumbering is invisible for content within
-#: the first MiB of a partition (which is why the doc's recipe *appears* to
-#: work) but leaves every later logical block unmapped — the documented
-#: "B: enumerates 0 entries" open issue (§7.5/§8) is exactly B:'s VBR block
-#: (logical 60) having no head tag. The builder therefore numbers head tags
-#: per 8-block span (``logical = (base − FS_START)/8``) and tags **only the
-#: span's base block**: follower blocks hold their placed data with blank
-#: tags — the authentic state of a partially-appended logical block (the
-#: firmware's own format writes tags only up to each block's write pointer;
-#: the runtime row addressing reaches follower data linearly regardless of
-#: their tags). Tagging followers as additional same-logical chain ends is
-#: wrong: the mount's duplicate-head arbitration keeps one block and
-#: **erases** the rest (Observed — it destroyed the placed span).
+#: The NFTL's **logical block is 1 MiB** — 2048 sectors = 256 four-KiB program
+#: units — spanning **8 physical 128-KiB blocks**. The runtime read resolver
+#: maps a 1-MiB logical block to a physical span *base* block and reaches the
+#: sector inside the span by a linear offset within the 8-block span (the row
+#: carries from ``base<<8 | 0xFF`` into ``base+1``…; ``nand-and-nfc-controller.md``
+#: §4). Head tags therefore carry ``[4:6] = the 1-MiB logical block number``
+#: (``(base − FS_START)/8``), and only the span's base block is a chain head.
 VBLOCK_BLOCKS = 8
 VBLOCK_BYTES = VBLOCK_BLOCKS * BLOCK_SIZE
 
@@ -137,29 +122,18 @@ def make_head_tag(logical_block: int, *, seq: int = 1, own: int = 0xFFFF) -> byt
     return struct.pack("<BBHHH", seq, 0, 0xFFFD, (logical_block & 0x7FFF) | 0x8000, own)
 
 
-def make_unit_tag(logical_block: int, *, obsolete: bool = False) -> bytes:
-    """Build the tag of a placed non-head unit (page) of an NFTL logical block.
+def make_unit_tag(logical_block: int) -> bytes:
+    """Build the tag of a placed non-head AU (page) *inside* a physical block.
 
-    Byte-for-byte the tag the firmware's own append path writes on every unit
-    it programs (Observed): ``{[0]=0, [1]=0, [2:4]=the member's chain-next
-    (0xfffd = chain end for a single placed member), [4:6]=logical`` (head-
-    valid bit 15 **clear**) ``, [6:8]=0x0001}``. These tags are what make the
-    placed content part of the logical block's *write pointer*: the runtime's
-    descending unit-tag probe stops at the last non-blank tag, so appends land
-    after the placed content instead of zero-padding over it (a blank tag
-    reads as an erased page — read-modify-writes then merge 0xFF over placed
-    sectors, Observed).
-
-    ``obsolete`` sets bit 7 of ``[0]`` — the firmware stamps it on the
-    **physical-block-leading** units (page 0 of each 128-KiB block after the
-    span's base, Observed on its own appends) so the mount's per-block scan
-    classifies those blocks as span content instead of competing chain heads
-    (non-obsolete same-logical page-0 tags make the duplicate-head arbitration
-    erase all but one block of the span, Observed).
+    Byte-for-byte the tag the firmware's own append path writes on every AU it
+    programs after page 0 (Observed): ``{[0]=0, [1]=0, [2:4]=0xfffd (chain end),
+    [4:6]=logical`` (head-valid bit 15 **clear**) ``, [6:8]=0x0001}``. These
+    carry the block's write pointer — the runtime's descending AU-tag probe
+    stops at the last non-blank tag, so appends land after the placed content
+    instead of zero-padding over it. ``mtd_init`` classifies a block from its
+    page-0 tag only; these mark the block's remaining AUs.
     """
-    return struct.pack(
-        "<BBHHH", 0x80 if obsolete else 0, 0, 0xFFFD, logical_block & 0x7FFF, 0x0001
-    )
+    return struct.pack("<BBHHH", 0, 0, 0xFFFD, logical_block & 0x7FFF, 0x0001)
 
 
 class NandImage:
@@ -335,31 +309,36 @@ def _place_bin(img: NandImage, data: bytes, start_block: int, *, logical_base: i
             img.tag_au(block, au, make_head_tag(logical_base + b, own=block))
 
 
-def _place_fat_volume(
-    img: NandImage, vol: Fat16Volume, start_block: int
-) -> list[tuple[int, int]]:
-    """Place a FAT16 volume at ``start_block``; return the placed spans as
-    ``(logical block, partition-relative base block)`` pairs (map entries).
+def _place_fat_volume(img: NandImage, vol: Fat16Volume, start_block: int) -> list[int]:
+    """Place a FAT16 volume at ``start_block`` as identity-mapped NFTL 1-MiB blocks.
 
-    Placement granularity is the NFTL's **1-MiB logical block** (the
-    :data:`VBLOCK_BLOCKS` doc gap): a span with live content — bytes that are
-    not uniformly 0x00/0xFF, or any part of the FAT system area (reserved +
-    FATs + root directory, which the firmware reads even when zero-filled) —
-    is placed in full and tagged like a freshly-appended single-member chain:
-    unit 0 carries the head tag (``logical = (base − FS_START)/8 | 0x8000``),
-    every further placed unit the firmware's append-form unit tag
-    (:func:`make_unit_tag`) — so the mount maps the base block as the
-    logical block's head, classifies the follower blocks as its chain
-    content (not free-pool, not competing heads), and the runtime's
-    write-pointer probe places appends *after* the placed content.
-    Content-free spans stay fully erased (the free pool). Logical numbers
-    are 1-MiB blocks relative to ``FS_START`` for both partitions — B's
-    first span is logical 60.
+    Placement is identity: partition-relative 128-KiB block *b* of the volume
+    lands at physical block ``start_block + b``. Tagging follows the NFTL's
+    **1-MiB logical block** (:data:`VBLOCK_BLOCKS` = 8 physical blocks): for each
+    1-MiB span with live content — bytes not uniformly 0x00/0xFF, or any part of
+    the FAT system area (reserved + FATs + root directory, which the firmware
+    reads even when zero-filled) — the **span base** block carries the chain
+    **head** tag at its page-0 row, ``[4:6] = (base − FS_START)/8`` (the 1-MiB
+    logical number). ``mtd_init`` inverts it into ``map[logical] = span base
+    block`` and the resolver reaches any sector in the span by a linear offset
+    from that base, so a read of a whole span resolves off the one head tag.
+    The base's AUs carry append-form unit tags (:func:`make_unit_tag`) in its
+    row window, for the write-pointer probe.
+
+    Returns the placed spans' **follower** blocks (the up-to-7 physical blocks
+    after each span base). They hold the tail of the span's static content but
+    are not chain heads; :func:`build_nand_image` records them in the bad-block
+    bitmap so ``mtd_init`` keeps them out of the free pool — otherwise their
+    blank page-0 tag reads free and the firmware's own runtime writes (A:'s log
+    / ``profile.dat`` / ``oidfilelist.lst``) COW-recycle them, overwriting the
+    placed span (Observed on A:, which is written every boot; B: is never
+    written, so its followers are harmless either way). Content-free spans stay
+    fully erased — that is the free pool the firmware writes its own files into.
     """
     if (start_block - FS_START) % VBLOCK_BLOCKS:
         raise ValueError("partition base must be aligned to the 1-MiB NFTL block")
     sys_bytes = vol.system_sectors * SECTOR_SIZE
-    spans: list[tuple[int, int]] = []
+    followers: list[int] = []
     for s in range(0, len(vol.data), VBLOCK_BYTES):
         chunk = bytes(vol.data[s : s + VBLOCK_BYTES])
         live = s < sys_bytes or not (
@@ -370,16 +349,12 @@ def _place_fat_volume(
         base_block = start_block + s // BLOCK_SIZE
         logical = (base_block - FS_START) // VBLOCK_BLOCKS
         img.place(base_block * BLOCK_SIZE, chunk)
-        # Unit tags live in the *base block's row window* (row = base<<8 |
-        # unit, unit up to 255) — where the runtime's write-pointer probe and
-        # page reads look. The neighbour blocks' own page-0 rows (what the
-        # mount scan reads) stay blank, exactly as the firmware's appends
-        # leave them.
         for unit in range((len(chunk) + AU_SIZE - 1) // AU_SIZE):
             tag = make_head_tag(logical) if unit == 0 else make_unit_tag(logical)
             img.set_tag(base_block << 8 | unit, tag)
-        spans.append((logical, base_block - FS_START))
-    return spans
+        nblocks = (len(chunk) + BLOCK_SIZE - 1) // BLOCK_SIZE
+        followers.extend(base_block + db for db in range(1, nblocks))
+    return followers
 
 
 # --- The recipe (nand-image-layout.md §6) --------------------------------------------
@@ -396,8 +371,14 @@ def build_nand_image(
     ``a_files`` / ``b_files`` are {relative/path: bytes} trees for the A:
     (system) and B: (user — the ``.gme`` games) partitions; both may be empty
     (an empty formatted A: boots and discovers games, §5.1).
+
+    A:'s **factory content** — the system-voice bank ``VOIMG/Chomp_Voice.bin``
+    and the ``Language/*.wav`` update prompts — comes from the firmware's own
+    ``to_udisk`` payload (:attr:`~tt_emu.loader.Firmware.udisk_files`) and is
+    placed automatically; any explicit ``a_files`` override it.
     """
     img = NandImage()
+    a_files = {**firmware.udisk_files, **(a_files or {})}
 
     # Step 2 — boot blob at block 1 (0xFF-padded by the sparse store).
     img.place(BOOT_BLOCK * BLOCK_SIZE, firmware.nandboot.data)
@@ -414,20 +395,23 @@ def build_nand_image(
     # ``au_sectors`` couples the FAT geometry to the NFTL allocation unit (§4.2:
     # AU = 4 KiB = 8 sectors) so cluster boundaries land on AU boundaries and
     # files occupy whole AUs — otherwise the firmware's AU-granular read of a
-    # file's last (partial-AU) cluster misresolves and returns zeros, truncating
-    # the tail of the .gme (the welcome playlist, firmware-2n-mt.md §4/§5).
-    # Only B: carries the pre-placed ``.gme`` files whose tails the AU-straddle
-    # bug truncates; A: holds no such static tails (its runtime files —
-    # ``oidfilelist.lst`` — the firmware writes itself through the COW path), and
-    # coupling A: shifts its system area enough to make the mount recycle blocks,
-    # so leave A: on the plain geometry and AU-couple B: only.
+    # file's last (partial-AU) cluster misresolves and returns zeros, so a
+    # directory/FAT/file cluster that straddles an unallocated AU reads back
+    # blank. Any partition carrying pre-placed static files (B:'s ``.gme``s,
+    # A:'s factory ``VOIMG``/``Language`` content) needs the coupling; an empty
+    # partition (only the runtime files the firmware writes itself through the
+    # COW path) is left on the plain geometry, whose system-area layout the
+    # mount is tuned for.
     au_sectors = AU_SIZE // SECTOR_SIZE
-    vol_a = build_fat16(A_VOLUME_BYTES, label="SYSTEM", files=a_files)
+    a_au = au_sectors if a_files else 1
+    vol_a = build_fat16(A_VOLUME_BYTES, label="SYSTEM", files=a_files, au_sectors=a_au)
     vol_b = build_fat16(B_VOLUME_BYTES, label="tiptoi", files=b_files, au_sectors=au_sectors)
 
-    # Step 5 — place them: A at FS_START, B at FS_START + A_BLOCKS.
-    _place_fat_volume(img, vol_a, FS_START)
-    _place_fat_volume(img, vol_b, FS_START + A_BLOCKS)
+    # Step 5 — place them: A at FS_START, B at FS_START + A_BLOCKS. The follower
+    # blocks of each placed 1-MiB span are marked reserved below so the mount
+    # keeps the static content out of the free pool.
+    reserved = _place_fat_volume(img, vol_a, FS_START)
+    reserved += _place_fat_volume(img, vol_b, FS_START + A_BLOCKS)
 
     # Step 6 — metadata rows. Their §4.2-decoded flat offsets are row*0x1000
     # (block 0's sparse row space maps into unused blocks 6/7 — module docstring).
@@ -436,8 +420,16 @@ def build_nand_image(
         img.set_tag(row, struct.pack("<I", magic) + b"\xff" * 4)
 
     # Factory bad-block bitmap at row 2 (see ROW_BADBLOCK_BITMAP doc-gap note):
-    # all-zero = no factory bad blocks; tag u32 = replica/"times" counter.
-    img.place(ROW_BADBLOCK_BITMAP * AU_SIZE, bytes(METADATA_PAYLOAD))
+    # 1 bit per block, MSB-first, set = withheld from the free pool. The placed
+    # spans' follower blocks are recorded here: mtd_init's per-block scan then
+    # classifies them reserved (neither free pool nor a competing map head)
+    # while the resolver still reaches their static content by linear offset
+    # from the span head (§ ``_place_fat_volume``). Every other block reads 0 =
+    # available. The tag u32 is the replica/"times" counter.
+    bitmap = bytearray(METADATA_PAYLOAD)
+    for block in reserved:
+        bitmap[block >> 3] |= 0x80 >> (block & 7)
+    img.place(ROW_BADBLOCK_BITMAP * AU_SIZE, bytes(bitmap))
     img.set_tag(ROW_BADBLOCK_BITMAP, struct.pack("<I", 1) + b"\xff" * 4)
 
     return img
