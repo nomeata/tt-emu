@@ -374,6 +374,7 @@ class Emulator:
                 self.machine,
                 gme_files=list(self._b_files.values()),
                 symbols=self._symbols,
+                read_mem=booted.mmu.read_va,
             )
 
         # Read-only observation watchpoints (firmware unmodified): the

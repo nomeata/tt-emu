@@ -211,15 +211,9 @@ class MmuBoot:
         base = self._cur_pa(va)
         return None if base is None else (base | (va & 0xFFF))
 
-    def read_va(self, va: int, size: int) -> bytes:
-        """Read a virtual address's content, even if its page is paged out.
-
-        Prefers the live physical frame (freshest), falls back to the demand-paging shadow
-        (authoritative content of an evicted page), then to a plain physical read for
-        identity/low addresses outside PROG's image. For inspection (health checkpoints),
-        so it assumes the read stays within one page. Under the MMU a plain
-        ``machine.read_u32(va)`` would read the wrong bytes for a remapped VA.
-        """
+    def _read_va_page(self, va: int, size: int) -> bytes:
+        """Read up to a page's worth of a VA's content (single page; ``size`` must not
+        cross the page boundary)."""
         pa = self._phys(va)
         if pa is not None:
             return bytes(self.uc.mem_read(pa, size))
@@ -228,6 +222,24 @@ class MmuBoot:
             off = va & 0xFFF
             return page[off:off + size]
         return bytes(self.uc.mem_read(va, size))
+
+    def read_va(self, va: int, size: int) -> bytes:
+        """Read a virtual address's content, even if its page is paged out or remapped.
+
+        Prefers the live physical frame (freshest), falls back to the demand-paging shadow
+        (authoritative content of an evicted page), then to a plain physical read for
+        identity/low addresses outside PROG's image. Splits the read at 4 KiB page
+        boundaries so it is correct for spans crossing pages that the firmware mapped to
+        discontiguous frames. Under the MMU a plain ``machine.read_u32(va)`` would read the
+        wrong bytes for a remapped VA — inspection code must translate through here.
+        """
+        out = bytearray()
+        while size > 0:
+            n = min(size, ((va & ~0xFFF) + 0x1000) - va)
+            out += self._read_va_page(va, n)
+            va += n
+            size -= n
+        return bytes(out)
 
     def _faulting(self, va: int) -> bool:
         """True if ``va``'s page currently faults (unmapped or AP=00 no-access)."""

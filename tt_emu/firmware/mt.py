@@ -428,8 +428,14 @@ class MtDebugger:
         gme_files: Iterable[bytes] = (),
         symbols: TttoolSymbols | None = None,
         log: Callable[[str], None] | None = None,
+        read_mem: Callable[[int, int], bytes] | None = None,
     ) -> None:
         self.machine = machine
+        # Firmware globals are read through the MMU: PROG runs under its real page table,
+        # so the allocator maps many heap/work VAs to non-identity frames. A plain physical
+        # read of such a VA returns garbage. ``read_mem`` (``MmuBoot.read_va``) translates;
+        # it defaults to a physical read for the flat/no-MMU case.
+        self._read_mem: Callable[[int, int], bytes] = read_mem or machine.read_bytes
         self.symbols = symbols
         self._log = log or (lambda message: None)
         self._scripts: list[GmeScripts] = []
@@ -448,13 +454,13 @@ class MtDebugger:
     # --- low-level safe reads -------------------------------------------------------------
 
     def _u8(self, addr: int) -> int:
-        return self.machine.read_u8(addr)
+        return self._read_mem(addr, 1)[0]
 
     def _u16(self, addr: int) -> int:
-        return self.machine.read_u16(addr)
+        return struct.unpack("<H", self._read_mem(addr, 2))[0]
 
     def _u32(self, addr: int) -> int:
-        return self.machine.read_u32(addr)
+        return struct.unpack("<I", self._read_mem(addr, 4))[0]
 
     def _ptr(self, addr: int) -> int | None:
         """A heap pointer, validated to the RAM window; None if unset/implausible."""
@@ -537,7 +543,7 @@ class MtDebugger:
         count = self._u32(REG_COUNT_ADDR)
         if not 0 < count <= MAX_REGISTERS:
             return ()
-        raw = self.machine.read_bytes(REG_FILE_ADDR, 2 * count)
+        raw = self._read_mem(REG_FILE_ADDR, 2 * count)
         return struct.unpack(f"<{count}H", raw)
 
     # --- §4.6 booklist ---------------------------------------------------------------------------
@@ -548,7 +554,7 @@ class MtDebugger:
         if it is None:
             return 0, ""
         count = self._u16(it)
-        raw = self.machine.read_bytes(it + BOOKLIST_PATH_OFF, 2 * 0x104)
+        raw = self._read_mem(it + BOOKLIST_PATH_OFF, 2 * 0x104)
         path = raw.decode("utf-16-le", "replace").split("\x00", 1)[0]
         return count, path
 
@@ -557,16 +563,16 @@ class MtDebugger:
     def _resident_line(self) -> tuple[tuple[tuple[int, int, int, int], ...], tuple[int, ...]]:
         """The RAM-resident parsed line: (actions, playlist) as stored (§4.4)."""
         count = min(self._u8(ACTION_COUNT_ADDR), 8)
-        regs = struct.unpack("<8H", self.machine.read_bytes(ACTION_REG_ADDR, 16))
-        ops = struct.unpack("<8H", self.machine.read_bytes(ACTION_OP_ADDR, 16))
-        consts = self.machine.read_bytes(ACTION_CONST_ADDR, 8)
-        operands = struct.unpack("<8H", self.machine.read_bytes(ACTION_OPERAND_ADDR, 16))
+        regs = struct.unpack("<8H", self._read_mem(ACTION_REG_ADDR, 16))
+        ops = struct.unpack("<8H", self._read_mem(ACTION_OP_ADDR, 16))
+        consts = self._read_mem(ACTION_CONST_ADDR, 8)
+        operands = struct.unpack("<8H", self._read_mem(ACTION_OPERAND_ADDR, 16))
         actions = tuple(
             (regs[i], ops[i], consts[i], operands[i]) for i in range(count)
         )
         length = min(self._u16(PLAYLIST_LEN_ADDR), MAX_PLAYLIST)
         playlist = struct.unpack(
-            f"<{length}H", self.machine.read_bytes(PLAYLIST_ADDR, 2 * length)
+            f"<{length}H", self._read_mem(PLAYLIST_ADDR, 2 * length)
         )
         return actions, playlist
 

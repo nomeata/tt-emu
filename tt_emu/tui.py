@@ -605,6 +605,7 @@ class EmulatorSession:
                 gme_files=game_blobs,
                 symbols=self.symbols,
                 log=self._debug_log,
+                read_mem=booted.mmu.read_va,
             )
             self.debugger.attach_watches()
             self.post_event(
