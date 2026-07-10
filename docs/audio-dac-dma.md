@@ -354,17 +354,25 @@ same with a ring/callback instead of a file):
   `_make_data_resident` a no-op and routing CPU reads through the MMU) fixes it; a content tap
   after idle now decodes and plays. Regression guard:
   `tests/test_scripting::test_tap_after_idle_produces_audio` (passing).
-- **Open — the demand-paging shadow gap the pin was masking.** Removing the pin exposed a
-  pre-existing bug: some read-write pages the firmware demand-pages have no faithful backing
-  store, so on eviction their live content is lost (the `shadow` capture/restore in `mmu_boot`
-  only covers PROG-image-recoverable pages). On the richer TUI flow
-  (`test_live_debugger_boot_book_tap`) and the second GME (WWW Bauernhof) a media-path pointer
-  page is dropped on eviction → the firmware jumps to a corrupted pointer (a UTF-16 string
-  mistaken for a pointer) and crashes. The faithful fix is the **authentic NAND swap/backing
-  store**: model the pager's per-frame dirty bit (`0x04010014`/`0x18`) and its swap store
-  (`pager_swap_out` `0x08006ff8`) so dirty pages are written to and restored from NAND swap
-  exactly as the hardware does, deleting the `shadow` stand-in entirely. Repro:
-  `test_live_debugger_boot_book_tap`, `test_second_gme_mounts_and_plays` (both xfail).
-- **Open — multi-tap media sequencing.** `test_scripting_end_to_end` now gets past the idle bug
-  (the `acht` digit plays) but `expect_play('neun')` on the second digit tap catches the prior
-  `acht` clip — the new playback's media detection races with the previous one's tail (xfail).
+- ~~**Open — the demand-paging shadow gap.**~~ **Resolved.** The `mmu_boot` backing store
+  snapshots a page's content the instant it is evicted, but it only hooked the nandboot
+  refiner's eviction site (`0x080014f8`). PROG has its **own** page-eviction routine
+  (`0x08009600`) — same shape as the refiner (check the per-frame dirty bit, optionally
+  `pager_swap_out`, invalidate the L2, clear the eviction-table entry at `0x08009634`, page in a
+  replacement) — whose evictions bypassed the snapshot, dropping ~6 pages a run. Under the
+  heavier paging complex GMEs (WWW Bauernhof) trigger, one dropped page was the heap allocator's
+  control metadata (block-state table + free-list head at `0x081db330`); the lost writes
+  corrupted the free list so `malloc_core` handed one VA to two live allocations, and the
+  larger's memclr wiped a live media object's callback pointer → the null-deref crash. Fixed by
+  capturing at PROG's eviction site too (`mmu_boot` `PAGER_PROG_EVICT`, same `r5`/`r4`
+  convention). No pin, no swap store needed — just the same faithful snapshot at every eviction.
+  This built on honouring the firmware's CP15 TLB invalidate (Unicorn ignored it), which exposed
+  the gap by removing an accidental stale-TLB masking. Guards: `test_live_debugger_boot_book_tap`,
+  `test_second_gme_mounts_and_plays`, `test_scripting_end_to_end` (all pass).
+- **Open — number-readout media naming.** Tapping a second digit reads the two-digit number back
+  as a multi-part spoken form (89 → "achtundneunzig": *acht*, *und*, *neunzig*). The firmware
+  plays three distinct media by **offset** (r1 at `PC_PLAY_MEDIA` `0x080AB7B4`), not via the
+  resident playlist, so the emulator's playlist-based `_resolve_media_index` labels all three
+  "acht". Resolving *und*/*neunzig* by name would need GME media-table offset→index parsing;
+  `test_scripting_end_to_end` verifies the readout opens with "acht", is a ≥3-media sequence, and
+  produces real PCM.
