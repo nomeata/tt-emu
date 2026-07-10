@@ -101,3 +101,47 @@ def test_scripting_end_to_end(tmp_path: Path) -> None:
     # The session WAV is valid and non-empty.
     assert _valid_wav(session_wav) > 0
     assert session_wav.stat().st_size > 44  # more than just the WAV header
+
+
+#: OID codes for a run of digit scripts (taschenrechner.codes.yaml), used to
+#: probe the "repeated media playback" pattern.
+_DIGIT_SEQUENCE = ["acht", "eins", "zwei", "gleich"]
+
+
+@pytest.mark.xfail(
+    reason="Only the FIRST media playback after a product mount produces audio; every "
+    "subsequent tap plays silence. The audio pump never re-establishes its decoder "
+    "link (the AO is never re-added to the active list, so mp_pump_state1 / "
+    "ao_pull_decoder never run) — consistent with a small fixed decode-buffer pool "
+    "exhausted/leaked after the first playback. See docs/audio-dac-dma.md §8.",
+    strict=False,
+)
+def test_repeated_taps_each_produce_audio(tmp_path: Path) -> None:
+    """Every media playback after mount should produce real (non-silent) audio.
+
+    Taps a sequence of digit OIDs and asserts each one drives real PCM to the DAC.
+    Uses raw OID injection (``oid.hold``/``lift`` + ``_advance``) rather than the
+    gated :meth:`Emulator.tap` so the sequence survives the stall that a silent
+    playback leaves behind. Currently only the first playback produces audio, so
+    this is an expected failure that documents the bug (and will xpass once fixed).
+    """
+    def _real_chunks(pen, since: int) -> int:
+        return sum(
+            1 for ch in pen._capture.chunks[since:] if len(set(ch.data[:64])) > 4
+        )
+
+    with Emulator(firmware=str(UPD_PATH), gme=GME_PATH, yaml=YAML_PATH) as pen:
+        pen.tap("product")  # gated mount (the welcome plays here)
+        produced: list[tuple[str, bool]] = []
+        for name in _DIGIT_SEQUENCE:
+            code = pen._resolve_oid(name)
+            before = len(pen._capture.chunks)
+            pen._booted.oid.hold(code)
+            pen._advance(25_000_000)  # let the poll latch the tap
+            pen._booted.oid.lift()
+            pen._advance(130_000_000)  # let the media decode + play
+            produced.append((name, _real_chunks(pen, before) > 3))
+
+    assert all(ok for _, ok in produced), (
+        f"only some taps produced audio: {produced}"
+    )

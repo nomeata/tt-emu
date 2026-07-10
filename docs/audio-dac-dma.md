@@ -341,11 +341,18 @@ same with a ring/callback instead of a file):
 - The exact divider search arithmetic for arbitrary rates (only the inverse table lookup
   and the observed data points — 22050 Hz → 0x28 live, 8000 Hz → 0x74 bring-up — are
   needed for emulation).
-- **Open bug — digit-media playback.** After a product mount, tapping a content OID (e.g.
-  4716 → media `'acht'`) starts a playback (metadata fires) but produces **no PCM**: the
-  firmware loops in the teardown silence-flush (`dac_flush_silence`, `0x08032eb0`) roughly
-  every 55 M instructions instead of decoding real audio. The swallow flag `0x08008C91` is
-  set/cleared cleanly, so it is not a stuck flag — the media-playback state after the
-  product-mount-sound teardown never transitions to real output. The mount sound itself now
-  plays and captures correctly (surfaced by the pager-LRU fix, §2.1). Reproduces as
-  `tests/test_scripting`.
+- **Open bug — only the first media playback after a mount produces audio.** After a product
+  mount, the welcome and the *first* tapped media decode and play correctly (real PCM). Every
+  **subsequent** playback is silent: the player emits `dac_flush_silence` (`0x08032eb0`)
+  keep-alives (~every 55 M instructions) instead of decoding. It is **position-dependent, not
+  media-dependent** — the same OID plays audio as the first tap and is silent as a later one
+  (see `tests/test_scripting::test_repeated_taps_each_produce_audio`, xfail). Localized: for a
+  failing playback the codec is detected (valid OGG header read) but the audio pump never runs
+  — `mp_pump_state1` (`0x0800be78`) and `ao_pull_decoder` (`0x0802220c`) are called 0× (vs
+  ~10 k / ~900× for a working one), because the active-AO list the pump iterates
+  (`sm_ao_event_coalesce`, `0x0800b9f8`) is empty. So the decoder is never re-linked into the
+  active list after the first playback — consistent with a small fixed decode-buffer/AO pool
+  (≈2) exhausted or leaked once the welcome + first digit consume it. The swallow flag
+  `0x08008C91` and the audio-active bit are both clean (not stuck), and the media data is valid
+  (not a storage/DMA-resolution problem). Root not yet fixed; the missing free/unlink on
+  playback teardown is the next lead.
