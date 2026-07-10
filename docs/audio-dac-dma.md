@@ -122,9 +122,9 @@ ring chunk (§5) → translate the chunk's virtual address to physical → `hal_
 > firmware's DMA pool sits in this one window). The firmware allocates its
 > DMA-able pool (PCM ring, system-voice buffer, teardown-flush buffer) from a
 > physically-contiguous region and translates each buffer to physical with
-> `hal_virt_to_phys` before submitting; the emulator reads the reconstructed
-> physical address, translating physical→where-the-bytes-live through the same
-> map (§7). This resolves any source uniformly and needs no firmware ring/struct.
+> `hal_virt_to_phys` before submitting; the emulator reconstructs that physical
+> address and reads it directly from RAM (§7). This resolves any source uniformly
+> and needs no firmware ring/struct.
 
 ---
 
@@ -278,13 +278,12 @@ same with a ring/callback instead of a file):
    = 0 always (else the ISR treats every interrupt as spurious).
 2. **Read the chunk source at submit as a physical bus master.** Reconstruct the
    physical address `phys = window_base | ([0x04010004] & 0x3ffff)` (window base =
-   the RAM base `0x08000000`, §2), then read physical memory at `phys`. A DMA
-   master reads physical RAM directly; model that as a `read_phys(phys, len)`
-   primitive in the memory layer. When the CPU-side MMU is not modelled, translate
-   `phys`→the flat/virtual address holding those bytes through the firmware's
-   active virt→phys map (the inverse of `hal_virt_to_phys`); when it is modelled,
-   physical == the address the CPU already wrote to. Either way the DMA engine
-   itself needs no knowledge of any firmware buffer or ring.
+   the RAM base `0x08000000`, §2), then read physical memory at `phys` — a
+   `read_phys(phys, len)` primitive in the memory layer. The DMA engine is a genuine
+   physical bus master: it reads physical RAM directly, bypassing the CPU's page
+   table. RAM is mapped at its physical base and the firmware runs under its MMU, so
+   `phys` is exactly where the bytes live — no page-table inversion. The DMA engine
+   needs no knowledge of any firmware buffer or ring.
 3. **On the START write to `0x0401000c`** (value has bit13 and a nonzero word count)
    while the destination is the DAC port (`0x04010008 == 0x08086200`):
    - read `word_count × 4` bytes from the recorded source pointer — these are final,
@@ -329,50 +328,17 @@ same with a ring/callback instead of a file):
 
 ---
 
-## 8. Open items
+## 8. Open items and known limitations
 
-- ~~The physical window base behind the 18-bit `0x04010004` encoding~~ — **resolved:**
-  it is a 256-KiB physical-RAM aperture based at the RAM base `0x08000000`
-  (proven at runtime — the reconstructed physical address resolves every content
-  submit to the exact same bytes); the DAC engine is a physical bus master, so
-  source resolution needs no firmware ring/struct (§2/§7).
 - **Inferred:** which init path sets `INT_ENABLE` bit0 initially (see
   `interrupts-and-timers.md` for the enable-register default that sidesteps this).
-- The exact divider search arithmetic for arbitrary rates (only the inverse table lookup
-  and the observed data points — 22050 Hz → 0x28 live, 8000 Hz → 0x74 bring-up — are
-  needed for emulation).
-- ~~**Open bug — a media playback started from an *idle* audio chain is silent.**~~
-  **Resolved.** The symptom was idle-time-dependent (a tap within ~100 M instructions of the
-  mount played; a tap after ~2 s of idle emitted `dac_flush_silence` keep-alives, with
-  `mp_pump_state1`/`ao_pull_decoder` running 0× because the active-AO list was empty). Root
-  cause was **not** in the audio path at all: it was the demand-paging hack that pinned the
-  work/data window resident (commit `e225130`). The firmware remaps pages in that window into
-  its own demand-paged frame pool at runtime — the audio player object at VA `0x081487a0` moves
-  into a pool frame — so the identity pin fought the firmware's mapping: on eviction+refault the
-  pinned-vs-paged split corrupted the page and the AO's decoder-source pointer (`[player+0x24]`)
-  was lost, so `aud_player_play_tail` (`0x08032c3c`) early-returned. Dropping the pin (making
-  `_make_data_resident` a no-op and routing CPU reads through the MMU) fixes it; a content tap
-  after idle now decodes and plays. Regression guard:
-  `tests/test_scripting::test_tap_after_idle_produces_audio` (passing).
-- ~~**Open — the demand-paging shadow gap.**~~ **Resolved.** The `mmu_boot` backing store
-  snapshots a page's content the instant it is evicted, but it only hooked the nandboot
-  refiner's eviction site (`0x080014f8`). PROG has its **own** page-eviction routine
-  (`0x08009600`) — same shape as the refiner (check the per-frame dirty bit, optionally
-  `pager_swap_out`, invalidate the L2, clear the eviction-table entry at `0x08009634`, page in a
-  replacement) — whose evictions bypassed the snapshot, dropping ~6 pages a run. Under the
-  heavier paging complex GMEs (WWW Bauernhof) trigger, one dropped page was the heap allocator's
-  control metadata (block-state table + free-list head at `0x081db330`); the lost writes
-  corrupted the free list so `malloc_core` handed one VA to two live allocations, and the
-  larger's memclr wiped a live media object's callback pointer → the null-deref crash. Fixed by
-  capturing at PROG's eviction site too (`mmu_boot` `PAGER_PROG_EVICT`, same `r5`/`r4`
-  convention). No pin, no swap store needed — just the same faithful snapshot at every eviction.
-  This built on honouring the firmware's CP15 TLB invalidate (Unicorn ignored it), which exposed
-  the gap by removing an accidental stale-TLB masking. Guards: `test_live_debugger_boot_book_tap`,
-  `test_second_gme_mounts_and_plays`, `test_scripting_end_to_end` (all pass).
-- **Open — number-readout media naming.** Tapping a second digit reads the two-digit number back
-  as a multi-part spoken form (89 → "achtundneunzig": *acht*, *und*, *neunzig*). The firmware
+- The exact divider-search arithmetic for arbitrary sample rates is unresolved; only the
+  inverse-table lookup and the observed data points (22050 Hz → 0x28 live, 8000 Hz → 0x74
+  bring-up) are needed for emulation.
+- **Number-readout media naming.** Tapping a second digit reads the two-digit number back as
+  a multi-part spoken form (89 → "achtundneunzig": *acht*, *und*, *neunzig*). The firmware
   plays three distinct media by **offset** (r1 at `PC_PLAY_MEDIA` `0x080AB7B4`), not via the
   resident playlist, so the emulator's playlist-based `_resolve_media_index` labels all three
-  "acht". Resolving *und*/*neunzig* by name would need GME media-table offset→index parsing;
-  `test_scripting_end_to_end` verifies the readout opens with "acht", is a ≥3-media sequence, and
-  produces real PCM.
+  "acht". Resolving *und*/*neunzig* by name would need GME media-table offset→index parsing.
+  (`test_scripting_end_to_end` verifies the readout opens with "acht", is a ≥3-media sequence,
+  and produces real PCM.)

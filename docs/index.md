@@ -3,10 +3,13 @@
 This directory documents the hardware of the Ravensburger tiptoi pen (2nd generation,
 "MT") at the level of detail needed to **emulate it** and boot the pen's real firmware
 **unmodified**. The SoC is a **Chomptech ZC3202N = Anyka AK1050** ("Snowbird2"), a 64-pin
-LQFP part with an **ARM926EJ-S** (ARMv5TEJ, ARM + Thumb) core, little-endian, effectively
-identity-mapped (no MMU emulation needed). The firmware runs OS-less: a hand-written PROG
-startup, a QHsm statechart, an event-pump main loop, plus a resident boot blob that stays
-mapped as the HAL for the pen's whole life.
+LQFP part with an **ARM926EJ-S** (ARMv5TEJ, ARM + Thumb) core, little-endian. The firmware
+runs under its **own MMU**: nandboot's `init2` builds the ARMv5 page tables and enables the
+MMU before the main firmware (PROG) executes, and PROG — far larger than the resident RAM
+window — is **demand-paged** through a pool of 37 physical frames (`memory-map-and-boot.md`
+§1.2–1.3). The firmware runs OS-less: a hand-written PROG startup, a QHsm statechart, an
+event-pump main loop, plus a resident boot blob that stays mapped as the HAL for the pen's
+whole life.
 
 Each file is **self-contained**: it describes one hardware component's programming
 interface (registers, behaviour, timing, data formats) well enough to implement a model of
@@ -41,10 +44,13 @@ Every fact below is drawn from the component docs (each marks items **Observed**
 - *Keep the battery "healthy" and detect power-off* → `battery-and-power.md`.
 - *Pass the anti-clone boot gate* → `zc90b-auth.md`.
 
-**Recommended build order** (each step boots a bit further):
+**Reading order** (the components in roughly boot-dependency order — each builds on the
+ones before):
 
-1. `memory-map-and-boot.md` — CPU core, address map, load the artifacts, enter at
-   `0x08039100`. Its §5 is the master recipe; §5.3 lists the minimum MMIO contract.
+1. `memory-map-and-boot.md` — CPU core, address map, artifact load, and the boot handoff:
+   nandboot's `init2` builds the page tables and enables the MMU, then PROG runs from
+   `0x08039100` under that MMU. Its §5 is the full boot recipe; §5.3 lists the minimum MMIO
+   contract.
 2. `system-control-and-clock.md` + `battery-and-power.md` — the constants that pass the
    boot self-tests (chip-ID, clock latch bits, battery ADC).
 3. `nand-and-nfc-controller.md` + `nand-image-layout.md` — the storage mount is a hard
@@ -230,7 +236,9 @@ substitutes for it.
 ## Conventions used in these docs
 
 - Addresses are byte addresses, hexadecimal, in the running firmware's address space
-  (runtime physical addresses; the firmware is effectively identity-mapped).
+  (runtime virtual addresses; the firmware runs under its own MMU, whose page table maps
+  each virtual page to the physical frame holding the bytes linked at that address, so
+  absolute references resolve as linked — see `memory-map-and-boot.md` §1.3.1).
 - Register widths are 32-bit unless noted; values are little-endian.
 - "Runtime address" = the address in the live firmware; noted where it differs from any
   file offset.

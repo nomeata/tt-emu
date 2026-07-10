@@ -9,8 +9,10 @@ path needs.
 Facts are marked **Observed** (byte-read from artifacts, seen in a live-pen RAM dump, or
 demonstrated in emulation) or **Inferred** (deduction). Unmarked statements are Observed.
 
-Address convention: all addresses are **runtime physical addresses** (the firmware runs
-with an effectively identity mapping, see §1.3). Byte order is little-endian throughout.
+Address convention: all addresses are **runtime virtual addresses** in the firmware's own
+address space. The firmware runs under its MMU (§1.2); the page table maps each virtual page
+to the physical frame holding the bytes linked at that address, so absolute references
+resolve as linked (§1.3.1). Byte order is little-endian throughout.
 
 ---
 
@@ -116,7 +118,7 @@ this is proven to work.
 | Range / addr | What lives there |
 |---|---|
 | `0x08000000–0x08007e80` | Boot blob code (resident: pre-inits, HAL leaves, IRQ plumbing, NAND/NFC driver, OID shifter, timer dispatch). Vector table at `0x08000000` (reset `b` at +0, **IRQ vector at +0x18** → low-level entry `0x08000110`). |
-| `0x08004000`, `0x08004400` | MMU section-table area built by the boot blob (unused if you skip the MMU — safe to leave as the blob wrote it). |
+| `0x08004000`, `0x08004400` | MMU L1/L2 page-table area built by nandboot `init2` (TTBR0 = `0x08004000`, coarse L2 tables above): the live translation tables PROG runs under (§1.2). |
 | `0x08006000–0x08006aff` | NAND L2-buffer staging SRAM (plain RAM; the NAND driver DMA-stages page data here). |
 | `0x08007000–0x08009000` | Early heap + **low globals** (zeroed by the boot blob's reset handler): QHsm frame stack base `0x08007e80` (12-byte frames, state number in byte 0; the deepest non-zero frame is the authoritative statechart leaf — §5.8); active-object (AO) `0x08008874`; AO event ring `0x08008898` (16 × 12-byte records, head u16 @+0xC0, tail @+0xC2); game context base `0x080089a4` (OID buffer ptr @+0x20 = `0x080089c4`); OID sensor struct `0x08008c08`; **NAND chip/geometry struct `0x08008ca8` (device object `0x08008cc4`)**; system tick `0x08008d24`; audio-output singleton ptr `0x08008d2c`. |
 | `0x08009000–0x08389000` | **PROG image, flat** (file offset = address − 0x08009000). Dense code/data to ~`0x0812xxxx`, then .data/.bss. |
@@ -211,11 +213,12 @@ mode, OID taps, audio.
 
 ## 5. Practical emulator boot (the recipe that works)
 
-The emulator does **not** run stages 0–1 (see §6). It performs the load the boot chain
-would have produced and enters PROG at its real entry, with the resident boot blob
-mapped so the pre-inits and HAL run for real. This boots the **unmodified** firmware to
-its main loop; everything below is Observed working end-to-end (cold boot ≈ 9–15 M
-instructions to the idle pump, then event-driven).
+The emulator does not run stage 0 (mask ROM) or the full stage-1 SPL runtime work (see §6).
+It performs the load the boot chain would have produced, runs nandboot's `init2` to build the
+page tables and enable the MMU (§1.2), then enters PROG at its real entry **under that MMU**,
+with the resident boot blob mapped so the pre-inits and HAL run for real. This boots the
+**unmodified** firmware to its main loop; everything below is Observed working end-to-end
+(cold boot ≈ 9–15 M instructions to the idle pump, then event-driven).
 
 ### 5.1 Memory setup
 
@@ -234,20 +237,20 @@ zeroes it in a from-entry boot).
 
 | Register | Value |
 |---|---|
-| PC | **`0x08039100`** (PROG entry; ARM state) |
+| PC | **`0x08039100`** (PROG entry; ARM state; a virtual address, set after `init2` has enabled the MMU — §1.2) |
 | SP (SVC) | `0x08400000` |
 | CPSR | SVC mode, ARM, IRQs initially enabled (the firmware masks/unmasks itself via `0x04000034` and CPSR.I) |
 | Other regs | don't-care (the real handoff leaves garbage too) |
 | SP (IRQ bank) | set `0x083F0000` when delivering the first IRQ (the from-entry boot skips the blob's per-mode stack setup) |
 
-> **Stack-placement rule (Observed the hard way):** both stacks must lie **inside
+> **Stack-placement rule (Observed):** both stacks must lie **inside
 > `[0x08000000, 0x08400000)`**. The firmware's `Utl_UStr*` wide-string helpers
 > validate every pointer against exactly that range and **silently no-op** on
 > out-of-range strings; with a stack top above `0x08400000`, discovery's on-stack
 > path buffers fail the check and it builds garbage `"B:/"`/`"A:/"` paths — no
 > error, no crash, just an empty booklist. SVC top `0x08400000` (stack bytes below
-> it) and IRQ top `0x083F0000` are the proven values; earlier drafts' `0x08420000`/
-> `0x0841f000` are exactly this failure.
+> it) and IRQ top `0x083F0000` are the proven values; a stack top at or above
+> `0x08420000` hits exactly this failure.
 
 ### 5.3 Minimum MMIO contract for boot
 
@@ -395,8 +398,8 @@ hold; listed here because a from-entry boot that gets any of them wrong fails
 The full mount→discovery→tap contract, tap sequence (product, product, content) and
 failure-signature table live in `nand-image-layout.md` §7.
 
-Explicitly **not** needed (they self-build; earlier beliefs to the contrary were wrong):
-the mem-driver vtable "keystone" `0x081db984` (the firmware's own NFTL init writes
+Explicitly **not** needed (they self-build): the mem-driver vtable "keystone" `0x081db984`
+(the firmware's own NFTL init writes
 {+0 alloc `0x08038cf8`, +8 free `0x08038d04`, +0xC copy `0x08009c71`, +0x10 memset
 `0x08009c85`} ~270 k instructions into the real mount), the statechart descriptor table
 `0x08121d44` (static .data, already in PROG.bin), the FAT signature string, the

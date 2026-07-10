@@ -590,11 +590,9 @@ Boot outcome: the boot loader finds PROG via rows 254/253/200, the mount reads
 row 255, builds the medium over blocks 134–4095, and registers **both** drives —
 A (`a:`) and B (`b:`) — when both FAT images are valid (Observed under emulation).
 The firmware's own writes (log, profile, `.lst`) COW into free blocks and read
-back consistently (Observed). **Resolved caveat:** an earlier reference validation
-saw the B:-pass directory enumeration return 0 entries; the cause was the
-pre-correction per-physical-block tagging. With the 1-MiB-span tagging of step 5
-(and raw-row tag keying), B: enumerates and plays placed content — the `.gme` can
-live on B: alone (Observed; §7.5). The full runtime chain and its failure
+back consistently (Observed). B: enumeration requires the 1-MiB-span tagging of step 5
+(and raw-row tag keying); with it, B: enumerates and plays placed content — the `.gme`
+can live on B: alone (Observed; §7.5). The full runtime chain and its failure
 signatures are in §7.
 
 ---
@@ -735,7 +733,7 @@ or no-match booklist: error voice 0x2D.
 
 **Tap 3 — a content OID → the script runs and media plays.**
 
-### 7.3.1 The `+0x1d` standby window — why tap 1 needs help (★ read before implementing)
+### 7.3.1 The `+0x1d` standby window — why tap 1 needs help
 
 Game-context byte `+0x1d` (base `0x080089a4`, i.e. `0x080089C1`) is the
 "fresh-standby" marker the tap-1 gate tests. Its lifecycle (Observed):
@@ -754,11 +752,10 @@ Game-context byte `+0x1d` (base `0x080089a4`, i.e. `0x080089C1`) is the
   therefore **one heartbeat wide (≤ ~100 ms of emulated time)**. Any realistically
   paced tap arrives at `+0x1d == 8`, fails the gate, and is dropped (see above).
   This is a property of the unmodified firmware, not an emulator timing bug —
-  reordering event delivery cannot widen the window. **Resolved:** a physical pen
-  never needs to win this window, because on a normal power-on it does not idle at
-  standby at all — it auto-descends to book(13) via `+0x24 == 1` (§7.3.1a). The
-  one-heartbeat window only matters on the `+0x24 == 0` boot shape the emulator
-  has been reproducing.
+  reordering event delivery cannot widen the window. A physical pen never needs to
+  win this window, because on a normal power-on it does not idle at standby at all —
+  it auto-descends to book(13) via `+0x24 == 1` (§7.3.1a). The one-heartbeat window
+  only matters on the `+0x24 == 0` boot shape the emulator reproduces.
 
 **What the reference emulation does (Observed, proven end-to-end):** present
 `+0x1d = 2` **at the classifier's first-load gate** — concretely: when execution
@@ -787,13 +784,13 @@ Alternatives, for the record:
   descent a normal boot takes anyway (§7.3.1a); FLAG.bin is just the second,
   post-update setter of the same `+0x24` byte.
 
-### 7.3.1a ★ RESOLVED: how a real pen normally reaches book mode (no FLAG.bin)
+### 7.3.1a How a real pen normally reaches book mode (no FLAG.bin)
 
 The `+0x24` "resume" byte has **two** authentic setters, and the second one fires
 on essentially **every** physical power-on:
 
-1. **Splash's `B:/FLAG.bin` branch** (post-firmware-update resume) — the shortcut
-   the emulator has been using.
+1. **Splash's `B:/FLAG.bin` branch** (post-firmware-update resume) — the path the
+   emulator uses.
 2. **The early app-init latches `+0x24 = (GPIO11 == 1)`** right after configuring
    the power-hold pin. **GPIO11 is the power button.** On a physical power-on the
    user's finger is still on the button when this sample runs (a fraction of a
@@ -900,14 +897,11 @@ decode has latched it (`akoid_buf+4 == N`, or code word `0x400000|N` at
   unmodified firmware.
 - **Observed:** two-FAT image (A: system + B: game) → both drives register; B's
   VBR at physical 614 is read and accepted; mount returns success.
-- **Resolved (Observed):** the discovery B: pass initially enumerated 0 entries
-  over placed B: content. The root cause was the image builder's tag model — a
-  translation-layer detail indeed: per-physical-block head tags instead of the
-  NFTL's **1-MiB logical blocks**, plus flattened tag keys aliasing neighbour
-  page-0 tags (§4 box). With 1-MiB-span tagging keyed by raw row (§6 step 5), the
-  B: pass enumerates placed `.gme`s and the end-to-end chain runs with the game on
-  B: alone. (A `.gme` on A: is still found through the same path, as on a real
-  pen.)
+- **Observed:** the discovery B: pass enumerates placed B: content when the image is
+  tagged as the NFTL expects — 1-MiB-span head tags keyed by raw row (§6 step 5), **not**
+  per-physical-block head tags with flattened keys that alias neighbour page-0 tags (§4
+  box). With correct tagging the end-to-end chain runs with the game on B: alone. (A `.gme`
+  on A: is found through the same path, as on a real pen.)
 
 ---
 
@@ -933,6 +927,3 @@ decode has latched it (`akoid_buf+4 == N`, or code word `0x400000|N` at
   no parity).
 - **ASA and RB/UB dual copies** are documented but not modelled; needed only for
   bad-block or self-update emulation.
-- **B:-pass discovery enumeration** — *resolved*, kept for history (§7.5): the
-  0-entries symptom was the tag mis-model (per-physical-block head tags instead of
-  1-MiB spans; flattened tag keys). See §4 box and §6 step 5; no workaround needed.

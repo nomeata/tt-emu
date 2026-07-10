@@ -115,7 +115,7 @@ Also seeded by the probe: a global row-address-cycle count (**3** for this devic
 class) used when emitting address cycles (§5.2).
 
 > **Caveat — the row-cycle count is a §5.6-class seed the boot recipe must not skip
-> (Observed the hard way in emulation):** the boot blob's *static* value of this
+> (Observed):** the boot blob's *static* value of this
 > global (blob offset `0x79E0`) is **2**, not the probe's 3. A from-entry boot that
 > skips the probe therefore emits only 2 row cycles, and every row ≥ 256 is silently
 > truncated to 16 bits: the NFTL mount scan then sees duplicate chain heads (blocks
@@ -123,7 +123,7 @@ class) used when emitting address cycles (§5.2).
 > bins get erased**. Either run the probe (option (a) below), which seeds 3, or
 > pre-seed the global to **3** explicitly (option (b)).
 
-> **Warning to implementers (Observed the hard way):** the values above must match
+> **Caveat (Observed):** the values above must match
 > real hardware, not a self-consistent fiction. `dev[0x1c]` **is `0x1000`**, not
 > `0x200`. An emulator can appear to work with `dev[0x1c] = 0x200` (AU = 1 sector) if
 > it also serves rows as flat 512-B sector indices and inflates the partition table's
