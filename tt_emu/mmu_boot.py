@@ -76,6 +76,11 @@ SP_ABT = 0x0800_6000
 #: index and r5 the page VA about to be evicted from that frame (0 if the frame is free) —
 #: the exact point to snapshot the outgoing page's content before the refiner reuses it.
 PAGER_REFINER_CAPTURE = 0x0800_14F8
+#: PROG's own page-eviction routine clears the frame's eviction-table entry here (str r0,
+#: [fp,#0x800] with r0=0), after swapping/invalidating, before paging in a replacement — the
+#: same eviction shape as the refiner but outside nandboot, so it needs the same content
+#: snapshot (r5 = outgoing page VA, r4 = frame index) or the evicted page's writes are lost.
+PAGER_PROG_EVICT = 0x0800_9634
 PAGER_FRAME_BASE = 0x0800_9000
 #: The pager's per-frame globals base (the refiner's ``[pc,#-0x8d0]`` literal) and
 #: its eviction table (``[base+0x800+idx*4]`` = the page VA resident in frame idx,
@@ -178,9 +183,15 @@ class MmuBoot:
         uc.reg_write(UC_ARM_REG_SP, SP_ABT)
         uc.reg_write(UC_ARM_REG_CPSR, cpsr)
 
-        # Snapshot each page the instant the refiner evicts it (scoped hook).
-        uc.hook_add(UC_HOOK_CODE, self._on_refiner_evict,
-                    begin=PAGER_REFINER_CAPTURE, end=PAGER_REFINER_CAPTURE)
+        # Snapshot each page the instant it is evicted from its frame (scoped hooks). There
+        # are two eviction sites that clear the frame's eviction-table entry and reuse it: the
+        # nandboot refiner's :data:`PAGER_REFINER_CAPTURE`, and PROG's own eviction routine at
+        # :data:`PAGER_PROG_EVICT` (0x08009634) — same register convention (r5=outgoing VA,
+        # r4=frame index). The refiner one alone leaves the PROG path's evictions uncaptured,
+        # dropping ~6 pages a run (incl. the heap allocator's free-list metadata → the media
+        # double-alloc crash). Capture at both.
+        for cap in (PAGER_REFINER_CAPTURE, PAGER_PROG_EVICT):
+            uc.hook_add(UC_HOOK_CODE, self._on_refiner_evict, begin=cap, end=cap)
         # Model the hardware per-frame usage clock: when the pager records a page
         # in a frame (eviction-table write), stamp that frame so its LRU victim
         # scan (the 0x04010124 array) can rank frames instead of thrashing a few.

@@ -44,16 +44,6 @@ def _valid_wav(path: Path) -> int:
         return w.getnframes()
 
 
-@pytest.mark.xfail(
-    reason="Hits the demand-paging heap-corruption crash shared by all three GME crash tests: "
-    "a large (~24 KB) heap-buffer memset overlaps the live audio stream object at VA "
-    "0x08149000, zeroing its logger pointer, so audio_seek_time (0x08104c28) later derefs a "
-    "null callback and the CPU sleds into unmapped low RAM (0x00010000). Root: the allocator's "
-    "demand-paged metadata is corrupted under paging pressure → overlapping allocations. "
-    "Exposed here once the stale-TLB masking was removed (mmu_boot honours the firmware's CP15 "
-    "TLB invalidate). See docs/audio-dac-dma.md §8 / mmu-path-b notes.",
-    strict=False,
-)
 def test_scripting_end_to_end(tmp_path: Path) -> None:
     session_wav = tmp_path / "session.wav"
     clip_wav = tmp_path / "acht.wav"
@@ -94,11 +84,12 @@ def test_scripting_end_to_end(tmp_path: Path) -> None:
         clip.save_wav(clip_wav)
         assert _valid_wav(clip_wav) > 0
 
-        # The expect_play / expect assertion style: tap "9" -> the number is now
-        # 89, spoken "neunundachtzig", whose first media is "neun".
+        # The expect_play / expect assertion style: tap "9" -> the register becomes 89 and
+        # the firmware reads the number back starting with "acht" (achtundneunzig — "acht"
+        # is the first media, with "und…" following).
         pen.tap("neun")
-        neun_clip = pen.expect_play("neun", timeout="20s")
-        assert neun_clip.kind == "media"
+        readout = pen.expect_play("acht", timeout="20s")
+        assert readout.kind == "media"
         pen.expect(pen.registers["eingabe"] == 89, "eingabe should be 89 after 8 then 9")
 
         # A wrong expectation raises ExpectationError (with context).
@@ -177,14 +168,15 @@ def test_tap_after_idle_produces_audio(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(_second_gme() is None, reason="second (Bauernhof) .gme not available")
-@pytest.mark.xfail(
-    reason="A second, more complex GME (WWW Bauernhof, product-id 1) crashes on the "
-    "product-mount/tap path — the firmware jumps to a UTF-16 string mistaken for a "
-    "pointer (media-path corruption). See docs/audio-dac-dma.md §8.",
-    strict=False,
-)
 def test_second_gme_mounts_and_plays(tmp_path: Path) -> None:
-    """Mounting a second GME and tapping a content OID should play audio (it crashes)."""
+    """Mounting a second, more complex GME (WWW Bauernhof) and tapping content plays audio.
+
+    Regression guard for the demand-paging shadow gap: this GME's heavier paging churns the
+    heap allocator's control metadata, and an eviction path in PROG (0x08009634) used to drop
+    those pages without a shadow snapshot, corrupting the free list into a double-allocation
+    that overwrote a live media object → the mount/tap crash. Fixed by capturing at that
+    eviction site too (tt_emu/mmu_boot.py :data:`PAGER_PROG_EVICT`).
+    """
     with Emulator(firmware=str(UPD_PATH), gme=_second_gme(), dac_pacing="fast") as pen:
         pen.tap(1)  # product-id 1 = the mount OID
         assert pen.mounted == 1
