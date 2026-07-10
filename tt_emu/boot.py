@@ -211,6 +211,9 @@ def build_machine(
     # The DMA engines then read physical memory directly (no page-table inversion).
     mmu = MmuBoot(machine, firmware, audio)
     mmu.setup()
+    # From here the firmware runs under its own MMU; route CPU-visible reads (read_u*) through
+    # it so inspection sees firmware globals at their real (often non-identity) frames.
+    machine.mmu = mmu
 
     # --- CPU entry state (§5.2): PROG's pre-init entry, now under the MMU ----------
     machine.set_entry_state(PROG_ENTRY, SVC_STACK_TOP, CPSR_SVC_IRQS_ON)

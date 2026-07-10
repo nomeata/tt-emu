@@ -187,15 +187,21 @@ class MmuBoot:
         self.m.set_abort_handler(self._on_abort)
 
     def _make_data_resident(self) -> None:
-        """Pin the work/data region resident (identity, AP=11), like the loader does.
+        """No-op: let the firmware's own page table + demand-pager own the work/data region.
 
-        init2 leaves every page AP=00 (fault-on-access), which would demand-page the *data*
-        region too — mapping it into the small code-frame pool and letting the pager clobber
-        it. The real loader keeps data resident and demand-pages only code. We replicate that
-        for the fixed-data window ``[frame-threshold, dynamic-pool-base)`` (bounds read from
-        the firmware's own allocator literals), seeding each page's image content; the
-        dynamic-alloc pool above stays untouched for the firmware to manage.
+        This used to pin ``[frame-threshold, dynamic-pool-base)`` resident (identity, AP=11),
+        on the theory that the loader keeps data resident and demand-pages only code. But the
+        firmware in fact **remaps pages in that window into its demand-paged frame pool** at
+        runtime (e.g. the audio player object at VA 0x081487a0 → a pool frame), so the identity
+        pin conflicts with the firmware's mapping: when such a page is evicted and re-faulted,
+        the pinned-vs-paged split corrupts its content and the object's live writes are lost.
+        That broke audio played from an idle chain (the AO's decoder source pointer was dropped
+        on eviction). Leaving these pages to the firmware's page table + the demand-paging
+        backing store is both more faithful (no intervention) and correct — it fixes the audio.
         """
+        return
+
+    def _unused_pin_data_resident(self) -> None:  # kept for reference; see _make_data_resident
         uc = self.uc
         lo = struct.unpack("<I", uc.mem_read(ALLOC_THRESHOLD_LIT, 4))[0] & ~0xFFF
         hi = struct.unpack("<I", uc.mem_read(ALLOC_POOL_START_LIT, 4))[0] & ~0xFFF

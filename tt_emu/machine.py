@@ -199,6 +199,11 @@ class Machine:
         #: The interrupt controller peripheral (set by the machine builder).
         self.intc: IrqController | None = None
         self.irqs_delivered = 0
+        #: The MMU-boot layer (set by the machine builder, after the MMU is enabled).
+        #: When present, ``read_u8/u16/u32`` translate firmware VIRTUAL addresses through
+        #: the page table (the firmware maps many globals to non-identity frames); DMA and
+        #: raw physical access use :meth:`read_phys` / :meth:`read_bytes` instead.
+        self.mmu = None
 
         self._peripherals: list[Peripheral] = []
         self._ticking: list[Peripheral] = []  # peripherals that override tick()
@@ -427,15 +432,21 @@ class Machine:
         self.uc.mem_write(addr, data)
 
     def read_u32(self, addr: int) -> int:
+        if self.mmu is not None:
+            return struct.unpack("<I", self.mmu.read_va(addr, 4))[0]
         return struct.unpack("<I", self.uc.mem_read(addr, 4))[0]
 
     def write_u32(self, addr: int, value: int) -> None:
         self.uc.mem_write(addr, struct.pack("<I", value & 0xFFFFFFFF))
 
     def read_u16(self, addr: int) -> int:
+        if self.mmu is not None:
+            return struct.unpack("<H", self.mmu.read_va(addr, 2))[0]
         return struct.unpack("<H", self.uc.mem_read(addr, 2))[0]
 
     def read_u8(self, addr: int) -> int:
+        if self.mmu is not None:
+            return self.mmu.read_va(addr, 1)[0]
         return self.uc.mem_read(addr, 1)[0]
 
     def write_u8(self, addr: int, value: int) -> None:
