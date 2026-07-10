@@ -341,20 +341,30 @@ same with a ring/callback instead of a file):
 - The exact divider search arithmetic for arbitrary rates (only the inverse table lookup
   and the observed data points — 22050 Hz → 0x28 live, 8000 Hz → 0x74 bring-up — are
   needed for emulation).
-- **Open bug — a media playback started from an *idle* audio chain is silent.** The real
-  variable is **idle time, not tap position or media**: a content tap within ~0–<100 M
-  instructions of the mount (or of the last audio) plays real PCM; a tap after **~100 M (~2 s) of
-  idle** is silent — the player emits `dac_flush_silence` (`0x08032eb0`) keep-alives instead of
-  decoding. It is **pacing-independent** (fast and faithful behave identically → an
-  instruction-time firmware idle timeout, not audio-timing). For the silent case the codec is
-  detected (valid OGG header) but the audio pump never runs — `mp_pump_state1` (`0x0800be78`) and
-  `ao_pull_decoder` (`0x0802220c`) fire 0× (vs ~10 k / ~900× working) because the active-AO list
-  the pump iterates (`sm_ao_event_coalesce`, `0x0800b9f8`) is empty. So **restarting the audio
-  chain from idle is broken**: the welcome (first chain start after boot) and any tap while the
-  chain is still active work, but once the voice-chain flags (`0x08008C60`) go idle the AO state
-  machine never transitions idle→playing again (no `mp_pump_state1`, `dac_flush_silence` instead).
-  The swallow flag `0x08008C91` and the audio-active bit are clean; the media data is valid (not a
-  storage/DMA-resolution issue). A second, more complex GME (WWW Bauernhof) is worse — its
-  product-mount/tap path **crashes** (jumps to a UTF-16 string mistaken for a pointer). Repro:
-  `tests/test_scripting::test_tap_after_idle_produces_audio` (xfail). Next lead: why the AO
-  idle→playing transition (chain restart) fails on a non-first start under the MMU boot.
+- ~~**Open bug — a media playback started from an *idle* audio chain is silent.**~~
+  **Resolved.** The symptom was idle-time-dependent (a tap within ~100 M instructions of the
+  mount played; a tap after ~2 s of idle emitted `dac_flush_silence` keep-alives, with
+  `mp_pump_state1`/`ao_pull_decoder` running 0× because the active-AO list was empty). Root
+  cause was **not** in the audio path at all: it was the demand-paging hack that pinned the
+  work/data window resident (commit `e225130`). The firmware remaps pages in that window into
+  its own demand-paged frame pool at runtime — the audio player object at VA `0x081487a0` moves
+  into a pool frame — so the identity pin fought the firmware's mapping: on eviction+refault the
+  pinned-vs-paged split corrupted the page and the AO's decoder-source pointer (`[player+0x24]`)
+  was lost, so `aud_player_play_tail` (`0x08032c3c`) early-returned. Dropping the pin (making
+  `_make_data_resident` a no-op and routing CPU reads through the MMU) fixes it; a content tap
+  after idle now decodes and plays. Regression guard:
+  `tests/test_scripting::test_tap_after_idle_produces_audio` (passing).
+- **Open — the demand-paging shadow gap the pin was masking.** Removing the pin exposed a
+  pre-existing bug: some read-write pages the firmware demand-pages have no faithful backing
+  store, so on eviction their live content is lost (the `shadow` capture/restore in `mmu_boot`
+  only covers PROG-image-recoverable pages). On the richer TUI flow
+  (`test_live_debugger_boot_book_tap`) and the second GME (WWW Bauernhof) a media-path pointer
+  page is dropped on eviction → the firmware jumps to a corrupted pointer (a UTF-16 string
+  mistaken for a pointer) and crashes. The faithful fix is the **authentic NAND swap/backing
+  store**: model the pager's per-frame dirty bit (`0x04010014`/`0x18`) and its swap store
+  (`pager_swap_out` `0x08006ff8`) so dirty pages are written to and restored from NAND swap
+  exactly as the hardware does, deleting the `shadow` stand-in entirely. Repro:
+  `test_live_debugger_boot_book_tap`, `test_second_gme_mounts_and_plays` (both xfail).
+- **Open — multi-tap media sequencing.** `test_scripting_end_to_end` now gets past the idle bug
+  (the `acht` digit plays) but `expect_play('neun')` on the second digit tap catches the prior
+  `acht` clip — the new playback's media detection races with the previous one's tail (xfail).
