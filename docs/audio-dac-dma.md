@@ -341,18 +341,20 @@ same with a ring/callback instead of a file):
 - The exact divider search arithmetic for arbitrary rates (only the inverse table lookup
   and the observed data points — 22050 Hz → 0x28 live, 8000 Hz → 0x74 bring-up — are
   needed for emulation).
-- **Open bug — only the first media playback after a mount produces audio.** After a product
-  mount, the welcome and the *first* tapped media decode and play correctly (real PCM). Every
-  **subsequent** playback is silent: the player emits `dac_flush_silence` (`0x08032eb0`)
-  keep-alives (~every 55 M instructions) instead of decoding. It is **position-dependent, not
-  media-dependent** — the same OID plays audio as the first tap and is silent as a later one
-  (see `tests/test_scripting::test_repeated_taps_each_produce_audio`, xfail). Localized: for a
-  failing playback the codec is detected (valid OGG header read) but the audio pump never runs
-  — `mp_pump_state1` (`0x0800be78`) and `ao_pull_decoder` (`0x0802220c`) are called 0× (vs
-  ~10 k / ~900× for a working one), because the active-AO list the pump iterates
-  (`sm_ao_event_coalesce`, `0x0800b9f8`) is empty. So the decoder is never re-linked into the
-  active list after the first playback — consistent with a small fixed decode-buffer/AO pool
-  (≈2) exhausted or leaked once the welcome + first digit consume it. The swallow flag
-  `0x08008C91` and the audio-active bit are both clean (not stuck), and the media data is valid
-  (not a storage/DMA-resolution problem). Root not yet fixed; the missing free/unlink on
-  playback teardown is the next lead.
+- **Open bug — a media playback started from an *idle* audio chain is silent.** The real
+  variable is **idle time, not tap position or media**: a content tap within ~0–<100 M
+  instructions of the mount (or of the last audio) plays real PCM; a tap after **~100 M (~2 s) of
+  idle** is silent — the player emits `dac_flush_silence` (`0x08032eb0`) keep-alives instead of
+  decoding. It is **pacing-independent** (fast and faithful behave identically → an
+  instruction-time firmware idle timeout, not audio-timing). For the silent case the codec is
+  detected (valid OGG header) but the audio pump never runs — `mp_pump_state1` (`0x0800be78`) and
+  `ao_pull_decoder` (`0x0802220c`) fire 0× (vs ~10 k / ~900× working) because the active-AO list
+  the pump iterates (`sm_ao_event_coalesce`, `0x0800b9f8`) is empty. So **restarting the audio
+  chain from idle is broken**: the welcome (first chain start after boot) and any tap while the
+  chain is still active work, but once the voice-chain flags (`0x08008C60`) go idle the AO state
+  machine never transitions idle→playing again (no `mp_pump_state1`, `dac_flush_silence` instead).
+  The swallow flag `0x08008C91` and the audio-active bit are clean; the media data is valid (not a
+  storage/DMA-resolution issue). A second, more complex GME (WWW Bauernhof) is worse — its
+  product-mount/tap path **crashes** (jumps to a UTF-16 string mistaken for a pointer). Repro:
+  `tests/test_scripting::test_tap_after_idle_produces_audio` (xfail). Next lead: why the AO
+  idle→playing transition (chain restart) fails on a non-first start under the MMU boot.
