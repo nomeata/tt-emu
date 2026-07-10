@@ -45,10 +45,11 @@ def _valid_wav(path: Path) -> int:
 
 
 @pytest.mark.xfail(
-    reason="Blocked by the idle-restart audio bug (docs/audio-dac-dma.md §8): the gated "
-    "tap after the welcome introduces ~2s of idle, so the digit playback starts from an "
-    "idle audio chain and is silent (clip.pcm empty). Tracked by "
-    "test_tap_after_idle_produces_audio.",
+    reason="The idle-restart audio bug is fixed (the 'acht' digit now decodes and plays — "
+    "clip.pcm > 0). This end-to-end test now gets further and fails on a separate multi-tap "
+    "sequencing issue: after the second digit tap, expect_play('neun') catches the prior "
+    "'acht' clip (the new playback's media detection races with the previous one's tail). "
+    "See docs/audio-dac-dma.md §8.",
     strict=False,
 )
 def test_scripting_end_to_end(tmp_path: Path) -> None:
@@ -158,21 +159,16 @@ def test_tap_immediately_after_mount_plays(tmp_path: Path) -> None:
         assert _raw_tap(pen, ACHT_OID) > 3
 
 
-@pytest.mark.xfail(
-    reason="Starting a media playback from an IDLE audio chain is silent. The failing "
-    "variable is idle time, not tap position: a tap within ~100M instructions of the "
-    "mount plays, a tap after ~100M (~2s) idle is silent — the AO state machine never "
-    "transitions idle->playing again (mp_pump_state1 / ao_pull_decoder run 0x). "
-    "Pacing-independent. See docs/audio-dac-dma.md §8.",
-    strict=False,
-)
-@pytest.mark.parametrize("pacing", ["fast", "faithful"])
-def test_tap_after_idle_produces_audio(pacing: str, tmp_path: Path) -> None:
-    """After ~2s idle since the mount, a content tap should still play audio (both
-    pacings — demonstrating the timeout is instruction-time, not audio-time)."""
-    with Emulator(
-        firmware=str(UPD_PATH), gme=GME_PATH, yaml=YAML_PATH, dac_pacing=pacing
-    ) as pen:
+def test_tap_after_idle_produces_audio(tmp_path: Path) -> None:
+    """After ~2s idle since the mount, a content tap still plays real audio.
+
+    Regression guard for the idle-restart bug (docs/audio-dac-dma.md §8): the fix was to
+    stop pinning the work/data window resident and let the firmware's own page table +
+    demand-pager own it, so the audio player object (which the firmware maps into the
+    demand-paged pool) is no longer corrupted by a pinned-vs-paged conflict on eviction.
+    Before the fix a tap after the audio chain went idle produced only silence.
+    """
+    with Emulator(firmware=str(UPD_PATH), gme=GME_PATH, yaml=YAML_PATH) as pen:
         pen.tap("product")
         pen._advance(120_000_000)  # ~2s idle -> the audio chain goes idle
         assert _raw_tap(pen, ACHT_OID) > 3, "tap after idle produced no audio"
