@@ -33,7 +33,7 @@ import struct
 import unicorn.arm_const as ac
 from capstone import CS_ARCH_ARM, CS_MODE_ARM, CS_MODE_THUMB, Cs
 from capstone.arm_const import ARM_OP_MEM, ARM_OP_REG
-from unicorn import UC_HOOK_CODE, UC_HOOK_MEM_WRITE, UcError
+from unicorn import UC_CTL_TLB_FLUSH, UC_HOOK_CODE, UC_HOOK_MEM_WRITE, UcError
 from unicorn.arm_const import (
     UC_ARM_REG_CPSR,
     UC_ARM_REG_LR,
@@ -85,6 +85,13 @@ PAGER_FRAME_BASE = 0x0800_9000
 PAGER_SB_BASE = 0x0800_7F8C
 PAGER_EVICT_TABLE = PAGER_SB_BASE + 0x800
 PAGER_FRAME_COUNT = 37
+#: The firmware's unified-TLB invalidate leaf (``mcr p15,0,rN,c8,c7,0`` then ``mov pc,lr``).
+#: It runs it after every page-table edit (via the L2 updater 0x08001860). Unicorn's ARM926
+#: model does not act on that CP15 op, so its softmmu TLB keeps stale VA->frame translations
+#: — a later access to an evicted VA then silently hits the frame the pager has since reused,
+#: clobbering the new occupant (the media-path object → the book/2nd-GME crash). We honour the
+#: firmware's own invalidate by flushing Unicorn's TLB at this leaf.
+TLB_INVALIDATE_LEAF = 0x0800_3310
 #: The loader keeps the work/data region **resident** (identity, AP=11) and demand-pages
 #: only the code range below it. These nandboot literals bound it: the allocator's frame
 #: threshold (page-aligned) is the code/data split, and its dynamic-alloc VA pool base is
@@ -183,6 +190,10 @@ class MmuBoot:
         # only at these two PCs, so there is no per-instruction cost).
         for ret in (PABT_RET, DABT_RET):
             uc.hook_add(UC_HOOK_CODE, self._on_handler_return, begin=ret, end=ret)
+        # Honour the firmware's own TLB invalidate: flush Unicorn's stale translations when the
+        # firmware runs its CP15 TLBIALL leaf (Unicorn's ARM926 ignores the op itself).
+        uc.hook_add(UC_HOOK_CODE, self._on_tlb_invalidate,
+                    begin=TLB_INVALIDATE_LEAF, end=TLB_INVALIDATE_LEAF)
         # The machine's UC_HOOK_INTR delegates prefetch/data aborts (intno 3/4) here.
         self.m.set_abort_handler(self._on_abort)
 
@@ -341,6 +352,17 @@ class MmuBoot:
             return
         frame = PAGER_FRAME_BASE + self.uc.reg_read(ac.UC_ARM_REG_R4) * 0x1000
         self.shadow[old_va & ~0xFFF] = bytes(self.uc.mem_read(frame, 0x1000))
+
+    def _on_tlb_invalidate(self, _uc: object, _addr: int, _size: int, _ud: object) -> None:
+        """Flush Unicorn's softmmu TLB when the firmware executes its CP15 TLBIALL leaf.
+
+        The firmware invalidates the whole unified TLB after every page-table edit; Unicorn's
+        ARM926 model does not act on the ``mcr p15,c8,c7`` op, so we mirror it here to keep its
+        cached VA->frame translations coherent with the page table the firmware just changed."""
+        try:
+            self.uc._Uc__ctl_w(UC_CTL_TLB_FLUSH)
+        except (UcError, AttributeError):
+            pass
 
     def _on_frame_map(self, _uc: object, _access: int, addr: int, _size: int,
                       _value: int, _ud: object) -> None:

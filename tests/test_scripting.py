@@ -45,11 +45,13 @@ def _valid_wav(path: Path) -> int:
 
 
 @pytest.mark.xfail(
-    reason="The idle-restart audio bug is fixed (the 'acht' digit now decodes and plays — "
-    "clip.pcm > 0). This end-to-end test now gets further and fails on a separate multi-tap "
-    "sequencing issue: after the second digit tap, expect_play('neun') catches the prior "
-    "'acht' clip (the new playback's media detection races with the previous one's tail). "
-    "See docs/audio-dac-dma.md §8.",
+    reason="Hits the demand-paging heap-corruption crash shared by all three GME crash tests: "
+    "a large (~24 KB) heap-buffer memset overlaps the live audio stream object at VA "
+    "0x08149000, zeroing its logger pointer, so audio_seek_time (0x08104c28) later derefs a "
+    "null callback and the CPU sleds into unmapped low RAM (0x00010000). Root: the allocator's "
+    "demand-paged metadata is corrupted under paging pressure → overlapping allocations. "
+    "Exposed here once the stale-TLB masking was removed (mmu_boot honours the firmware's CP15 "
+    "TLB invalidate). See docs/audio-dac-dma.md §8 / mmu-path-b notes.",
     strict=False,
 )
 def test_scripting_end_to_end(tmp_path: Path) -> None:
