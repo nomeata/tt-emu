@@ -85,12 +85,24 @@ def test_scripting_end_to_end(tmp_path: Path) -> None:
         assert _valid_wav(clip_wav) > 0
 
         # The expect_play / expect assertion style: tap "9" -> the register becomes 89 and
-        # the firmware reads the number back starting with "acht" (achtundneunzig — "acht"
-        # is the first media, with "und…" following).
+        # the firmware reads the two-digit number back as the multi-part spoken form
+        # "achtundneunzig" — "acht", then "und", then "neunzig" — three distinct media in
+        # sequence (not one clip), each with real audio.
         pen.tap("neun")
-        readout = pen.expect_play("acht", timeout="20s")
+        readout = pen.expect_play("acht", timeout="20s")  # the readout opens with "acht"
         assert readout.kind == "media"
         pen.expect(pen.registers["eingabe"] == 89, "eingabe should be 89 after 8 then 9")
+        # The whole "acht-und-neunzig" sequence plays: at least three media playbacks after
+        # the readout starts, and the captured audio for them is real (non-silent) PCM.
+        pen.wait("4s")
+        readout_media = [
+            e for e in pen._audio_events
+            if e.kind == "media" and e.start_clock >= readout._start
+        ]
+        assert len(readout_media) >= 3, (
+            f"expected the multi-part 'achtundneunzig' readout, got {len(readout_media)} media"
+        )
+        assert _real_chunks(pen, 0) > 3, "the number readout should produce real audio"
 
         # A wrong expectation raises ExpectationError (with context).
         with pytest.raises(ExpectationError):
