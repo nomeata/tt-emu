@@ -55,7 +55,8 @@ async def _drive(firmware: str, game: Path, yaml: Path | None, out: Path, timeou
                 break
         else:
             print("warning: debugger view did not fully populate before timeout", file=sys.stderr)
-        await pilot.press("d")  # reveal the debugger panels
+        # Debug panels are on by default and reveal themselves once the snapshot
+        # is ready (the wait above); just let the UI settle and repaint.
         for _ in range(20):
             await pilot.pause()
         app.save_screenshot(str(out))
