@@ -156,6 +156,57 @@ def test_machine_irq_gated_by_cpsr_i() -> None:
     assert m.irqs_delivered == 0
 
 
+# --- Machine: realtime pacing ------------------------------------------------------
+
+
+def test_config_rejects_unknown_pacing() -> None:
+    with pytest.raises(ValueError):
+        MachineConfig(pacing="fast")
+
+
+def test_realtime_pacing_tracks_wall_time() -> None:
+    """Realtime chunks advance the clock by wall time at the modelled rate.
+
+    ipt=20_000 models 1M insn/s; a 100k-instruction budget is therefore
+    ~100 ms of wall time (generous upper bound for CI jitter), and the pacer
+    thread must be gone when run() returns.
+    """
+    import threading
+    import time
+
+    m = Machine(MachineConfig(instructions_per_tick=20_000, pacing="realtime"))
+    m.write_bytes(0x08000000, struct.pack("<I", 0xEAFFFFFE))  # b .
+    m.set_entry_state(0x08000000, 0x08020000, 0x13)
+    t0 = time.monotonic()
+    result = m.run(100_000)
+    elapsed = time.monotonic() - t0
+    assert result.reason == "instruction budget exhausted"
+    assert m.clock >= 100_000
+    assert 0.05 <= elapsed <= 10.0  # ~0.1 s nominal; wide bounds for slow CI
+    assert not any(t.name == "tt-emu-pacer" for t in threading.enumerate())
+    # The machine resumes: a second bounded run continues from the same state.
+    result = m.run(20_000)
+    assert m.clock >= 120_000
+
+
+def test_realtime_pacing_delivers_irqs_between_chunks() -> None:
+    """Wall-paced chunks still tick peripherals and deliver IRQs at boundaries."""
+    m = Machine(MachineConfig(instructions_per_tick=1_000, pacing="realtime"))
+
+    class AlwaysPending:
+        def irq_asserted(self) -> bool:
+            return True
+
+    m.intc = AlwaysPending()  # type: ignore[assignment]
+    m.write_bytes(IRQ_VECTOR, struct.pack("<I", 0xEAFFFFFE))  # b .
+    m.write_bytes(0x08039100, struct.pack("<I", 0xEAFFFFFE))  # main: b .
+    m.set_entry_state(0x08039100, 0x08420000, 0x13)  # SVC, IRQs on
+    m.run(2_000)  # two ticks' worth of emulated time (~40 ms wall)
+    assert m.irqs_delivered >= 1
+    assert m.pc == IRQ_VECTOR
+    assert (m.cpsr & 0x1F) == 0x12  # IRQ mode
+
+
 # --- Machine: checkpoint hooks + semihosting ---------------------------------------
 
 

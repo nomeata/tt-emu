@@ -65,6 +65,12 @@ the pen. Pass `--dac-pacing faithful` to run the audio on the pen's real timelin
 (real-time-slow playback), for testing timing-sensitive game behaviour; the captured audio
 is identical either way.
 
+`--pacing realtime` (**experimental**) runs the CPU count-free at full speed with emulated
+time locked to wall time — the pen boots in a few seconds and runs on its real timeline —
+at the cost of run-to-run reproducibility; it is still sensitive to host scheduling
+jitter. The default (`deterministic`) is exact and reproducible but roughly 10–20× slower
+than the pen.
+
 ### The GME debugger
 
 When the loaded firmware is a **recognized build** (currently the 2N "MT" `N0038MT /

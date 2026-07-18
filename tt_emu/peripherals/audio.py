@@ -204,6 +204,7 @@ class AudioDma(L2NandBuffer):
         machine = self.machine
         if machine is None:
             return
+        machine.io_touch()  # a replayed START would double-submit (realtime pacing)
         length = (value & WORDCOUNT_MASK) * 4
         dst = self._regs.get(DMA_DST, 0)
         src = self._regs.get(DMA_SRC, 0)

@@ -153,11 +153,15 @@ class OidSensor(Peripheral):
     def hold(self, oid: int) -> None:
         """Press-and-hold ``oid``: re-serve the frame after every capture (§6
         "Repeat / anti-repeat": the real sensor re-reports ~every 40 ms while
-        the pen is held on a code) until :meth:`lift` is called.
+        the pen is held on a code) until the tap latches or :meth:`lift` is
+        called.
 
         This is the reliable way to tap at standby: frames eaten by the 32-bit
         status polls (§4.2, no event posted) are simply re-served until the
-        40 ms gameplay poll (§4.1) gets one and posts event ``0x1060``.
+        40 ms gameplay poll (§4.1) gets one and posts event ``0x1060`` — at
+        which point the hold ends by itself (tap-and-lift; see
+        :meth:`_finalize_serve`). :meth:`lift` remains for withdrawing a tap
+        that never latched.
         """
         self._check_oid(oid)
         self._hold_oid = oid
@@ -363,6 +367,17 @@ class OidSensor(Peripheral):
             self.taps_served += 1
             if self._bit_count != FRAME_BITS:
                 self.gameplay_frames_served += 1
+                # A 23-bit gameplay capture posts event 0x1060 — the tap is
+                # latched, so the press-and-hold ends *here* (tap-and-lift).
+                # Drivers also lift when they observe the latch, but only at
+                # chunk granularity: when the emulation runs many capture
+                # cycles per chunk (realtime pacing, oversped clocks), a
+                # still-held frame re-serves before that lift lands and the
+                # firmware dispatches the tap twice (§6 repeat-on-hold — real,
+                # but never what the tap APIs mean). Status-poll-consumed
+                # frames (32-bit, no event) keep the hold: re-serving through
+                # them is the point of holding (§4.2).
+                self._hold_oid = None
             log.debug("OID tap served: %d (%d bits)", self._oid, self._bit_count)
 
     # --- deferred release (tap-and-lift, §6 item 5) -------------------------------------------

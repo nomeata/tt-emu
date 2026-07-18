@@ -305,6 +305,13 @@ class Emulator:
     instructions_per_tick:
         Emulation pacing (default: the session cadence, ~50 MIPS-equivalent,
         which the boot→tap→play chain needs for realistic firmware timing).
+    pacing:
+        ``"deterministic"`` (default): count-paced, bit-for-bit reproducible
+        runs — what scripted assertions want. ``"realtime"`` (experimental):
+        count-free at full speed, emulated time tracks wall time (roughly
+        10–20× faster) — but runs are no longer reproducible and the
+        event-observation helpers (``expect_play``) can race the firmware,
+        so scripted assertions should stay on the default.
     """
 
     def __init__(
@@ -316,10 +323,12 @@ class Emulator:
         yaml: str | Path | None = None,
         instructions_per_tick: int = SESSION_INSTRUCTIONS_PER_TICK,
         dac_pacing: str = "fast",
+        pacing: str = "deterministic",
     ) -> None:
         self._firmware = firmware
         self._ipt = instructions_per_tick
         self._dac_pacing = dac_pacing
+        self._pacing = pacing
 
         game_paths: list[Path] = []
         if gme is not None:
@@ -363,7 +372,11 @@ class Emulator:
     def __enter__(self) -> "Emulator":
         firmware_path = ensure_firmware(self._firmware)
         firmware = load_upd(str(firmware_path))
-        config = MachineConfig(instructions_per_tick=self._ipt, dac_pacing=self._dac_pacing)
+        config = MachineConfig(
+            instructions_per_tick=self._ipt,
+            dac_pacing=self._dac_pacing,
+            pacing=self._pacing,
+        )
         booted = build_machine(firmware, config, b_files=self._b_files or None)
         self._booted = booted
         self.machine = booted.machine

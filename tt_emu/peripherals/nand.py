@@ -215,6 +215,8 @@ class NfcController(WordRegisterPeripheral):
 
     def _execute(self) -> None:
         """Run the staged micro-op list: GO → walk until the first LAST word."""
+        if self.machine is not None:
+            self.machine.io_touch()  # GO advances the op state machine (realtime pacing)
         self.l2_level = 0  # cleared by the next GO (§10)
         self._stream = None
         offset = NFC_CMD_LIST
@@ -455,6 +457,8 @@ class L2NandBuffer(WordRegisterPeripheral):
 
     def read_reg(self, offset: int) -> int:
         if offset == L2_BUF_STATUS:
+            if self.machine is not None:
+                self.machine.io_touch()  # refill side effect: read-sensitive (realtime pacing)
             self._nfc.on_level_poll()  # streaming refill of >512-B records
             return (self._nfc.l2_level & 0xF) << 16  # bits[19:16] = fill in 64-B chunks
         if offset == DMA_WORDCOUNT:
@@ -469,4 +473,6 @@ class L2NandBuffer(WordRegisterPeripheral):
             buf = (value >> 8) & 7
             op = (value >> 12) & 0xF
             if buf == 4:
+                if self.machine is not None:
+                    self.machine.io_touch()  # strobes advance the drain (realtime pacing)
                 self._nfc.l2_strobe(op)

@@ -446,10 +446,12 @@ class EmulatorSession:
         instructions_per_tick: int = SESSION_INSTRUCTIONS_PER_TICK,
         max_instructions: int = 1_000_000_000_000,
         dac_pacing: str = "fast",
+        pacing: str = "deterministic",
     ) -> None:
         self.firmware_path = str(firmware_path)
         self._ipt = instructions_per_tick
         self._dac_pacing = dac_pacing
+        self._pacing = pacing
         self._max_instructions = max_instructions
         self._b_files: dict[str, bytes] = {}
         self.product_code: int | None = None
@@ -571,17 +573,21 @@ class EmulatorSession:
         self.post_event(f"loading firmware {Path(self.firmware_path).name} …")
         try:
             firmware = load_upd(self.firmware_path)
-            # chunk_instructions is pinned to the historical 2000: the
-            # interactive tap injection here (unlike runner._TapSession) is
-            # not gated on the book-entry settle window, and coarser chunks
-            # shift a held tap's first post-book-entry capture into the
-            # welcome-jingle window where the firmware discards it.
+            # In deterministic (count-paced) mode chunk_instructions is pinned
+            # to the historical 2000: coarser deterministic chunks shift a held
+            # tap's first post-book-entry capture into the welcome-jingle window
+            # where the firmware discards it. In realtime mode chunks are
+            # wall-interval-paced (the default effective_chunk = 2 ms) and the
+            # shared book_ready_for_tap gate spaces the taps.
             booted = build_machine(
                 firmware,
                 MachineConfig(
                     instructions_per_tick=self._ipt,
-                    chunk_instructions=2_000,
+                    chunk_instructions=(
+                        2_000 if self._pacing == "deterministic" else None
+                    ),
                     dac_pacing=self._dac_pacing,
+                    pacing=self._pacing,
                 ),
                 b_files=self._b_files or None,
             )
@@ -1365,6 +1371,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="emulated instructions per 20 ms tick (default: %(default)s)",
     )
     parser.add_argument(
+        "--pacing", choices=("deterministic", "realtime"), default="deterministic",
+        help="deterministic (default): count-paced, reproducible, but roughly "
+        "10-20x slower than the pen; realtime (EXPERIMENTAL): run count-free "
+        "at full speed with emulated time tracking wall time — the pen runs "
+        "on its real timeline (boots in seconds, audio at real pace), but is "
+        "sensitive to host scheduling jitter and may still misbehave",
+    )
+    parser.add_argument(
         "--no-audio", action="store_true", help="disable the sounddevice output stream"
     )
     parser.add_argument(
@@ -1390,6 +1404,7 @@ def main(argv: list[str] | None = None) -> int:
         yaml_path=args.yaml,
         instructions_per_tick=args.instructions_per_tick,
         dac_pacing=args.dac_pacing,
+        pacing=args.pacing,
     )
     audio = (
         None

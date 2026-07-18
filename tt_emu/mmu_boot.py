@@ -359,10 +359,12 @@ class MmuBoot:
         eviction record, so it needs no ownership tracking and has no capture-timing gap.
         """
         old_va = self.uc.reg_read(ac.UC_ARM_REG_R5)
-        if old_va == 0:
-            return
-        frame = PAGER_FRAME_BASE + self.uc.reg_read(ac.UC_ARM_REG_R4) * 0x1000
-        self.shadow[old_va & ~0xFFF] = bytes(self.uc.mem_read(frame, 0x1000))
+        if old_va != 0:
+            frame = PAGER_FRAME_BASE + self.uc.reg_read(ac.UC_ARM_REG_R4) * 0x1000
+            self.shadow[old_va & ~0xFFF] = bytes(self.uc.mem_read(frame, 0x1000))
+        # Stop-safe pace point: re-firing on resume just re-snapshots the same
+        # frame content (idempotent).
+        self.m.maybe_pace_stop()
 
     def _on_tlb_invalidate(self, _uc: object, _addr: int, _size: int, _ud: object) -> None:
         """Flush Unicorn's softmmu TLB when the firmware executes its CP15 TLBIALL leaf.
@@ -374,6 +376,10 @@ class MmuBoot:
             self.uc._Uc__ctl_w(UC_CTL_TLB_FLUSH)
         except (UcError, AttributeError):
             pass
+        # Stop-safe pace point: a re-fired flush on resume is idempotent, and
+        # the leaf runs after every page-table edit — dense coverage of the
+        # demand-paging-heavy phases (boot, first-touch decode).
+        self.m.maybe_pace_stop()
 
     def _on_frame_map(self, _uc: object, _access: int, addr: int, _size: int,
                       _value: int, _ud: object) -> None:
