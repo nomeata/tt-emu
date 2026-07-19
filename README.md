@@ -58,18 +58,13 @@ tt-emu --headless --gme game.gme --tap product --tap 4716 --wav out.wav
 ```
 
 In the TUI, tap the game's **product code** first (the game mounts), then any content
-code. Audio plays at 22050 Hz. By default the emulated DAC drains as fast as the emulator
-produces samples, so each sound is captured quickly, buffered, and played complete —
-keeping up with real time even though the emulator itself runs several times slower than
-the pen. Pass `--dac-pacing faithful` to run the audio on the pen's real timeline instead
-(real-time-slow playback), for testing timing-sensitive game behaviour; the captured audio
-is identical either way.
-
-`--pacing realtime` (**experimental**) runs the CPU count-free at full speed with emulated
-time locked to wall time — the pen boots in a few seconds and runs on its real timeline —
-at the cost of run-to-run reproducibility; it is still sensitive to host scheduling
-jitter. The default (`deterministic`) is exact and reproducible but roughly 10–20× slower
-than the pen.
+code. Audio plays at 22050 Hz. The TUI runs with **realtime pacing** by default: the pen
+boots in a few seconds and runs on its real timeline, with each sound produced ahead of
+real time and played from a small buffered lead. Pass `--pacing deterministic` for
+count-paced, bit-for-bit reproducible runs instead (roughly 10–20× slower than the pen —
+the right mode when you need to reproduce an exact run). `--dac-pacing faithful`
+additionally paces the emulated DAC to the pen's real audio timeline, for testing
+timing-sensitive game behaviour; the captured audio is identical either way.
 
 ### The GME debugger
 

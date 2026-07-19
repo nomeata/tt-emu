@@ -102,9 +102,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--pacing", choices=("deterministic", "realtime"), default="deterministic",
         help="deterministic (default): count-paced, bit-for-bit reproducible "
-        "runs — right for scripted tests; realtime (EXPERIMENTAL): count-free "
-        "at full speed, emulated time tracks wall time (roughly 10-20x "
-        "faster, not reproducible, jitter-sensitive)",
+        "runs — right for scripted/captured sessions; realtime: emulated "
+        "time tracks wall time as in the interactive TUI (faster, not "
+        "reproducible)",
     )
     parser.add_argument(
         "-v", "--verbose", action="count", default=0, help="-v: info, -vv: debug"

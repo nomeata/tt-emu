@@ -33,7 +33,11 @@ _DEFAULT_OUT = _ROOT / "docs" / "tui-screenshot.svg"
 
 
 async def _drive(firmware: str, game: Path, yaml: Path | None, out: Path, timeout: float) -> None:
-    session = EmulatorSession(firmware, [game], yaml_path=yaml)
+    # Deterministic pacing: the Textual test pilot's message-pump loop holds
+    # the GIL aggressively, which starves realtime pacing's wall-locked
+    # phases; count-paced chunks are immune (and reproducible screenshots
+    # are a feature here anyway).
+    session = EmulatorSession(firmware, [game], yaml_path=yaml, pacing="deterministic")
     app = TtEmuApp(session, audio=None)
     async with app.run_test(size=(120, 40)) as pilot:
         session.start()

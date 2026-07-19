@@ -248,7 +248,9 @@ def test_app_runs_without_audio_output() -> None:
     reason="firmware .upd / taschenrechner.gme not available",
 )
 def test_emulator_session_thread_boots_and_stops() -> None:
-    session = EmulatorSession(UPD_PATH, [GME_PATH])
+    # Deterministic pacing: tests want reproducible runs (realtime is the
+    # interactive default).
+    session = EmulatorSession(UPD_PATH, [GME_PATH], pacing="deterministic")
     assert session.product_code == 42
     assert session.content_oids[:1] == [4716]
     session.tap(4716)  # queued commands are safe before the thread runs

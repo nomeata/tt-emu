@@ -522,7 +522,7 @@ class EmulatorSession:
         instructions_per_tick: int = SESSION_INSTRUCTIONS_PER_TICK,
         max_instructions: int = 1_000_000_000_000,
         dac_pacing: str = "fast",
-        pacing: str = "deterministic",
+        pacing: str = "realtime",
     ) -> None:
         self.firmware_path = str(firmware_path)
         self._ipt = instructions_per_tick
@@ -1448,12 +1448,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="emulated instructions per 20 ms tick (default: %(default)s)",
     )
     parser.add_argument(
-        "--pacing", choices=("deterministic", "realtime"), default="deterministic",
-        help="deterministic (default): count-paced, reproducible, but roughly "
-        "10-20x slower than the pen; realtime (EXPERIMENTAL): run count-free "
-        "at full speed with emulated time tracking wall time — the pen runs "
-        "on its real timeline (boots in seconds, audio at real pace), but is "
-        "sensitive to host scheduling jitter and may still misbehave",
+        "--pacing", choices=("realtime", "deterministic"), default="realtime",
+        help="realtime (default): the pen runs on its real timeline — boots "
+        "in seconds, sounds play smoothly from a small buffered lead; "
+        "deterministic: count-paced and bit-for-bit reproducible, but "
+        "roughly 10-20x slower than the pen (the right mode for debugging "
+        "a repeatable run)",
     )
     parser.add_argument(
         "--no-audio", action="store_true", help="disable the sounddevice output stream"

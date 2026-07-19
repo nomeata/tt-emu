@@ -307,11 +307,11 @@ class Emulator:
         which the boot→tap→play chain needs for realistic firmware timing).
     pacing:
         ``"deterministic"`` (default): count-paced, bit-for-bit reproducible
-        runs — what scripted assertions want. ``"realtime"`` (experimental):
-        count-free at full speed, emulated time tracks wall time (roughly
-        10–20× faster) — but runs are no longer reproducible and the
-        event-observation helpers (``expect_play``) can race the firmware,
-        so scripted assertions should stay on the default.
+        runs — what scripted assertions want. ``"realtime"`` (the
+        interactive TUI's default): emulated time tracks wall time — but
+        runs are no longer reproducible and the event-observation helpers
+        (``expect_play``) can race the firmware, so scripted assertions
+        should stay on the default.
     """
 
     def __init__(

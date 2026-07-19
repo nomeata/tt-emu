@@ -368,7 +368,11 @@ def test_live_debugger_boot_book_tap() -> None:
     Everything asserted here is read hook-free from emulator RAM (plus the
     documented read-only PC watchpoints for the executed-action trace).
     """
-    session = EmulatorSession(UPD_PATH, [GME_PATH], yaml_path=YAML_PATH)
+    # Deterministic pacing: tests want reproducible runs (realtime is the
+    # interactive default).
+    session = EmulatorSession(
+        UPD_PATH, [GME_PATH], yaml_path=YAML_PATH, pacing="deterministic"
+    )
     assert session.symbols is not None and session.symbols.product_id == 42
     session.start()
 
