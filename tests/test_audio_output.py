@@ -66,10 +66,18 @@ class _FakeStream:
         self.written += data
 
 
+def _output_no_prebuffer(ring: AudioRing) -> AudioOutput:
+    """An AudioOutput with the prebuffer lead disabled: any buffered byte plays
+    on the next block (the pre-prebuffer behaviour the block tests assert)."""
+    out = AudioOutput(ring)
+    out.prebuffer_seconds = 0.0
+    return out
+
+
 def test_write_block_plays_ring_data() -> None:
     """A block of real PCM is written whole; state=playing, meter + counter set."""
     ring = AudioRing()
-    out = AudioOutput(ring)
+    out = _output_no_prebuffer(ring)
     sound = _pcm(out.BLOCK_FRAMES)  # exactly one block
     ring.push(sound)
     stream = _FakeStream()
@@ -84,7 +92,7 @@ def test_write_block_plays_ring_data() -> None:
 def test_write_block_writes_silence_when_ring_empty() -> None:
     """An empty ring still yields a full block — of silence; idle, nothing played."""
     ring = AudioRing()
-    out = AudioOutput(ring)
+    out = _output_no_prebuffer(ring)
     stream = _FakeStream()
 
     out._write_block(stream)
@@ -98,7 +106,7 @@ def test_write_block_partial_is_padded_to_a_full_block() -> None:
     """Less than a block buffered: the real bytes then silence, always a full
     block (so the device never underruns); only real bytes count as played."""
     ring = AudioRing()
-    out = AudioOutput(ring)
+    out = _output_no_prebuffer(ring)
     half = _pcm(out.BLOCK_FRAMES // 2)
     ring.push(half)
     stream = _FakeStream()
@@ -109,6 +117,62 @@ def test_write_block_partial_is_padded_to_a_full_block() -> None:
     assert bytes(stream.written[len(half) :]) == b"\x00" * (out._block_bytes - len(half))
     assert out.state == "playing"
     assert out.played_bytes == len(half)
+
+
+def test_prebuffer_holds_until_threshold_then_plays() -> None:
+    """Below the lead threshold the writer plays silence (state=buffering) and
+    leaves the ring untouched; crossing the threshold starts playback."""
+    ring = AudioRing()
+    out = AudioOutput(ring)  # default lead (0.25 s)
+    stream = _FakeStream()
+    short = _pcm(out.BLOCK_FRAMES)  # ~46 ms — well below the lead
+
+    ring.push(short)
+    out._write_block(stream)
+    assert out.state == "buffering"
+    assert out.played_bytes == 0
+    assert ring.fill_bytes == len(short)  # untouched while the lead builds
+    assert bytes(stream.written) == b"\x00" * out._block_bytes
+
+    lead = _pcm(int(out.prebuffer_seconds * out.rate))
+    ring.push(lead)  # threshold reached
+    out._write_block(stream)
+    assert out.state == "playing"
+    assert out.played_bytes == out._block_bytes
+
+
+def test_prebuffer_max_wait_plays_short_sounds() -> None:
+    """A sound shorter than the lead still plays once its data is old enough."""
+    ring = AudioRing()
+    out = AudioOutput(ring)
+    out.prebuffer_max_wait = 0.0  # "old enough" immediately, keeps the test fast
+    stream = _FakeStream()
+    short = _pcm(out.BLOCK_FRAMES // 2)
+
+    ring.push(short)
+    out._write_block(stream)  # below threshold, but max-wait elapsed -> plays
+    assert out.state == "playing"
+    assert out.played_bytes == len(short)
+
+
+def test_prebuffer_rearms_after_running_dry() -> None:
+    """Running dry re-arms the lead: the next sound buffers before resuming."""
+    ring = AudioRing()
+    out = AudioOutput(ring)
+    out.prebuffer_seconds = 0.0  # start immediately...
+    stream = _FakeStream()
+
+    ring.push(_pcm(out.BLOCK_FRAMES))
+    out._write_block(stream)
+    assert out.state == "playing"
+    out._write_block(stream)  # ring dry -> idle + prebuffer re-armed
+    assert out.state == "idle"
+
+    out.prebuffer_seconds = 10.0  # ...but the *next* sound needs the lead again
+    ring.push(_pcm(out.BLOCK_FRAMES))
+    out._write_block(stream)
+    assert out.state == "buffering"
+    assert ring.fill_bytes > 0  # still held back
 
 
 def test_backlog_seconds_tracks_ring_fill() -> None:

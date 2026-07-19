@@ -260,12 +260,21 @@ class AudioOutput:
     A single writer thread pulls fixed-size blocks from the :class:`AudioRing`
     and blocking-writes them to a persistent ``RawOutputStream`` — real PCM
     when the ring has data, silence when it's empty — so the device is always
-    fed and never underruns. With fast DAC pacing the firmware produces audio
-    faster than real time, so the ring stays ahead and every sound it plays
-    (jingles, prompts, content) reaches the speaker in order, at real-time
-    pitch, with no boundary guessing and no per-sound stream churn.
-    ``stream.write`` blocks the writer thread only (``Pa_WriteStream`` releases
-    the GIL), so the Textual UI and the emulation keep running.
+    fed and never underruns. ``stream.write`` blocks the writer thread only
+    (``Pa_WriteStream`` releases the GIL), so the Textual UI and the emulation
+    keep running.
+
+    **Prebuffering:** playback of a sound starts (and, after the ring ran dry,
+    resumes) only once :attr:`prebuffer_seconds` of PCM is buffered — or once
+    the buffered data is :attr:`prebuffer_max_wait` old, which bounds the
+    added latency and lets sounds shorter than the threshold play at all. The
+    lead absorbs production jitter: with realtime pacing the firmware
+    produces audio at exactly 1.00x wall time, so an unbuffered stream turns
+    every pacing hiccup into an audible gap mid-sound; with deterministic
+    pacing production is decode-bound and can transiently fall behind
+    real-time drain. Running dry re-arms the prebuffer, so a starved stream
+    pauses coherently and resumes with a fresh lead instead of sputtering
+    block by block.
 
     ``start()`` never raises: on any failure (no PortAudio library, no output
     device, …) it records the error and the TUI shows "audio unavailable".
@@ -274,6 +283,11 @@ class AudioOutput:
     #: Writer block: ~46 ms of 22050 Hz stereo — small enough that the meter and
     #: shutdown stay responsive, large enough that the blocking write dominates.
     BLOCK_FRAMES = 1024
+    #: Default playback lead (see class docstring): latency traded for
+    #: jitter-immune playback.
+    PREBUFFER_SECONDS = 0.25
+    #: Play buffered-but-below-threshold data anyway once it is this old.
+    PREBUFFER_MAX_WAIT_SECONDS = 0.30
 
     def __init__(
         self,
@@ -285,9 +299,13 @@ class AudioOutput:
         self.available = False
         self.error: str | None = None
         self.level = 0.0  #: peak of the block currently playing, 0..1
-        self.state = "off"  #: off / idle / playing
+        self.state = "off"  #: off / idle / buffering / playing
         self.played_bytes = 0  #: real (non-silence) PCM written to the device
+        self.prebuffer_seconds = self.PREBUFFER_SECONDS
+        self.prebuffer_max_wait = self.PREBUFFER_MAX_WAIT_SECONDS
         self._block_bytes = self.BLOCK_FRAMES * FRAME_BYTES
+        self._prebuffering = True  #: waiting for the lead before (re)starting
+        self._data_since: float | None = None  #: when the ring went non-empty
         self._stop = threading.Event()
         self._writer: threading.Thread | None = None
         #: Test seam: builds a fresh output stream. ``start()`` points it at
@@ -365,20 +383,44 @@ class AudioOutput:
             except Exception:  # noqa: BLE001
                 pass
 
+    def _prebuffer_ready(self) -> bool:
+        """Enough lead buffered (or waited long enough) to (re)start playback."""
+        fill = self.ring.fill_bytes
+        if not fill:
+            self._data_since = None
+            return False
+        now = time.monotonic()
+        if self._data_since is None:
+            self._data_since = now
+        return (
+            fill >= int(self.prebuffer_seconds * self.rate) * FRAME_BYTES
+            or now - self._data_since >= self.prebuffer_max_wait
+        )
+
     def _write_block(self, stream: object) -> None:
         """Pull one block from the ring and play it (or silence).
 
         Split out from :meth:`_run` so the pull/meter logic is unit-testable
         with a stub stream. ``stream.write`` blocks until the block is consumed,
         pacing the writer to real time; a full block is always supplied, so the
-        device never underruns.
+        device never underruns. While the prebuffer lead accumulates (see the
+        class docstring) the ring is left untouched and silence is played;
+        running dry re-arms the prebuffer for the next sound.
         """
+        if self._prebuffering and not self._prebuffer_ready():
+            self.state = "buffering" if self.ring.fill_bytes else "idle"
+            self.level = 0.0
+            stream.write(b"\x00" * self._block_bytes)  # type: ignore[attr-defined]
+            return
         data, got = self.ring.pull(self._block_bytes)
         if got:
+            self._prebuffering = False
             self.state = "playing"
             self.level = _peak_level(data[:got])
             self.played_bytes += got
         else:
+            self._prebuffering = True  # ran dry: rebuild the lead before resuming
+            self._data_since = None
             self.state = "idle"
             self.level = 0.0
         stream.write(data)  # type: ignore[attr-defined]  # blocks; releases the GIL
