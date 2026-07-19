@@ -136,6 +136,14 @@ _PACE_COUNT_CHUNK = 10_000
 #: probes) run within this window and need deterministic clock-vs-execution
 #: proportions (100 ticks = 2 emulated seconds; book mode is reached later).
 _PACE_WARMUP_TICKS = 100
+#: Realtime pacing: count-free chunks advance the clock at this multiple of
+#: wall time. The firmware schedules its audio decode by its own timer tick,
+#: so PCM production tracks the emulated clock — at exactly 1.0x, any count
+#: interlude leaves production a few percent behind the speaker's fixed
+#: drain and every sound eventually stutters. A slight overdrive gives
+#: production headroom; it is far below the guest's actual count-free speed
+#: (~10x wall), and a sound's lead is bounded by its own length.
+_PACE_FREE_OVERDRIVE = 1.1
 
 
 @dataclass
@@ -829,7 +837,8 @@ class Machine:
                 #   modelled rate — wall time is the *smaller* advance there,
                 #   which is what locks busy phases to real time.
                 if count_free:
-                    self.clock += min(int(elapsed * rate), rate)
+                    self.clock += min(
+                        int(elapsed * rate * _PACE_FREE_OVERDRIVE), rate)
                 else:
                     self.clock += count_size  # ended early by a serve: §"counting
                     # the full chunk is acceptable" (same as deterministic mode)
@@ -837,7 +846,6 @@ class Machine:
                 served = self._pace_serves != serves_before
                 served_prompt = (
                     served
-                    and elapsed <= interval * 4
                     # Warm-up: the first emulated seconds run count-paced
                     # regardless — boot's calibrated self-tests (battery
                     # sampling, clock probes, §5.4) must see deterministic
