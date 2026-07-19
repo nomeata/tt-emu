@@ -175,6 +175,43 @@ def test_prebuffer_rearms_after_running_dry() -> None:
     assert ring.fill_bytes > 0  # still held back
 
 
+def test_prebuffer_grows_after_midsound_underrun() -> None:
+    """Data resuming right after a dry-out = an underrun: the lead ratchets up."""
+    ring = AudioRing()
+    out = AudioOutput(ring)
+    stream = _FakeStream()
+    lead0 = out.prebuffer_seconds
+
+    ring.push(_pcm(int(out.prebuffer_seconds * out.rate) + out.BLOCK_FRAMES))
+    out._write_block(stream)
+    assert out.state == "playing"
+    while out.state == "playing":  # drain to the underrun
+        out._write_block(stream)
+    ring.push(_pcm(out.BLOCK_FRAMES))  # production resumes immediately
+    out._write_block(stream)
+    assert out.prebuffer_seconds > lead0  # the lead grew
+    assert out.prebuffer_seconds <= out.PREBUFFER_MAX_SECONDS
+
+
+def test_prebuffer_does_not_grow_after_a_sound_ends() -> None:
+    """A ring that stayed dry past the resume window was a sound ending, not
+    an underrun — the lead must NOT grow (keeps sound starts snappy)."""
+    ring = AudioRing()
+    out = AudioOutput(ring)
+    stream = _FakeStream()
+    lead0 = out.prebuffer_seconds
+
+    ring.push(_pcm(int(out.prebuffer_seconds * out.rate) + out.BLOCK_FRAMES))
+    out._write_block(stream)
+    while out.state == "playing":
+        out._write_block(stream)
+    # The next sound arrives long after the dry-out.
+    out._dry_since = out._dry_since - (out.UNDERRUN_RESUME_SECONDS + 1.0)
+    ring.push(_pcm(out.BLOCK_FRAMES))
+    out._write_block(stream)
+    assert out.prebuffer_seconds == lead0
+
+
 def test_backlog_seconds_tracks_ring_fill() -> None:
     """The panel's buffered/latency figure is just the ring's fill in seconds."""
     ring = AudioRing()

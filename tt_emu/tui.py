@@ -292,6 +292,15 @@ class AudioOutput:
     PREBUFFER_SECONDS = 0.25
     #: Play buffered-but-below-threshold data anyway once it is this old.
     PREBUFFER_MAX_WAIT_SECONDS = 0.30
+    #: Adaptive lead: a mid-sound underrun (production resumed within
+    #: :data:`UNDERRUN_RESUME_SECONDS` of running dry — a sound that had
+    #: merely ended stays dry) means the lead did not cover this host's
+    #: production stalls; grow it by this factor, up to the cap. Realtime
+    #: pacing produces audio in bursts (count-paced firmware phases produce
+    #: nearly nothing), so the needed lead is host-dependent.
+    PREBUFFER_GROWTH = 1.6
+    PREBUFFER_MAX_SECONDS = 1.5
+    UNDERRUN_RESUME_SECONDS = 1.0
 
     def __init__(
         self,
@@ -310,6 +319,7 @@ class AudioOutput:
         self._block_bytes = self.BLOCK_FRAMES * FRAME_BYTES
         self._prebuffering = True  #: waiting for the lead before (re)starting
         self._data_since: float | None = None  #: when the ring went non-empty
+        self._dry_since: float | None = None  #: when playback last ran dry
         self._stop = threading.Event()
         self._writer: threading.Thread | None = None
         #: Test seam: builds a fresh output stream. ``start()`` points it at
@@ -396,6 +406,21 @@ class AudioOutput:
         now = time.monotonic()
         if self._data_since is None:
             self._data_since = now
+            if (
+                self._dry_since is not None
+                and self._data_since - self._dry_since < self.UNDERRUN_RESUME_SECONDS
+            ):
+                # Production resumed right after we ran dry: that was a
+                # mid-sound underrun, not a sound ending — this host's
+                # production stalls outlast the current lead. Deepen it
+                # (session-scoped ratchet; latency is the price of smooth).
+                self.prebuffer_seconds = min(
+                    self.prebuffer_seconds * self.PREBUFFER_GROWTH,
+                    self.PREBUFFER_MAX_SECONDS,
+                )
+                self.prebuffer_max_wait = max(
+                    self.prebuffer_max_wait, self.prebuffer_seconds * 1.2
+                )
         return (
             fill >= int(self.prebuffer_seconds * self.rate) * FRAME_BYTES
             or now - self._data_since >= self.prebuffer_max_wait
@@ -423,6 +448,11 @@ class AudioOutput:
             self.level = _peak_level(data[:got])
             self.played_bytes += got
         else:
+            if not self._prebuffering:
+                # Transition playing→dry (not repeated idle blocks): the
+                # timestamp that distinguishes a mid-sound underrun from a
+                # sound simply ending (see _prebuffer_ready).
+                self._dry_since = time.monotonic()
             self._prebuffering = True  # ran dry: rebuild the lead before resuming
             self._data_since = None
             self.state = "idle"
