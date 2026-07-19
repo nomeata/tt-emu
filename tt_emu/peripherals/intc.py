@@ -134,6 +134,16 @@ class IntcTimer(WordRegisterPeripheral):
         return (self.base + TIMER1_CTRL, self.base + TIMER_STAT_CTRL,
                 self.base + INT_PENDING)
 
+    def attach(self, machine: "Machine") -> None:  # type: ignore[name-defined]  # noqa: F821
+        super().attach(machine)
+        # The firmware's idle wait loop polls the timer-latch status —
+        # reading it is pure (the latch clears on the TIMER1_CTRL ACK write,
+        # never on read), so it is the natural realtime pace-serve point for
+        # idle phases: the pen waits for a tick exactly where we end the
+        # chunk that delivers it (no-op in deterministic mode).
+        machine.add_pace_serve_mmio(self.base + TIMER_STAT_CTRL)
+        machine.add_pace_serve_mmio(self.base + INT_PENDING)
+
     def seed_ram(self, poke: Callable[[int, int], None]) -> None:
         poke(self.base + INT_ENABLE, self._regs.get(INT_ENABLE, 0))
 
