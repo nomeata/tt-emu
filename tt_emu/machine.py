@@ -425,18 +425,17 @@ class Machine:
         raw value is the read-back for storage registers); peripherals whose
         read value differs keep a read hook, so what lands here is moot for them.
 
-        An **IRQ-deferring** pace point — this page's traffic (the OID
-        bit-bang) is the only Python-visible activity of the firmware's idle
-        and tap-capture phases, which must run count-free or they crawl at
-        the Python-callback rate. The model replay of a rolled-back store is
-        idempotent (the core-page models are edge/transition-triggered), but
-        an IRQ delivered at the boundary would run an ISR between a
-        read-modify-write's load and its re-executed store, whose stale value
-        then clobbers the ISR's update — observed twice, as the firmware's
-        ``INT_ENABLE`` restore and its ``TIMER1_CTRL`` reprogramming undoing
-        ISR state, wedging all interrupt delivery mid-jingle. So the serve
-        raises ``_pace_skip_irq``, and the run loop lets the store re-execute
-        and delivers the IRQ at the end of a tiny follow-up count chunk.
+        NEVER a pace point. A stop from inside a memory-write hook rewinds
+        the CPU to the start of the translation block — several instructions
+        before the store — while the store's memory effect PERSISTS. The
+        resumed block then re-executes from the top, and any earlier load of
+        the stored location re-reads the store's own committed value: rolled
+        back code reading its own future. Measured against the firmware's
+        interrupt-mask helper (``LDR old←EN; STR 0→EN; save old``): the serve
+        on the STR resumed at the LDR, which re-read EN as 0, so the saved
+        "old" — and every later restore — became 0, permanently masking all
+        interrupts. No IRQ interleaving involved; the corruption is purely
+        mechanical, so no deferral scheme can fix it.
         """
         offset = addr - MMIO_BASE
         entry = self._mmio_cache.get(offset)
@@ -447,9 +446,6 @@ class Machine:
             self._trace(addr, size, value, periph, is_write=True)
         if write is not None:
             write(rel + offset, size, value)
-        if self._pace_due:
-            self._pace_skip_irq = True  # rewound-store boundary: defer the IRQ
-            self.maybe_pace_stop()
 
     def _core_read_hook(self, uc: Uc, _access: int, addr: int, size: int,
                         _value: int, _ud: object) -> None:
@@ -761,29 +757,37 @@ class Machine:
         pacer_stop = threading.Event()
 
         def pace() -> None:
+            # The pacer is the only ender of a count-free chunk in a phase
+            # that stopped producing serves: if this thread dies, such a
+            # chunk runs forever and the machine freezes (observed via a
+            # single swallowed exception). Never let one iteration's failure
+            # kill the loop.
             unserved = 0.0
             while not pacer_stop.wait(interval):
-                if not self._pace_due:
-                    # Ask for a chunk end. In count-free chunks a stop-safe
-                    # callback serves it; count-paced chunks end by themselves
-                    # (the run loop clears the flag either way).
-                    self._pace_due = True
-                    unserved = 0.0
-                else:
-                    # Unserved: the phase stopped producing serves (typically
-                    # a busy→idle transition wedging a count-free chunk).
-                    # Break it with the async stop, flagging the boundary so
-                    # the run loop defers its IRQ delivery (_pace_skip_irq):
-                    # a rolled-back store then re-executes before any ISR can
-                    # interleave, which removes the lost-update hazard — and
-                    # a serve-less phase has no replay-sensitive I/O in
-                    # flight to be replayed.
-                    unserved += interval
-                    if unserved >= _PACE_UNSERVED_STOP_SECONDS:
+                try:
+                    if not self._pace_due:
+                        # Ask for a chunk end. In count-free chunks a
+                        # stop-safe callback serves it; count-paced chunks
+                        # end by themselves (the run loop clears the flag
+                        # either way).
+                        self._pace_due = True
                         unserved = 0.0
-                        self._pace_due = False
-                        self._pace_skip_irq = True
-                        uc.emu_stop()
+                    else:
+                        # Unserved: the phase stopped producing serves
+                        # (typically a busy→idle transition wedging a
+                        # count-free chunk). Break it with the async stop —
+                        # cross-thread stops land on translation-block
+                        # boundaries (consistent state), and a serve-less
+                        # phase has no MMIO callbacks in flight to replay —
+                        # deferring the boundary's IRQ to the next count end.
+                        unserved += interval
+                        if unserved >= _PACE_UNSERVED_STOP_SECONDS:
+                            unserved = 0.0
+                            self._pace_due = False
+                            self._pace_skip_irq = True
+                            uc.emu_stop()
+                except Exception:  # noqa: BLE001 — pacer must survive anything
+                    log.exception("realtime pacer: iteration failed (continuing)")
 
         pacer = threading.Thread(target=pace, name="tt-emu-pacer", daemon=True)
         pacer.start()
