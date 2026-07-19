@@ -131,13 +131,6 @@ _PACE_UNSERVED_STOP_SECONDS = 0.06
 #: deterministic chunk: IRQs deliver only at chunk ends, and serve-sparse
 #: phases can run slowly — a small count keeps ticks and taps responsive).
 _PACE_COUNT_CHUNK = 10_000
-#: Realtime pacing: instruction count of the tiny chunk run after an
-#: IRQ-deferred boundary (a store-context serve or the pacer's fallback).
-#: It re-executes the possibly rolled-back store plus a few hundred
-#: instructions and ends on a precise count boundary, where the deferred IRQ
-#: is delivered on clean architectural ground. Serving is inhibited while it
-#: runs, or the next store-context serve would defer the IRQ again, forever.
-_PACE_DELIVER_COUNT = 500
 #: Realtime pacing: emulated ticks of count-paced warm-up before count-free
 #: chunks are allowed — boot's calibrated self-tests (battery sampling, clock
 #: probes) run within this window and need deterministic clock-vs-execution
@@ -291,9 +284,6 @@ class Machine:
         #: model/RAM reconverge; the run loop delivers the IRQ at the end of
         #: the tiny follow-up count chunk instead.
         self._pace_skip_irq = False
-        #: Serving is inhibited while the tiny IRQ-delivery chunk runs (see
-        #: :data:`_PACE_DELIVER_COUNT`).
-        self._pace_inhibit = False
         #: MMIO offsets (MMIO_BASE-relative) whose *reads* are declared pure
         #: and may serve a pace stop from the read callback
         #: (:meth:`add_pace_serve_mmio`).
@@ -457,8 +447,8 @@ class Machine:
             self._trace(addr, size, value, periph, is_write=True)
         if write is not None:
             write(rel + offset, size, value)
-        if self._pace_due and not self._pace_inhibit:
-            self._pace_skip_irq = True  # let the store re-execute before any ISR
+        if self._pace_due:
+            self._pace_skip_irq = True  # rewound-store boundary: defer the IRQ
             self.maybe_pace_stop()
 
     def _core_read_hook(self, uc: Uc, _access: int, addr: int, size: int,
@@ -541,10 +531,9 @@ class Machine:
         stack-popping restore) or from MMIO callbacks of registers with
         read side effects (mid-instruction, the access would replay — see
         :meth:`add_pace_serve_mmio` for the declared-pure exception).
-        No-op unless a pace stop is due (and serving is not inhibited by an
-        in-flight IRQ-delivery chunk).
+        No-op unless a pace stop is due.
         """
-        if self._pace_due and not self._pace_inhibit:
+        if self._pace_due:
             self._pace_due = False
             self._pace_serves += 1
             self.uc.emu_stop()
@@ -804,8 +793,7 @@ class Machine:
         # a small count keeps ticks and tap handling responsive even when
         # the guest's effective speed is low.
         count_size = min(self.config.effective_chunk, _PACE_COUNT_CHUNK)
-        mode = "count"  # "count" | "free" | "deliver" (the tiny IRQ chunk)
-        resume_free = False  # mode to resume after a delivery chunk
+        count_free = False
         last = time.monotonic()
         try:
             while self._stop_reason is None and self.clock < budget_end:
@@ -814,16 +802,11 @@ class Machine:
                     pc |= 1  # resume in Thumb state
                 self._fault = None
                 serves_before = self._pace_serves
+                was_free = count_free
                 emu_t0 = time.monotonic()
                 try:
-                    if mode == "free":
+                    if count_free:
                         emu_start(pc, _NEVER)
-                    elif mode == "deliver":
-                        self._pace_inhibit = True
-                        try:
-                            emu_start(pc, _NEVER, count=_PACE_DELIVER_COUNT)
-                        finally:
-                            self._pace_inhibit = False
                     else:
                         emu_start(pc, _NEVER, count=count_size)
                 except UcError as err:
@@ -841,10 +824,8 @@ class Machine:
                 # * count-free chunks run at full TCG speed, well above the
                 #   modelled rate — wall time is the *smaller* advance there,
                 #   which is what locks busy phases to real time.
-                if mode == "free":
+                if count_free:
                     self.clock += min(int(elapsed * rate), rate)
-                elif mode == "deliver":
-                    self.clock += _PACE_DELIVER_COUNT
                 else:
                     self.clock += count_size  # ended early by a serve: §"counting
                     # the full chunk is acceptable" (same as deterministic mode)
@@ -861,31 +842,27 @@ class Machine:
                 )
                 skip_irq, self._pace_skip_irq = self._pace_skip_irq, False
                 if self.pace_trace is not None:
-                    self.pace_trace.append((mode, elapsed, served, skip_irq, emu_dur, self.pc))
+                    self.pace_trace.append(
+                        ("free" if was_free else "count",
+                         elapsed, served, skip_irq, emu_dur, self.pc))
                 # Adaptive mode: count-free only while serve points are
                 # demonstrably dense (chunks ended by a serve, promptly);
                 # serve-sparse phases run count-paced — slower, but precise
-                # and self-terminating. A skip-IRQ boundary (store-context
-                # serve or the pacer's fallback) inserts the tiny delivery
-                # chunk, then resumes the mode the serve justified.
-                if skip_irq:
-                    resume_free = served_prompt or mode == "free"
-                    new_mode = "deliver"
-                elif mode == "deliver":
-                    new_mode = "free" if resume_free else "count"
-                else:
-                    new_mode = "free" if served_prompt else "count"
-                if new_mode != "free" and mode == "free":
+                # and self-terminating. A skip-IRQ boundary forces the next
+                # chunk onto the count side too: its end is where the
+                # deferred IRQ gets delivered, and a count end is a clean
+                # post-instruction boundary.
+                count_free = served_prompt and not skip_irq
+                if not count_free and was_free:
                     # Counted chunks after a count-free chunk need freshly
                     # instrumented translations: Unicorn re-adds its count
                     # hook without invalidating cached TBs, so counting
-                    # silently never fires in them (measured: count=500
-                    # chunks running 60+ ms until the pacer's fallback).
+                    # silently never fires in them (measured: counted chunks
+                    # running 60+ ms until the pacer's fallback).
                     try:
                         uc.ctl_flush_tb()
                     except UcError:
                         pass
-                mode = new_mode
                 for peripheral in ticking:
                     peripheral.tick(self.clock)
                 if not skip_irq and intc is not None and intc.irq_asserted():
@@ -897,7 +874,6 @@ class Machine:
             pacer.join()
             self._pace_due = False
             self._pace_skip_irq = False
-            self._pace_inhibit = False
 
     # --- IRQ delivery (interrupts-and-timers.md §3) ---------------------------------
 
