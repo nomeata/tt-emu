@@ -278,6 +278,16 @@ class Machine:
         #: Count of pace stops served from callbacks — the run loop's signal
         #: that serve points are dense enough to run count-free.
         self._pace_serves = 0
+        #: Realtime pacing: prefer count-paced chunks until this clock value
+        #: (see :meth:`pace_hold_count`). The audio DMA holds this forward
+        #: while buffers are in flight: completions are delivered once per
+        #: chunk end, so PCM production is capped by chunk cadence — count
+        #: chunks end ~an order of magnitude more often than serve-bound
+        #: count-free chunks, letting the firmware pump a sound into the
+        #: playback buffer well ahead of real time (exactly how the boot
+        #: jingle, played inside the count-paced warm-up, gets its perfectly
+        #: smooth start).
+        self._pace_count_hold = 0
         #: Diagnostics seam: when set to a deque, the realtime run loop
         #: appends ``(mode, elapsed_s, served, skip_irq)`` per chunk. ``None``
         #: (the default) costs one attribute check per chunk.
@@ -519,6 +529,20 @@ class Machine:
         the pace path (a set lookup only while a stop is due).
         """
         self._pace_serve_mmio.add(addr - MMIO_BASE)
+
+    def pace_hold_count(self, until_clock: int) -> None:
+        """Prefer count-paced chunks until ``until_clock`` (realtime pacing).
+
+        Called by peripherals whose throughput depends on chunk cadence —
+        the audio DMA holds this forward on every buffer submit, because its
+        completion (and hence the firmware's next refill) is delivered once
+        per chunk end. Count chunks trade wall-clock fidelity for cadence:
+        during active playback that is the right trade, since audio
+        smoothness is production-bound while the emulated timeline of a
+        playing sound is content-bound anyway. No-op in deterministic mode.
+        """
+        if until_clock > self._pace_count_hold:
+            self._pace_count_hold = until_clock
 
     def maybe_pace_stop(self) -> None:
         """Serve a pending realtime pace stop from a stop-safe callback.
@@ -851,6 +875,13 @@ class Machine:
                     # sampling, clock probes, §5.4) must see deterministic
                     # clock-vs-execution proportions or they trip.
                     and self.clock >= _PACE_WARMUP_TICKS * ipt
+                    # Active audio prefers count cadence (pace_hold_count):
+                    # DAC completions deliver once per chunk end, so PCM
+                    # production tracks chunk rate, and count chunks end an
+                    # order of magnitude more often than serve-bound free
+                    # chunks — this is what lets a sound fill the playback
+                    # buffer ahead of real time, jingle-style.
+                    and self.clock >= self._pace_count_hold
                 )
                 skip_irq, self._pace_skip_irq = self._pace_skip_irq, False
                 if self.pace_trace is not None:

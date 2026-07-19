@@ -228,6 +228,14 @@ class AudioDma(L2NandBuffer):
 
         self.dac_submits += 1
         self.last_dac_submit_at = machine.clock
+        # Realtime pacing: while buffers are in flight, hold the machine on
+        # count-paced chunks — completion delivery (and so the firmware's
+        # next refill) happens once per chunk end, making PCM production
+        # track chunk cadence; count chunks are the dense ones. Renewed per
+        # submit, expiring a few ticks after the last one.
+        machine.pace_hold_count(
+            machine.clock + machine.config.instructions_per_tick * 5
+        )
         rate = self.current_rate()
         if machine.read_u8(SWALLOW_FLAG_ADDR):
             self.flush_submits += 1  # §6 silence flush: complete, don't capture
