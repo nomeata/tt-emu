@@ -120,8 +120,12 @@ BUTTON_HOLD_TICKS = 40
 #: instructions (mirrors the scripted runner's react timeout: 250 ticks).
 TAP_TIMEOUT_INSTRUCTIONS = 250 * SESSION_INSTRUCTIONS_PER_TICK
 
-#: Snapshot republish cadence (emulated instructions).
-SNAPSHOT_INTERVAL = 200_000
+#: Snapshot republish cadence, in **wall** seconds (10 Hz — plenty for the UI).
+#: Wall-based on purpose: a clock-based cadence tuned for deterministic speeds
+#: turns into a snapshot storm under realtime pacing (200k clock ≈ every 4 ms
+#: wall ≈ 250 heavy debug-snapshot builds/s on the worker thread), starving
+#: the guest of execution time exactly when it must keep up with real time.
+SNAPSHOT_WALL_INTERVAL = 0.1
 
 
 def gme_content_oids(data: bytes, limit: int | None = 3) -> list[int]:
@@ -549,7 +553,7 @@ class EmulatorSession:
         self._last_lift = 0
         self._book_tail_at: int | None = None  # set by the book-entry-tail hook
         self._button_releases: list[tuple[int, str, int]] = []  # (clock, name, pin)
-        self._last_snapshot_clock = 0
+        self._last_snapshot_wall = 0.0
         self._last_leaf = -1
         self._last_mounted = 0
         self._last_chain = False
@@ -781,8 +785,9 @@ class EmulatorSession:
                 with self._transitions_lock:
                     self._transitions.append(f"[{now:>12,}] {transition.format()}")
 
-        if now - self._last_snapshot_clock >= SNAPSHOT_INTERVAL:
-            self._last_snapshot_clock = now
+        wall = time.monotonic()
+        if wall - self._last_snapshot_wall >= SNAPSHOT_WALL_INTERVAL:
+            self._last_snapshot_wall = wall
             self.snapshot = self._build_snapshot(machine)
 
     def _apply_command(self, machine: Machine, command: tuple[object, ...]) -> None:

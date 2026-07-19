@@ -55,8 +55,6 @@ from unicorn.arm_const import (
     UC_CPU_ARM_926,
 )
 
-_THUMB_BIT = 1
-
 from .peripheral import Peripheral
 
 log = logging.getLogger(__name__)
@@ -124,11 +122,16 @@ _NEVER = 1 << 40
 #: modelled CPU's instruction rate, the wall-clock anchor of realtime pacing.
 TICKS_PER_SECOND = 50
 
-#: Realtime pacing: how long peripheral I/O must have been quiet before the
-#: pacer may stop the CPU asynchronously (see :meth:`Machine._run_realtime`),
-#: and after how long an unserved chunk-end request is worth a diagnostic.
-_PACE_IO_QUIET_SECONDS = 0.02
+#: Realtime pacing: after how long an unserved chunk-end request is worth a
+#: diagnostic (see :meth:`Machine._run_realtime`; on a machine with peripheral
+#: traffic the request is always served by a callback, so this firing means an
+#: unexpectedly long callback-free execution phase).
 _PACE_UNSERVED_WARN_SECONDS = 2.0
+#: Realtime pacing: emulated ticks of count-paced warm-up before count-free
+#: chunks are allowed — boot's calibrated self-tests (battery sampling, clock
+#: probes) run within this window and need deterministic clock-vs-execution
+#: proportions (100 ticks = 2 emulated seconds; book mode is reached later).
+_PACE_WARMUP_TICKS = 100
 
 
 @dataclass
@@ -256,24 +259,17 @@ class Machine:
         #: Prefetch/data-abort handler (installed by the MMU-boot layer; see
         #: :meth:`set_abort_handler`). ``None`` leaves aborts to the default path.
         self._abort_handler: Callable[[int], None] | None = None
-        #: Wall-clock time of the last **replay-sensitive** peripheral access
-        #: (see :meth:`io_touch`). The realtime pacer only stops the CPU
-        #: asynchronously when this is quiet (:meth:`_run_realtime`): an async
-        #: stop can roll back the in-flight instruction *after* its I/O side
-        #: effect fired, and the resume then replays the access — fatal for
-        #: read-sensitive registers like the NFC data FIFO (measured).
-        #: Idempotent accesses (status polls, storage-register reads — the
-        #: bulk of MMIO traffic, including the firmware's idle-time OID status
-        #: polling) replay harmlessly and must NOT stamp this, or idle phases
-        #: read as a permanent I/O storm and pacing starves.
-        self._io_last = 0.0
         #: Realtime pacing: a chunk end is due (set by the pacer thread each
         #: interval, served synchronously by :meth:`maybe_pace_stop` from
-        #: stop-safe callback contexts, or asynchronously by the pacer once
-        #: I/O has been quiet — see :meth:`_run_realtime`).
+        #: stop-safe callback contexts — see :meth:`_run_realtime`).
         self._pace_due = False
-        #: Handle of the armed one-shot pace hook (see :meth:`_arm_pace_oneshot`).
-        self._pace_oneshot: int | None = None
+        #: Count of pace stops served from callbacks — the run loop's signal
+        #: that serve points are dense enough to run count-free.
+        self._pace_serves = 0
+        #: MMIO offsets (MMIO_BASE-relative) whose *reads* are declared pure
+        #: and may serve a pace stop from the read callback
+        #: (:meth:`add_pace_serve_mmio`).
+        self._pace_serve_mmio: set[int] = set()
 
         self.uc = Uc(UC_ARCH_ARM, UC_MODE_ARM | UC_MODE_LITTLE_ENDIAN)
         self.uc.ctl_set_cpu_model(UC_CPU_ARM_926)
@@ -372,8 +368,6 @@ class Machine:
         return entry
 
     def _mmio_read(self, _uc: Uc, offset: int, size: int, _ud: object) -> int:
-        if self._pace_due:
-            self._arm_pace_oneshot()
         offset += self._mmio_off_adjust
         entry = self._mmio_cache.get(offset)
         if entry is None:
@@ -385,11 +379,13 @@ class Machine:
             value = int.from_bytes(self._scratch[offset : offset + size], "little")
         if self.config.trace_mmio:
             self._trace(MMIO_BASE + offset, size, value, periph, is_write=False)
+        if self._pace_due and offset in self._pace_serve_mmio:
+            # A declared-pure poll register: stopping here rolls the load back
+            # and replays a side-effect-free read (see add_pace_serve_mmio).
+            self.maybe_pace_stop()
         return value
 
     def _mmio_write(self, _uc: Uc, offset: int, size: int, value: int, _ud: object) -> None:
-        if self._pace_due:
-            self._arm_pace_oneshot()
         offset += self._mmio_off_adjust
         entry = self._mmio_cache.get(offset)
         if entry is None:
@@ -410,12 +406,14 @@ class Machine:
         effects. The CPU store still lands in the backing RAM afterwards (that
         raw value is the read-back for storage registers); peripherals whose
         read value differs keep a read hook, so what lands here is moot for them.
-        Not stamped as replay-sensitive I/O (:meth:`io_touch`): the core-page
-        models are edge/transition-triggered (GPIO notifies only on
+
+        A stop-safe realtime pace point (:meth:`maybe_pace_stop`): stopping
+        here rolls the store back and replays this hook on resume, but the
+        core-page models are edge/transition-triggered (GPIO notifies only on
         ``old != value``; OID/ZC90B advance on clock edges; the timer ACK is
-        write-1-to-clear), so a rolled-back write replays as a no-op — and the
-        OID two-wire link bit-bangs this page constantly at idle, so stamping
-        here would read idle as a permanent I/O storm.
+        write-1-to-clear), so the replay is a no-op — and the OID two-wire
+        link bit-bangs this page throughout idle and capture phases, exactly
+        the phases with no other callback to end a chunk from.
         """
         offset = addr - MMIO_BASE
         entry = self._mmio_cache.get(offset)
@@ -426,6 +424,7 @@ class Machine:
             self._trace(addr, size, value, periph, is_write=True)
         if write is not None:
             write(rel + offset, size, value)
+        self.maybe_pace_stop()
 
     def _core_read_hook(self, uc: Uc, _access: int, addr: int, size: int,
                         _value: int, _ud: object) -> None:
@@ -433,6 +432,11 @@ class Machine:
         self-clearing, or computed): serve the model's value by writing it into
         the backing RAM before the triggering load samples it (the read hook
         fires ahead of the load, and a host store from the hook feeds it).
+
+        NOT a pace point: hooked core registers include *self-clearing*
+        latches, and a stop here would roll the load back after the clearing
+        read ran — the replayed read then sees the cleared value and the
+        event is lost.
         """
         offset = addr - MMIO_BASE
         entry = self._mmio_cache.get(offset)
@@ -463,22 +467,20 @@ class Machine:
 
     # --- realtime pacing: synchronous chunk ends ------------------------------------
 
-    def io_touch(self) -> None:
-        """Mark a replay-sensitive peripheral access (realtime pacing).
+    def add_pace_serve_mmio(self, addr: int) -> None:
+        """Declare an MMIO register whose *read* is pure, as a pace-serve point.
 
-        Peripheral models call this from any operation whose **replay would
-        change model state** — a data-FIFO pop, a drain strobe, a transfer
-        submit, a command that advances a state machine. The realtime pacer
-        then avoids asynchronous stops until the traffic has been quiet for
-        :data:`_PACE_IO_QUIET_SECONDS` (an async stop can roll back the
-        in-flight instruction after its side effect fired and replay it on
-        resume). Purely idempotent accesses — status polls, storage-register
-        reads/writes — must not call this: they replay harmlessly, and
-        stamping them (e.g. the firmware's idle-time OID status polling)
-        makes idle look like a permanent I/O storm and starves the pacing.
-        Free in deterministic mode (a timestamp store).
+        For registers in the Python-dispatched MMIO window (outside the
+        RAM-backed core page). A pace stop taken from the MMIO read callback
+        rolls the in-flight load back and **replays the read** on resume —
+        only registers whose read has no model side effect (ready/status
+        polls, latched values) may be declared. This is what keeps realtime
+        pacing live through I/O phases the other serve points never see (the
+        NFC ready poll runs between every NAND micro-op of a stream), with no
+        runtime hook mutation (measured to corrupt/crash under load) and no
+        cost off the pace path (a set lookup only while a stop is due).
         """
-        self._io_last = time.monotonic()
+        self._pace_serve_mmio.add(addr - MMIO_BASE)
 
     def maybe_pace_stop(self) -> None:
         """Serve a pending realtime pace stop from a stop-safe callback.
@@ -492,40 +494,15 @@ class Machine:
         hooks whose own effect tolerates re-firing on resume (the stop lands
         before the hooked instruction, so every hook at that PC fires again).
         Do NOT call it from hooks with one-shot effects (e.g. a
-        stack-popping restore) or from MMIO callbacks (mid-instruction, the
-        access would replay — those arm :meth:`_arm_pace_oneshot` instead).
+        stack-popping restore) or from MMIO callbacks of registers with
+        read side effects (mid-instruction, the access would replay — see
+        :meth:`add_pace_serve_mmio` for the declared-pure exception).
         No-op unless a pace stop is due.
         """
         if self._pace_due:
             self._pace_due = False
+            self._pace_serves += 1
             self.uc.emu_stop()
-
-    def _arm_pace_oneshot(self) -> None:
-        """Arm a one-shot stop at the guest's return address (MMIO-safe pacing).
-
-        MMIO callbacks cannot stop directly (mid-instruction — the access
-        would replay on resume), but they run with precise CPU state (QEMU
-        syncs before I/O), so LR points into the caller of the polling HAL
-        routine: ordinary, non-I/O code the CPU reaches within microseconds.
-        A scoped code hook there stops precisely (measured). This is what
-        keeps pacing safe *and* live through I/O-heavy phases (NAND streams,
-        media reads) that never touch the other stop-safe callbacks — an
-        asynchronous stop there replays FIFO traffic (measured: boot-time
-        NFTL-scan corruption). Firmware-agnostic: no fixed addresses, the
-        target is whatever return path is live right now.
-        """
-        if self._pace_oneshot is not None:
-            return
-        lr = self.uc.reg_read(UC_ARM_REG_LR) & ~_THUMB_BIT
-        self._pace_oneshot = self.uc.hook_add(
-            UC_HOOK_CODE, self._on_pace_oneshot, begin=lr, end=lr
-        )
-
-    def _on_pace_oneshot(self, _uc: Uc, _addr: int, _size: int, _ud: object) -> None:
-        handle, self._pace_oneshot = self._pace_oneshot, None
-        if handle is not None:
-            self.uc.hook_del(handle)
-        self.maybe_pace_stop()
 
     # --- abort delivery: the CPU MMU's demand-paging path --------------------------
 
@@ -707,21 +684,30 @@ class Machine:
         nothing). A pacer thread requests a chunk end on the
         ``effective_chunk``-worth-of-wall-time cadence (2 ms at the session
         cadence and the default chunk — the same IRQ-latency bound as
-        deterministic mode). The request is preferably served
-        **synchronously** by a stop-safe callback, which is precise:
-        :meth:`maybe_pace_stop` (exception delivery, idempotent scoped hooks)
-        or the one-shot return-address hook that MMIO callbacks arm during
-        I/O phases (:meth:`_arm_pace_oneshot`). Only when no callback runs at
-        all — a pure compute/poll phase — does the pacer stop
-        **asynchronously**, and then only while replay-sensitive I/O
-        (:meth:`io_touch`) has been quiet for
-        :data:`_PACE_IO_QUIET_SECONDS`. An async stop can roll the in-flight
-        instruction back *after* its I/O side effect fired, and the resume
-        then replays the access (measured — it corrupts the NFC FIFO
-        stream); rolling back a pure CPU/RAM instruction re-executes
-        idempotently, so quiet-phase stops are safe. The pacer never stops
-        into sustained I/O (ticks catch up afterwards; the interrupt
-        controller does not accumulate backlog).
+        deterministic mode). Chunks run in one of two modes, adaptively:
+
+        * **count-free** (full TCG speed) while stop-safe callbacks
+          demonstrably end chunks promptly — :meth:`maybe_pace_stop` in the
+          exception hook, the replay-idempotent core-page *write* hook, and
+          the declared-pure MMIO poll registers
+          (:meth:`add_pace_serve_mmio`). Busy phases (NAND streams, demand
+          paging, audio) are exactly the serve-dense ones, so they get the
+          speed.
+        * **count-paced** (the deterministic primitive, ~10-20x slower but
+          precise and self-terminating) everywhere else — idle polling,
+          busy-delay loops, and under scheduler jitter. Those phases do not
+          need surplus speed, and a count chunk can never wedge.
+
+        The pacer thread itself only *requests* chunk ends: an asynchronous
+        ``emu_stop`` can roll the in-flight instruction back *after* its I/O
+        side effect fired, and the resume then replays the access (measured —
+        it corrupts the NFC FIFO stream); no wall-clock quietness heuristic
+        survives GIL/scheduler jitter (a starved worker looks quiet exactly
+        while stalled mid-I/O). Its one exception is the emergency stop of a
+        count-free chunk that stopped being served entirely
+        (:data:`_PACE_UNSERVED_WARN_SECONDS` — after seconds of zero
+        callbacks the CPU is in pure CPU/RAM code with near certainty, and
+        hanging would be worse).
 
         The clock advances by measured wall time at the modelled CPU rate,
         capped at one second per chunk so a host stall (suspend) slips
@@ -744,36 +730,33 @@ class Machine:
             unserved = 0.0
             while not pacer_stop.wait(interval):
                 if not self._pace_due:
-                    # Ask for a chunk end. A stop-safe callback serves it
-                    # synchronously (maybe_pace_stop / the MMIO-armed one-shot
-                    # of _arm_pace_oneshot) — the precise path.
+                    # Ask for a chunk end. In count-free chunks a stop-safe
+                    # callback serves it; count-paced chunks end by themselves
+                    # (the run loop clears the flag either way).
                     self._pace_due = True
                     unserved = 0.0
-                elif time.monotonic() - self._io_last >= _PACE_IO_QUIET_SECONDS:
-                    # Unserved and no replay-sensitive peripheral traffic for
-                    # a while: a pure compute/poll phase, where an
-                    # asynchronous stop only rolls back CPU/RAM instructions
-                    # (idempotent re-execution) — safe.
-                    self._pace_due = False
-                    unserved = 0.0
-                    uc.emu_stop()
                 else:
-                    # Replay-sensitive I/O in flight: never stop from here
-                    # (a mid-stream rollback replays FIFO traffic). The next
-                    # MMIO callback arms the one-shot; if nothing ever serves,
-                    # that is a coverage gap worth a diagnostic — not an
-                    # unsafe stop.
+                    # Never stop the CPU from here (a rollback mid-I/O replays
+                    # the access — and a GIL-starved worker is
+                    # indistinguishable from a quiet one). A wedged count-free
+                    # chunk is broken by the emergency stop below — corruption
+                    # is possible then, but strictly better than hanging, and
+                    # the count fallback makes it unreachable in practice.
                     unserved += interval
                     if unserved >= _PACE_UNSERVED_WARN_SECONDS:
                         unserved = 0.0
                         log.warning(
                             "realtime pacing: chunk-end request unserved for "
-                            "%.1f s through sustained I/O — pacing coverage gap",
+                            "%.1f s — emergency stop of a wedged count-free "
+                            "chunk (possible I/O replay)",
                             _PACE_UNSERVED_WARN_SECONDS,
                         )
+                        uc.emu_stop()
 
         pacer = threading.Thread(target=pace, name="tt-emu-pacer", daemon=True)
         pacer.start()
+        chunk_size = self.config.effective_chunk
+        count_free = False
         last = time.monotonic()
         try:
             while self._stop_reason is None and self.clock < budget_end:
@@ -781,14 +764,47 @@ class Machine:
                 if reg_read(UC_ARM_REG_CPSR) & CPSR_T:
                     pc |= 1  # resume in Thumb state
                 self._fault = None
+                serves_before = self._pace_serves
                 try:
-                    emu_start(pc, _NEVER)
+                    if count_free:
+                        emu_start(pc, _NEVER)
+                    else:
+                        emu_start(pc, _NEVER, count=chunk_size)
                 except UcError as err:
                     if not self._handle_emu_error(err):
                         break
                 now = time.monotonic()
-                self.clock += min(int((now - last) * rate), rate)
+                elapsed = now - last
                 last = now
+                # The clock must never outrun the guest, or the firmware's
+                # calibrated timing (battery sampling, delay loops) breaks:
+                # * count chunks know the executed instructions exactly —
+                #   advance by them (deterministic semantics; a slow host
+                #   just runs slower than real time, correctly);
+                # * count-free chunks run at full TCG speed, well above the
+                #   modelled rate — wall time is the *smaller* advance there,
+                #   which is what locks busy phases to real time.
+                if count_free:
+                    self.clock += min(int(elapsed * rate), rate)
+                else:
+                    self.clock += chunk_size  # ended early by a serve: §"counting
+                    # the full chunk is acceptable" (same as deterministic mode)
+                self._pace_due = False  # any chunk end fulfils the request
+                # Adaptive mode: run the next chunk count-free only while
+                # serve points are demonstrably dense (this chunk ended by a
+                # serve, promptly). Serve-sparse phases (idle polling,
+                # busy-delay loops) run count-paced — slower, but precise and
+                # self-terminating, keeping the tick cadence and ruling out a
+                # wedged chunk.
+                count_free = (
+                    self._pace_serves != serves_before
+                    and elapsed <= interval * 4
+                    # Warm-up: the first emulated seconds run count-paced
+                    # regardless — boot's calibrated self-tests (battery
+                    # sampling, clock probes, §5.4) must see deterministic
+                    # clock-vs-execution proportions or they trip.
+                    and self.clock >= _PACE_WARMUP_TICKS * ipt
+                )
                 for peripheral in ticking:
                     peripheral.tick(self.clock)
                 if intc is not None and intc.irq_asserted():
@@ -799,9 +815,6 @@ class Machine:
             pacer_stop.set()
             pacer.join()
             self._pace_due = False
-            if self._pace_oneshot is not None:
-                self.uc.hook_del(self._pace_oneshot)
-                self._pace_oneshot = None
 
     # --- IRQ delivery (interrupts-and-timers.md §3) ---------------------------------
 
@@ -868,7 +881,6 @@ class Machine:
         firmware's fault handlers otherwise print via semihosting, which is not on the
         happy path (§1.1), so logging + returning is sufficient.
         """
-        self.io_touch()  # exception delivery is a no-async-stop window
         if intno in (3, 4):
             if self._abort_handler is not None:
                 self._abort_handler(intno)

@@ -24,9 +24,13 @@ triggers the work, §1); no timers, no ECC parity, no randomizer, no read-retry
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING
 
 from ..nand_image import AU_SIZE, NandImage, SECTOR_SIZE
 from ..peripheral import MmioRegion, WordRegisterPeripheral
+
+if TYPE_CHECKING:  # pragma: no cover - import cycle guard
+    from ..machine import Machine
 
 log = logging.getLogger(__name__)
 
@@ -194,6 +198,15 @@ class NfcController(WordRegisterPeripheral):
     def regions(self) -> tuple[MmioRegion, ...]:
         return (MmioRegion(self.base, 0x200),)
 
+    def attach(self, machine: Machine) -> None:
+        super().attach(machine)
+        # The ready-status poll (a constant in this reactive model) runs
+        # between every micro-op of a NAND stream: the realtime pace-serve
+        # point that keeps chunk ends flowing through I/O phases no other
+        # stop-safe callback covers. Reading it is pure, so the rolled-back
+        # load's replay is harmless (no-op in deterministic mode).
+        machine.add_pace_serve_mmio(self.base + NFC_CTRL_STATUS)
+
     # --- registers (§5.1) --------------------------------------------------------------
 
     def read_reg(self, offset: int) -> int:
@@ -215,8 +228,6 @@ class NfcController(WordRegisterPeripheral):
 
     def _execute(self) -> None:
         """Run the staged micro-op list: GO → walk until the first LAST word."""
-        if self.machine is not None:
-            self.machine.io_touch()  # GO advances the op state machine (realtime pacing)
         self.l2_level = 0  # cleared by the next GO (§10)
         self._stream = None
         offset = NFC_CMD_LIST
@@ -457,8 +468,6 @@ class L2NandBuffer(WordRegisterPeripheral):
 
     def read_reg(self, offset: int) -> int:
         if offset == L2_BUF_STATUS:
-            if self.machine is not None:
-                self.machine.io_touch()  # refill side effect: read-sensitive (realtime pacing)
             self._nfc.on_level_poll()  # streaming refill of >512-B records
             return (self._nfc.l2_level & 0xF) << 16  # bits[19:16] = fill in 64-B chunks
         if offset == DMA_WORDCOUNT:
@@ -473,6 +482,4 @@ class L2NandBuffer(WordRegisterPeripheral):
             buf = (value >> 8) & 7
             op = (value >> 12) & 0xF
             if buf == 4:
-                if self.machine is not None:
-                    self.machine.io_touch()  # strobes advance the drain (realtime pacing)
                 self._nfc.l2_strobe(op)

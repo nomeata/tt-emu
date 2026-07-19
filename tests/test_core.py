@@ -164,12 +164,10 @@ def test_config_rejects_unknown_pacing() -> None:
         MachineConfig(pacing="fast")
 
 
-def test_realtime_pacing_tracks_wall_time() -> None:
-    """Realtime chunks advance the clock by wall time at the modelled rate.
-
-    ipt=20_000 models 1M insn/s; a 100k-instruction budget is therefore
-    ~100 ms of wall time (generous upper bound for CI jitter), and the pacer
-    thread must be gone when run() returns.
+def test_realtime_pacing_completes_and_cleans_up() -> None:
+    """A bare realtime machine (no serve points) runs count-paced chunks:
+    the clock advances by executed instructions, the budget is honoured, and
+    the pacer thread is gone when run() returns.
     """
     import threading
     import time
@@ -182,7 +180,7 @@ def test_realtime_pacing_tracks_wall_time() -> None:
     elapsed = time.monotonic() - t0
     assert result.reason == "instruction budget exhausted"
     assert m.clock >= 100_000
-    assert 0.05 <= elapsed <= 10.0  # ~0.1 s nominal; wide bounds for slow CI
+    assert elapsed <= 10.0  # count-paced: far faster than the modelled rate
     assert not any(t.name == "tt-emu-pacer" for t in threading.enumerate())
     # The machine resumes: a second bounded run continues from the same state.
     result = m.run(20_000)

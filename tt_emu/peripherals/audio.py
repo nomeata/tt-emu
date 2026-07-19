@@ -50,7 +50,7 @@ from __future__ import annotations
 import logging
 
 from ..audio_capture import AudioCapture
-from ..machine import PHYS_RAM_BASE
+from ..machine import PHYS_RAM_BASE, Machine
 from .gpio import GpioBlock
 from .intc import IntcTimer, LINE_AUDIO
 from .nand import L2NandBuffer, NfcController
@@ -163,6 +163,14 @@ class AudioDma(L2NandBuffer):
         self._frame_clock = 0
         self._frame_lru = [0] * PAGER_FRAME_COUNT
 
+    def attach(self, machine: Machine) -> None:
+        super().attach(machine)
+        # The submit-gate poll (+0x0c bit13, read back masked — §7 item 3) is
+        # what the firmware spins on between DAC buffer submits: a pure read,
+        # declared as a realtime pace-serve point so chunk ends keep flowing
+        # through playback phases (no-op in deterministic mode).
+        machine.add_pace_serve_mmio(self.base + DMA_WORDCOUNT)
+
     def touch_frame(self, index: int) -> None:
         """Stamp pager frame ``index`` as just-used.
 
@@ -204,7 +212,6 @@ class AudioDma(L2NandBuffer):
         machine = self.machine
         if machine is None:
             return
-        machine.io_touch()  # a replayed START would double-submit (realtime pacing)
         length = (value & WORDCOUNT_MASK) * 4
         dst = self._regs.get(DMA_DST, 0)
         src = self._regs.get(DMA_SRC, 0)
