@@ -12,9 +12,17 @@ terminal UI where you "tap" OID codes and hear the audio in real time.
 registers, and OID→script-line routing with symbolic names joined from a tttool
 YAML.](docs/tui-screenshot.svg)
 
-> **Status:** early / work in progress — but it boots the real firmware and plays both
-> script-based and embedded-binary `.gme` games end to end, with a live firmware-aware
-> debugger.
+## Status
+
+This is a AI generated tool, and severely overengineered and large. Maybe it is useful or
+fun to play with.
+
+I do not plan to spend a lot of time maintaining or extending this. Issue reports or feature
+requests are welcome, but will likely not result in quick action.
+
+Code contributions are not welcome. I did not write this code, so I don’t want to review
+changes to this code. Trivial PRs may be fine. Contributions are best made in the form of 
+precise, detailed error reports or careful feature descriptions that I can feed to an AI.
 
 ## Installation
 
