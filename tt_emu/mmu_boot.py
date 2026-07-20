@@ -31,8 +31,8 @@ import logging
 import struct
 
 import unicorn.arm_const as ac
-from capstone import CS_ARCH_ARM, CS_MODE_ARM, CS_MODE_THUMB, Cs
-from capstone.arm_const import ARM_OP_MEM, ARM_OP_REG
+from capstone import CS_ARCH_ARM, CS_MODE_ARM, CS_MODE_THUMB, Cs  # type: ignore[import-untyped]
+from capstone.arm_const import ARM_OP_MEM, ARM_OP_REG  # type: ignore[import-untyped]
 from unicorn import UC_CTL_TLB_FLUSH, UC_HOOK_CODE, UC_HOOK_MEM_WRITE, UcError
 from unicorn.arm_const import (
     UC_ARM_REG_CPSR,
@@ -373,7 +373,8 @@ class MmuBoot:
         ARM926 model does not act on the ``mcr p15,c8,c7`` op, so we mirror it here to keep its
         cached VA->frame translations coherent with the page table the firmware just changed."""
         try:
-            self.uc._Uc__ctl_w(UC_CTL_TLB_FLUSH)
+            # name-mangled private helper; exists at runtime, invisible to the stubs
+            self.uc._Uc__ctl_w(UC_CTL_TLB_FLUSH)  # type: ignore[attr-defined]
         except (UcError, AttributeError):
             pass
         # Stop-safe pace point: a re-fired flush on resume is idempotent, and

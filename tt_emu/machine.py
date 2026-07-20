@@ -25,8 +25,12 @@ import struct
 import threading
 import time
 from bisect import bisect_right
+from collections.abc import MutableSequence
 from dataclasses import dataclass
-from typing import Callable, Protocol
+from typing import TYPE_CHECKING, Callable, Protocol
+
+if TYPE_CHECKING:
+    from .mmu_boot import MmuBoot
 
 __all__ = ["Machine", "MachineConfig", "RunResult"]
 
@@ -252,7 +256,7 @@ class Machine:
         #: When present, ``read_u8/u16/u32`` translate firmware VIRTUAL addresses through
         #: the page table (the firmware maps many globals to non-identity frames); DMA and
         #: raw physical access use :meth:`read_phys` / :meth:`read_bytes` instead.
-        self.mmu = None
+        self.mmu: MmuBoot | None = None
 
         self._peripherals: list[Peripheral] = []
         self._ticking: list[Peripheral] = []  # peripherals that override tick()
@@ -288,10 +292,11 @@ class Machine:
         #: jingle, played inside the count-paced warm-up, gets its perfectly
         #: smooth start).
         self._pace_count_hold = 0
-        #: Diagnostics seam: when set to a deque, the realtime run loop
-        #: appends ``(mode, elapsed_s, served, skip_irq)`` per chunk. ``None``
-        #: (the default) costs one attribute check per chunk.
-        self.pace_trace: object | None = None
+        #: Diagnostics seam: when set to a deque (or list), the realtime run
+        #: loop appends ``(mode, elapsed_s, served, skip_irq, emu_dur_s, pc)``
+        #: per chunk. ``None`` (the default) costs one attribute check per
+        #: chunk.
+        self.pace_trace: MutableSequence[tuple[str, float, bool, bool, float, int]] | None = None
         #: The chunk just ended at a store boundary (or the pacer's async
         #: stop): defer this boundary's IRQ delivery. The stop may have
         #: rolled back an in-flight store; an ISR run before its re-execution
@@ -903,7 +908,9 @@ class Machine:
                     # silently never fires in them (measured: counted chunks
                     # running 60+ ms until the pacer's fallback).
                     try:
-                        uc.ctl_flush_tb()
+                        # exists at runtime (unicorn 2.1.x), but is added
+                        # dynamically, so the type stubs miss it
+                        uc.ctl_flush_tb()  # type: ignore[attr-defined]
                     except UcError:
                         pass
                 for peripheral in ticking:
