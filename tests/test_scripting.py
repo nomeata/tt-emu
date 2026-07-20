@@ -86,13 +86,13 @@ def test_scripting_end_to_end(tmp_path: Path) -> None:
 
         # The expect_play / expect assertion style: tap "9" -> the register becomes 89 and
         # the firmware reads the two-digit number back as the multi-part spoken form
-        # "achtundneunzig" — "acht", then "und", then "neunzig" — three distinct media in
+        # "neunundachtzig" — "neun", then "und", then "achtzig" — three distinct media in
         # sequence (not one clip), each with real audio.
         pen.tap("neun")
-        readout = pen.expect_play("acht", timeout="20s")  # the readout opens with "acht"
+        readout = pen.expect_play("neun", timeout="20s")  # the readout opens with "neun"
         assert readout.kind == "media"
         pen.expect(pen.registers["eingabe"] == 89, "eingabe should be 89 after 8 then 9")
-        # The whole "acht-und-neunzig" sequence plays: at least three media playbacks after
+        # The whole "neun-und-achtzig" sequence plays: at least three media playbacks after
         # the readout starts, and the captured audio for them is real (non-silent) PCM.
         pen.wait("4s")
         readout_media = [
@@ -100,7 +100,7 @@ def test_scripting_end_to_end(tmp_path: Path) -> None:
             if e.kind == "media" and e.start_clock >= readout._start
         ]
         assert len(readout_media) >= 3, (
-            f"expected the multi-part 'achtundneunzig' readout, got {len(readout_media)} media"
+            f"expected the multi-part 'neunundachtzig' readout, got {len(readout_media)} media"
         )
         assert _real_chunks(pen, 0) > 3, "the number readout should produce real audio"
 
