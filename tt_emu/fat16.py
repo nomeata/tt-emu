@@ -97,7 +97,9 @@ def _split_83(name: str) -> tuple[str, str]:
     stem, dot, ext = name.rpartition(".")
     if not dot:
         stem, ext = name, ""
-    up = lambda s: "".join(c if c in _SHORT_OK else "_" for c in s.upper())
+    def up(s: str) -> str:
+        return "".join(c if c in _SHORT_OK else "_" for c in s.upper())
+
     return up(stem), up(ext)
 
 
