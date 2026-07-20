@@ -243,7 +243,7 @@ ACTION_NAMES: dict[int, str] = {
     0xF8FF: "Jump",
     0xFD00: "Game",
     0xFAFF: "Cancel",
-    0xFFA1: "DeferredPlay",
+    0xFFA1: "CoinFlipPlay",
 }
 
 #: Condition opcodes (pure u16 compares).

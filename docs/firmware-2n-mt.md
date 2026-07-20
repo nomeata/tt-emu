@@ -355,7 +355,7 @@ Action opcodes (16-bit LE), for disassembling the parsed action arrays:
 | 0xFFF8 | Neg | logical-not | | 0xFD00 | Game | launch game record (posts a launch event) |
 | | | | | 0xFAFF | Cancel | exit game |
 | | | | | 0xFEE0–7 | — | set sound/rate profile 0–7 (byte @0x081DB904) |
-| | | | | 0xFFA1 | — | deferred play-index latch (not in tttool) |
+| | | | | 0xFFA1 | CoinFlipPlay | play `playlist[m]` iff the event-dispatch counter (@akoid+0x125) is even, else no-op; roll recorded @akoid+0xDDF/+0xDE0 for replay walks |
 
 Condition opcodes: 0xFFF9 Eq, 0xFFFA Gt, 0xFFFB Lt, 0xFFFC Eq-alias, 0xFFFD GEq,
 0xFFFE LEq, 0xFFFF NEq — pure u16 compares. **Observed** (full opcode switch decoded).
