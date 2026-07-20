@@ -51,7 +51,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Iterator
 
-from unicorn.arm_const import UC_ARM_REG_R0, UC_ARM_REG_R1, UC_ARM_REG_R3
+from unicorn.arm_const import UC_ARM_REG_R0, UC_ARM_REG_R1, UC_ARM_REG_R2, UC_ARM_REG_R3
 
 from .audio_capture import CHANNELS, FRAME_BYTES, SAMPLE_BYTES, AudioCapture, AudioStats
 from .boot import BootedMachine, build_machine
@@ -346,13 +346,25 @@ class Emulator:
         self._symbols: TttoolSymbols | None = None
         if yaml is not None:
             self._symbols = load_tttool_yaml(yaml)
-            for data in self._b_files.values():
-                try:
-                    scripts = GmeScripts(data)
-                except (ValueError, struct.error, IndexError):
-                    continue
-                if scripts.product == self._symbols.product_id:
-                    self._symbols.media_names.update(derive_media_names(self._symbols, scripts))
+        # Media identity by the play_media call's own (file offset, byte size)
+        # arguments, from each game's media table. Opcode-agnostic — covers
+        # plays from 0xFFE0/0xFFE1/0xFFA1 and the playlist-walk modes, which
+        # the playlist join cannot label (issue #2). Keys that collide across
+        # several mounted games are dropped (the fallback join still applies).
+        self._media_by_pos: dict[tuple[int, int], int] = {}
+        ambiguous: set[tuple[int, int]] = set()
+        for data in self._b_files.values():
+            try:
+                scripts = GmeScripts(data)
+            except (ValueError, struct.error, IndexError):
+                continue
+            for index, pos in enumerate(scripts.media_table):
+                if self._media_by_pos.setdefault(pos, index) != index:
+                    ambiguous.add(pos)
+            if self._symbols is not None and scripts.product == self._symbols.product_id:
+                self._symbols.media_names.update(derive_media_names(self._symbols, scripts))
+        for pos in ambiguous:
+            del self._media_by_pos[pos]
 
         # Set on __enter__:
         self._booted: BootedMachine | None = None
@@ -481,7 +493,11 @@ class Emulator:
         self._last_play_action = (uc.reg_read(UC_ARM_REG_R1), uc.reg_read(UC_ARM_REG_R3))
 
     def _on_play_media(self, machine: Machine) -> None:
-        index = self._resolve_media_index(machine)
+        uc = machine.uc
+        pos = (uc.reg_read(UC_ARM_REG_R1), uc.reg_read(UC_ARM_REG_R2))
+        index = self._media_by_pos.get(pos)
+        if index is None:
+            index = self._resolve_media_index(machine)
         media = self._media_display(index)
         self._audio_events.append(_AudioEvent(machine.clock, index, media, "media"))
         self._last_play_action = None
@@ -499,13 +515,14 @@ class Emulator:
         return struct.unpack(f"<{length}H", raw)
 
     def _resolve_media_index(self, machine: Machine) -> int | None:
-        """The media-table index the firmware just asked to play.
+        """Fallback join when the (offset, size) media-table lookup missed.
 
-        Primary: the resident playlist indexed by the just-executed ``Play n``
-        action's operand (``firmware-2n-mt.md`` §4.4 "Play n → playlist[n]") —
-        the same join the debugger's routing panel renders. Falls back to the
-        play-all cursor, then the first playlist entry; None if the playlist is
-        empty.
+        The resident playlist indexed by the just-executed ``Play n`` action's
+        operand (``firmware-2n-mt.md`` §4.4 "Play n → playlist[n]") — the same
+        join the debugger's routing panel renders. Falls back to the play-all
+        cursor, then the first playlist entry; None if the playlist is empty.
+        Only heuristic for plays that do not come from a ``Play n`` action —
+        the primary (offset, size) lookup in :meth:`_on_play_media` is exact.
         """
         playlist = self._read_playlist(machine)
         action = self._last_play_action

@@ -154,6 +154,23 @@ def test_gme_scripts_and_register_index_join() -> None:
 
 
 @needs_game
+def test_gme_media_table() -> None:
+    """The media table: one (file offset, byte size) per media index — the
+    join key for play_media's r1/r2 arguments (issue #2)."""
+    gme = GmeScripts(GME_PATH.read_bytes())
+    table = gme.media_table
+    assert len(table) == 38
+    # Entries are ascending, in-bounds file ranges.
+    size = GME_PATH.stat().st_size
+    assert all(0 < off and off + n <= size for off, n in table)
+    assert [off for off, _ in table] == sorted(off for off, _ in table)
+    # The YAML-derived media names index into this same table.
+    symbols = load_tttool_yaml(YAML_PATH)
+    media = derive_media_names(symbols, gme)
+    assert media and all(0 <= i < len(table) for i in media)
+
+
+@needs_game
 def test_render_and_line_matching() -> None:
     symbols = load_tttool_yaml(YAML_PATH)
     gme = GmeScripts(GME_PATH.read_bytes())

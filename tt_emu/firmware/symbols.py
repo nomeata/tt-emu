@@ -97,6 +97,36 @@ class GmeScripts:
         self.last_oid = last
         self._offsets: tuple[int, ...] = struct.unpack_from(f"<{count}I", data, table + 8)
         self._cache: dict[int, tuple[GmeLine, ...] | None] = {}
+        self._media_table: tuple[tuple[int, int], ...] | None = None
+
+    @property
+    def media_table(self) -> tuple[tuple[int, int], ...]:
+        """The media-file table: one ``(file_offset, byte_size)`` per media index.
+
+        ``u32@4`` points at the table, a packed list of ``u32 offset, u32 size``
+        pairs; the entry count is implied — the table ends where the first
+        media file begins (the same rule tttool uses). Empty on any
+        implausibility (the join is best-effort, like the YAML one).
+        """
+        if self._media_table is None:
+            self._media_table = self._parse_media_table()
+        return self._media_table
+
+    def _parse_media_table(self) -> tuple[tuple[int, int], ...]:
+        data = self.data
+        try:
+            (table,) = struct.unpack_from("<I", data, 4)
+            (first_file,) = struct.unpack_from("<I", data, table)
+            count = (first_file - table) // 8
+            if not (0 < count <= 20_000 and first_file <= len(data)):
+                return ()
+            entries = struct.unpack_from(f"<{2 * count}I", data, table)
+        except struct.error:
+            return ()
+        pairs = tuple(zip(entries[0::2], entries[1::2]))
+        if any(off + size > len(data) for off, size in pairs):
+            return ()
+        return pairs
 
     def script(self, oid: int) -> tuple[GmeLine, ...] | None:
         """The script lines for a content OID; None if absent/out of range."""
