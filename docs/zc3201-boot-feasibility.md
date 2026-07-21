@@ -1358,3 +1358,31 @@ past standby, and **reaches book/game-mode ENTRY (`FUN_0804c164`), which complet
 premise is corrected). The un-wired ZC3201 OID sensor is the sole remaining wall to a GME OID-tap
 play. **No product code changed this leg** (analysis + probes only): `scripts/zc3201_audio_block.py`,
 `scripts/zc3201_chomp_open.py`. MT unregressed.
+
+### Leg 19 addendum — concrete MT OID-HAL anchors for finding the ZC3201 twins
+
+The MT OID capture (from `2N-update3202MT/docs/oid-sensor-read-protocol.md`) is a **nandboot-HAL**
+bit-bang, timer-driven — the architecture the ZC3201 nandboot HAL mirrors (same Anyka family).
+The MT reference points, to find the ZC3201 twins by structure (the ZC3201 nandboot blob is at
+`0x07ff8000`, aliased `0x08000000`; disasm it — these are HAL `0x07ffxxxx`/`0x0800xxxx` addresses,
+**not** in the PROG decomp):
+
+* **`hal_oid_bus_idle` `0x08005560`** — rest state: GPIO9→input (pull high), GPIO2→output, clock low;
+* **`hal_oid_shift_in` `0x080055a4`** — the frame shift-in (IRQs off): abort unless GPIO9==0
+  (attention), ACK, then clock `bit_count` bits sampling GPIO9 in the clock-LOW phase, MSB first;
+* **`OidCaptureState`** struct at **`0x08008c08`**: `+0` frame_ready, **`+1` bit_count** (23 decode /
+  0x20 poll) — tt-emu's `OidSensor.BIT_COUNT_ADDR 0x08008c09`;
+* pins **GPIO2 = clock (host out), GPIO9 = data/attention (bidir)** — **but GPIO9 is the audio amp on
+  ZC3201** (`FUN_0809efa4`/`FUN_0809f538` drive pin 9), so the ZC3201 data/attention pin **must
+  differ**: recover it from the ZC3201 `hal_oid_shift_in` twin's `hal_gpio_*` pin args;
+* **poll timer**: MT arms it at splash (`hal_oid_timer_start = func_0x080058b0`), callback
+  `hal_oid_timer_cb 0x07ffd7cc` gates on attention and runs `hal_oid_capture_decode23`, posting
+  `0x1060`. **First check whether the ZC3201 book entry starts its OID poll timer at all** — if not,
+  that is an even earlier blocker than the pin wiring.
+
+So the concrete next-leg tasks: (a) disasm the ZC3201 nandboot to find the `hal_oid_shift_in` /
+`hal_oid_bus_idle` / `hal_oid_timer_cb` twins and their GPIO pins + the ZC3201 `bit_count` address;
+(b) confirm the OID poll timer runs in book mode; (c) model a profile-driven ZC3201 `OidSensor`
+variant (pins + `bit_count` addr) and wire it into `build_zc3201_machine` + a `tap()` API; (d) tap →
+`0x1060` → `game_reading_sm_dispatch 0x0805cbd4` → `game_play_oid_voice 0x0805c730` → capture at
+`voice_play_sample 0x0809f068` entry; (e) parametrise `tests/test_scripting.py` over both firmwares.
