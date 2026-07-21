@@ -70,6 +70,9 @@ STATE_HANDLERS: dict[int, str] = {
     0x0803_8E48: "init_power_on",     # state_init_power_on (INIT leaf)
     0x0803_EF7C: "standby",           # standby state machine (MT standby_handler twin)
     0x0803_E454: "standby_setrefresh",  # SetRefresh helper in the standby file
+    0x0809_EDA4: "voice_player",      # Fwl_pfVoice_fn — the power-on voice AO leaf
+                                      # reached once standby descends past the GPIO
+                                      # pin0 wait (docs Leg 18)
 }
 
 #: The QF event vocabulary observed on this build (partial; the shared 0x10xx band

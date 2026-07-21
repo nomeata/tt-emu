@@ -144,6 +144,16 @@ class FirmwareProfile:
     #: extends to ``~0x08006fe4``), clobbering a HAL leaf.
     nand_sram_window: int = 0x0800_6800
 
+    #: Composite idle ``GPIO_IN`` (bank-0) word this generation reads when no
+    #: device drives a pin. MT's retail idle is ``0x3201``; ZC3201 clears bit0
+    #: (a battery-OK comparator that idles released/0, where MT sets it). ZC3201's
+    #: standby state machine (``FUN_0803ef7c``) waits for ``GPIO_IN`` bit0 == 0
+    #: before descending INIT→standby→book (nandboot ``func_0x08006978(0)`` =
+    #: ``0x040000bc`` bit0); presenting the authentic ZC3201 idle level lets
+    #: standby descend rather than spin (``docs/zc3201-boot-feasibility.md``
+    #: "Leg 18"). Only the model's GPIO idle base — device overrides still win.
+    gpio_in_idle: int = 0x0000_3201
+
     #: SoC chip-ID constant read at ``0x04000000`` (SysCon REG_CHIP_ID). Per-
     #: generation: 2N-MT ``0x30393031`` ("1090"), ZC3201 ``0x33323931`` ("1923").
     #: The firmware's FAT/MtdLib version gate (``fw_version_ref`` 0x0802c880 /
@@ -357,6 +367,7 @@ ZC3201 = FirmwareProfile(
     # this window, so it is small; the HAL IRQ-nesting depth byte lives here.)
     bss_seed=(0x0800_6FE4, 0x0800_8000 - 0x0800_6FE4),
     nand_sram_window=0x0800_5800,  # L2 buffer 4 (base 0x08005000 + 4·0x200)
+    gpio_in_idle=0x0000_3200,  # bit0 (battery-OK comparator) idles released on ZC3201
     soc_chip_id=0x3332_3931,  # "1923" — the ZC3201 SoC chip-ID (FS version gate)
     nand_small_page=True,     # Samsung K9F5608: 512-B page + 16-B OOB, 32 pages/block
     nand_page_size=512,

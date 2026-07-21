@@ -58,6 +58,9 @@ def test_profile_load_layout_distinct() -> None:
     # Per-generation hardware: the L2 NAND-staging SRAM window and the SoC chip-ID.
     assert MT.nand_sram_window == 0x0800_6800 and ZC3201.nand_sram_window == 0x0800_5800
     assert MT.soc_chip_id == 0x3039_3031 and ZC3201.soc_chip_id == 0x3332_3931
+    # GPIO idle word: MT sets bit0 (0x3201), ZC3201 clears it (0x3200) so its
+    # standby SM descends past the GPIO-pin0 wait toward book (Leg 18).
+    assert MT.gpio_in_idle == 0x0000_3201 and ZC3201.gpio_in_idle == 0x0000_3200
     # Data globals are absolute literals — unshifted (verified against baked words).
     assert ZC3201.symbols["gb_app_context"] == 0x0800_779C
     assert ZC3201.symbols["p_pMeGame_slot"] == 0x081D_8854
@@ -314,4 +317,38 @@ def test_zc3201_statechart_advances_init_to_standby() -> None:
     assert 0x0803_EF7C in visited, (
         "statechart did not advance from INIT into the standby state machine "
         "(FUN_0803ef7c) — the timer tick is not driving the pump"
+    )
+
+
+@pytest.mark.skipif(ZC_PATH is None, reason="ZC3201 firmware .upd not available")
+def test_zc3201_standby_descends_past_gpio_pin0_wait() -> None:
+    """Standby descends toward book, not into a GPIO-pin0 spin (Leg 18).
+
+    ZC3201's standby state machine (``FUN_0803ef7c``) waits for ``GPIO_IN`` bit0
+    (a battery-OK comparator, nandboot ``func_0x08006978(0)`` = ``0x040000bc``
+    bit0) to read *released* (0) before it descends INIT→standby→book and starts
+    the power-on voice. MT's idle word ``0x3201`` sets bit0; the ZC3201 profile
+    clears it (``gpio_in_idle = 0x3200``) — the authentic 1st-gen idle level — so
+    standby leaves the pin0 wait loop and hands off to the voice-player active
+    object (``Fwl_pfVoice_fn`` ``0x0809eda4``) instead of spinning. Observed
+    hook-free via the statechart-leaf watches.
+    """
+    from tt_emu.boot import build_zc3201_machine
+    from tt_emu.firmware import zc3201 as fw_zc
+    from tt_emu.loader import load_upd
+    from tt_emu.machine import MachineConfig
+
+    fw = load_upd(str(ZC_PATH))
+    assert ZC3201.gpio_in_idle == 0x0000_3200, "ZC3201 idle word must clear GPIO bit0"
+    machine = build_zc3201_machine(fw, MachineConfig(instructions_per_tick=20_000))
+    dbg = fw_zc.Zc3201Debugger(machine)
+    dbg.attach_watches()
+    machine.run(40_000_000)
+
+    visited = [pc for _clock, pc in dbg.leaves]
+    assert 0x0803_EF7C in visited, "statechart never reached the standby state machine"
+    assert 0x0809_EDA4 in visited, (
+        "standby did not descend past the GPIO pin0 wait into the voice-player "
+        "(Fwl_pfVoice_fn 0x0809eda4) — the pen is spinning on GPIO_IN bit0 instead "
+        "of proceeding toward book mode"
     )

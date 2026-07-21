@@ -288,7 +288,7 @@ def build_zc3201_machine(
     hooks: this only loads, seeds and runs the unmodified firmware.
     """
     machine = Machine(config)
-    gpio = GpioBlock()
+    gpio = GpioBlock(in_idle=profile.gpio_in_idle)
     # ZC3201's timer ISR (nandboot 0x08003d6c) acks the top-level line-10 status
     # (0xCC) before reading the second-level timer-fired bit (0x4C bit17) that
     # gates the HAL software-timer tick; decouple the two latches so the tick —
@@ -326,6 +326,12 @@ def build_zc3201_machine(
     machine.add_peripheral(nfc)
     machine.add_peripheral(ecc)
     machine.add_peripheral(L2NandBuffer(nfc))
+    # NOTE: the 0x04010000 block is shared between NAND L2 staging and the audio
+    # DAC DMA, but ZC3201's DAC submit encoding differs from MT's (it writes the
+    # control word at +0x00 directly — no +0x0c wordcount START — and involves
+    # 0x04080000), so MT's AudioDma model does not fire here and its DMA_CTRL
+    # kick-clear could spuriously drop the audio IRQ line. Retargeting the audio
+    # DAC is the next wall (docs/zc3201-boot-feasibility.md "Leg 18").
     if profile.nand_small_page and profile.nand_spare_surface_strobe:
         # The MtdLib readspare leaf presents the page's OOB at the NAND window
         # head, then reads the 4-byte map tag from window[0]. On hardware the

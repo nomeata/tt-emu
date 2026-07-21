@@ -1186,3 +1186,85 @@ ZC3201 power-hold GPIO condition is not yet presented. MT unregressed. Product c
 `IntcTimer.zc3201_timer_ack` (+ the two-latch decouple) and the `build_zc3201_machine` wiring;
 new `tt_emu/firmware/zc3201.py` (statechart debugger). Tests:
 `test_zc3201_statechart_advances_init_to_standby`. Probe: `scripts/zc3201_statechart_probe.py`.
+
+## Leg 18 — the pen does NOT power off (Leg 17 premise corrected); standby descends past a GPIO-pin0 wait; new wall = the audio DAC completion
+
+Leg 17's resume pointer said the pen entered the mode-8 **power-off** path (INIT bailed on
+`FUN_08008a04`, `+0x1b` stuck at 8, `FUN_0803e384` fires). **Re-measured at HEAD this is not
+what happens** (probe `scripts/zc3201_init_precond.py`, live-instrumented):
+
+* `state_init_power_on` `0x08038e48` runs its **real work** — the movable-block allocator
+  `FUN_0802b350(4)` → `FUN_0802b0d0` returns an in-range pointer (`0x80f…`, manager
+  `DAT_0802ab5c` header segcount **25**), so the precondition `FUN_08008a04` (ptr ∈
+  `[0x08000000,0x08200000]`) **passes**; INIT plays its files and sets the app-mode byte
+  `+0x1b = 2` (`ctx 0x0800779c`). `FUN_0803e384` (the mode-8/`|=0x200000` power-off enter)
+  is **never called** (0 hits). Standby is entered with **`+0x1b == 2`**, so `FUN_0803ef7c`
+  does *not* take its mode-8 shutdown spin. (The Leg-17 note predates the head commit's
+  timer-status decouple settling the boot; the power-off premise no longer reproduces.)
+
+### The real wall — standby's book-descent waits on GPIO input pin 0
+
+With mode 2, `FUN_0803ef7c` takes the **book-descent branch** (`bVar11` set by an event whose
+payload `*param_2 == 0x104c`, and `+0x1c != 2`): it runs `FUN_080a483c()` then a wait loop at
+`0x0803f0fc`:
+
+```
+do { func_0x08006954(6,0); iVar8 = func_0x08006978(0); } while (iVar8 != 0);
+```
+
+`func_0x08006978(0)` reads **`GPIO_IN0` (`0x040000bc`) bit0** (nandboot leaf, disasm-confirmed:
+`ldr r1,[r1,#0xbc]; ands r0,r1,r2 lsl r0`). It waits for pin0 to read **released (0)** before it
+sets `+0x44 = 1`, drives `GPIO_out6 = 1`, and `event_post`s (`0x08009544`) the transition that
+descends to book. The tt-emu GPIO idle word `0x3201` (MT's) has **bit0 = 1**, so the pen spins
+forever. `soc-core-registers.md` documents `GPIO_IN` bits **0/1/11 = battery-OK comparators**;
+bit0 idles **released/0** on the 1st-gen board (MT sets it). Presenting the authentic ZC3201 idle
+level lets the unmodified standby SM leave the wait and descend — modelling the pin, not hooking.
+
+### Fix (landed, product; MT byte-identical)
+
+* **`FirmwareProfile.gpio_in_idle`** (default MT `0x3201`; **ZC3201 `0x3200`** — bit0 cleared),
+  threaded through a new **`GpioBlock(in_idle=…)`** constructor param and
+  `build_zc3201_machine`. MT constructs `GpioBlock()` unchanged (default idle), so its whole
+  GPIO/boot-button model is bit-for-bit as before.
+
+**Verified** (`test_zc3201_standby_descends_past_gpio_pin0_wait`, `scripts/zc3201_descend_probe.py`):
+INIT `0x08038e48` (≈6 M) → standby SM `0x0803ef7c` (≈15.6 M) → **descends past the pin0 wait**,
+`play_chomp_voice` fires (≈17.7 M), and the statechart AO current-state handler hands off to the
+**voice-player leaf `Fwl_pfVoice_fn` `0x0809eda4`** (≈18.5 M); `sm_dispatch_hierarchy` runs
+~630 k times (the event pump is alive). Added to `Zc3201Debugger.STATE_HANDLERS`. MT unregressed.
+
+### Leg 18 resume pointer — the ZC3201 audio DAC completion (blocks the power-on voice → book)
+
+The pen is now parked in the **voice-player active object** (`Fwl_pfVoice_fn` `0x0809eda4`): it
+started the power-on voice (`play_chomp_voice` → `voice_play_sample` `0x0809f068`) and **waits
+for the DAC to finish** — it polls an audio-state flag `*(DAT_0809ecec + 1) & 4` (getter
+`0x0809f57c`) that the audio-done IRQ would advance. That completion never arrives, so book entry
+is blocked. Traced the voice-play MMIO (`scripts/zc3201_audio_mmio.py`):
+
+* The DAC DMA **is** on the shared `0x04010000` block (like MT), but ZC3201's **submit encoding
+  differs**: it writes the control word at **`+0x00`** directly (e.g. `0x00520424`) with **no
+  `+0x0c` wordcount START** (MT's `AudioDma._on_start` gate), and also programs **`0x04080000`**
+  (`|= 1`, later `= 0x13`) plus the SysCon audio-clock regs (`0x04000058/5c/64`, `0x04000008`
+  divider). Completion is delivered via the second-level/top-level IRQ latches (`0x0400004c` /
+  `0x040000cc`, heavily polled) — the ZC3201 audio IRQ line.
+* Because the encoding differs, **MT's `AudioDma` model does not fire** (0 DAC submits) and its
+  `DMA_CTRL` kick-clear path could *spuriously* clear the audio IRQ line, so it was **not** wired
+  into `build_zc3201_machine` (kept `L2NandBuffer`). Retargeting the audio DAC is the next leg:
+  RE the ZC3201 DAC submit (the `voice_play_sample` → `FUN_08026fa0`/`FUN_08026fe8` path and the
+  `0x04010000`/`0x04080000` control words), model its completion on the correct IRQ line, and
+  confirm the voice-player AO finishes and the statechart descends into **book mode**.
+
+**Then** (unchanged): re-point the **OID sensor** (ZC3201 capture-state + GPIO pin — MT
+`bit_count 0x08008c09` twin) and drive a product/cover-OID **tap** → book → the shared GME
+interpreter plays on the tapped OID (`.gme` on B:), and **parametrise `tests/test_scripting.py`**
+(+ the other gme-based tests) over both firmwares.
+
+**State now:** the unmodified firmware boots through the complete mount + codepage, INIT does its
+real work (mode 2, no power-off), and — with the ZC3201 GPIO idle (bit0 = 0) — the statechart
+**descends past standby's GPIO-pin0 wait** and starts the power-on voice, handing off to the
+voice-player AO. It then blocks there on the **unmodelled ZC3201 audio-DAC completion**. MT
+unregressed. Product change this leg: `FirmwareProfile.gpio_in_idle` (+ ZC3201 `0x3200`), the
+`GpioBlock(in_idle=…)` param, the `build_zc3201_machine` wiring, and the `Fwl_pfVoice_fn` leaf in
+`Zc3201Debugger`. Tests: `test_zc3201_standby_descends_past_gpio_pin0_wait` + the `gpio_in_idle`
+assertions in `test_profile_load_layout_distinct`. Probes: `scripts/zc3201_init_precond.py`,
+`scripts/zc3201_descend_probe.py`, `scripts/zc3201_audio_mmio.py`.

@@ -72,8 +72,16 @@ class GpioBlock(WordRegisterPeripheral):
     name = "gpio"
     base = 0x0400_0000
 
-    def __init__(self) -> None:
+    def __init__(self, in_idle: int = GPIO_IN_IDLE) -> None:
         super().__init__()
+        #: Composite idle GPIO_IN word. MT's retail idle is 0x3201; the
+        #: 1st-gen ZC3201 differs in bit0 (a battery-OK comparator that reads
+        #: released/0 at idle — MT sets it, ZC3201 does not). Its standby state
+        #: machine waits for GPIO_IN bit0 == 0 before descending into book mode
+        #: (nandboot ``func_0x08006978(0)`` = ``0x040000bc`` bit0), so presenting
+        #: the authentic ZC3201 idle level (bit0 = 0) lets standby descend rather
+        #: than spin (``docs/zc3201-boot-feasibility.md`` "Leg 18").
+        self._in_idle = in_idle
         self._out_watchers: dict[int, list[PinWatcher]] = {}
         self._dir_watchers: dict[int, list[PinWatcher]] = {}
         self._in_overrides: dict[int, int] = {}
@@ -221,7 +229,7 @@ class GpioBlock(WordRegisterPeripheral):
         """Compose the live GPIO_IN bank-0 word (§8 item 2; memoized)."""
         word = self._in_word
         if word is None:
-            word = GPIO_IN_IDLE
+            word = self._in_idle
             if self._boot_power_button:
                 # The power-on press is still held (§7.3.1a); an explicit
                 # set_input(11, …) below would win, as any later press does.
