@@ -382,3 +382,42 @@ Consequence: the reusable :mod:`tt_emu.nand_provision` seam (validated byte-exac
 `0x0404xxxx`/`0x04010000` NAND-DMA MMIO). The current `ProducerProfile` fields are MT-shaped; a
 ZC3201 variant should carry `dispatch`, `ring_*`, `usb_loop`, `format_worker`, and the traced
 NAND-leaf addresses instead of the MT vtable slots.
+
+### Leg 6 — the chip-detect wall is SOLVED; the real format protocol is driven
+
+`scripts/zc3201_producer_probe.py` now drives the **real factory command protocol**, not cmd 5 in
+isolation, and the "gNand init fails chip-detect" wall from Leg 5 is cleared. Full detail (Proven,
+byte/disasm-cited) is in `docs/zc3201-producer-addresses.md` §9; the load-bearing findings:
+
+* **The format is a 3-command host sequence**, recovered from the workers' own debug strings:
+  **cmd 2 `transc_get_chip_id`** (worker `0x08001260`) → **cmd 3 `transc_set_chip_param`**
+  (`0x08001430`) → **cmd 5 `transc_format`** (`0x08001660`). Driving cmd 5 alone (as Leg 5 did)
+  fails because the geometry has not been loaded yet — that was the whole "gNand init fails". (§4's
+  semantic labels were mis-assigned; these are Proven from the strings.)
+* **The ring packet's `arg0` (`pkt[4..7]`) is a POINTER** to the data buffer (the dispatcher
+  forwards `r0 = arg0`). cmd 3's buffer is a **287-byte chip-param blob**; cmd 3 memcpy's it into
+  `0x0801f751`, reads the physical chip-ID over **NFC `0x0404a150`** (the ZC3201 NAND HAL uses BOTH
+  the `0x0404a000` and `0x04070000` bands), and — when the returned ID matches the blob's `[0:3]`
+  expected-ID — prints **`find chip=1`** and builds the gNand device descriptor `*0x08024b50`.
+* **The NAND method-vtable leaves are pinned STATICALLY** (Leg 5 expected these to need dynamic
+  tracing): `desc[+0x28]=0x08005c1c +0x2c=0x08005b14 +0x34=0x08005be0 +0x38=0x08005d44
+  +0x3c=0x08005db0 +0x40=0x08005a04 +0x44=0x08005af8 +0x30=0x08005cd8` — the read/write/erase/
+  readspare leaves the capture harness hooks. The descriptor↔blob geometry decode is in §9.
+
+**Leg 6 resume pointer.** With `cmd 2 → cmd 3 → cmd 5` and a matching chip-ID, the gNand init
+`0x08002eb4` **no longer errors** — it allocs against real geometry, then builds the FatLib/MtdLib
+**medium** (`0x0800cd78` + `0x08012a88`) and calls a still-**null** method pointer → fetch fault at
+PC `0x10000`, **caller LR `0x0801271c`** (nandflash band). Two coupled next steps, both now precise:
+1. **Get the real geometry blob.** The placeholder blob (`scripts/zc3201_producer_probe.py`) yields
+   a *scrambled* geometry (`page size=1`, `planes=64`, `plane size=512`) because the exact 16-bit
+   sub-field encoding needs the pen's true `flash_ic.ini` values — the real ZC3201 NAND chip-ID and
+   its page/block byte sizes. Source candidates: the Windows host tool's `flash_ic.ini`, or derive
+   from the firmware's own accepted chip-ID (`tt_emu/peripherals/nand.py` `NAND_READ_ID =
+   0x9551D3EC`, Samsung K9GAG08U0M) and standard geometry. A correct blob makes the medium's method
+   table initialise fully (no null slot).
+2. **Capture the format.** Once the medium builds, disassemble/hook the null-method caller at
+   `0x0801271c` (nandflash band) and the vtable leaves `0x08005b14/0x08005c1c/0x08005be0/...`, drive
+   cmd 5's format worker `0x0800849c`, and capture the NAND writes into a `WritableNand` — the
+   ZC3201 variant of `tt_emu.nand_provision` (ring-dispatch driver, hooks at the static leaves).
+   Then convert to a `NandImage` the real `NfcController` serves and reach `fs_storage_mount_init`
+   `0x0802d0e0` mounting A:/B:.

@@ -270,3 +270,57 @@ harness the §7 quick-list feeds). Results:
   writes can be captured to a `WritableNand` (the ZC3201 variant of
   `tt_emu.nand_provision`, hooking the nandmtd/nandflash bands or the `0x04070000`
   register I/O).
+
+---
+
+## 9. The real format protocol — the chip-detect blocker is SOLVED (Proven)
+
+§8's "gNand init fails chip-detect *before* any read-ID" was a symptom of driving
+cmd 5 in isolation. The producer's format is **not** standalone: it needs the
+device geometry loaded first by the host's protocol sequence. All Proven by
+running the updated `scripts/zc3201_producer_probe.py`:
+
+* **Command semantics (from the workers' debug strings).** cmd 1 `transc_test`;
+  **cmd 2 `transc_get_chip_id`** (worker `0x08001260`); **cmd 3
+  `transc_set_chip_param`** (worker `0x08001430`); cmd 4 `transc_erase`
+  (`0x080015f8`); **cmd 5 `transc_format`** (worker `0x08001660`, which calls the
+  gNand init `0x08002eb4`). (The §4 semantic labels were mis-assigned; these are
+  Proven from the strings.)
+
+* **The ring packet's `arg0` (`pkt[4..7]`) is a POINTER**, not inline data. The
+  dispatcher forwards `r0 = pkt[4..7]` to the worker; for cmd 3 that is a pointer
+  to a **287-byte (`0x11f`) chip-param blob** which the worker memcpy's into the
+  static struct `0x0801f751`, then re-reads the physical chip-ID over the NFC and
+  matches it against the blob's `[0:3]` expected-ID.
+
+* **The chip-ID is read on NFC `0x0404a150`** (the MT producer's `nfc_readid_reg`)
+  — the ZC3201 NAND HAL uses BOTH bands: `0x0404a000` (status/ready `+0x158`
+  bit31, data `+0x150`) AND `0x04070000`. Returning the pen chip-ID there makes
+  cmd 2 report `Get chip id: 0x…, count: 1` and cmd 3 print **`find chip=1`**.
+
+* **cmd 3 builds the device descriptor `*0x08024b50`** (0x54 B) and sets the
+  geometry global `0x0801569c`. The **NAND method vtable is filled with STATIC
+  leaves** (docs/§8 expected these to need dynamic tracing — they are pinned):
+  `+0x28=0x08005c1c +0x2c=0x08005b14 +0x34=0x08005be0 +0x38=0x08005d44
+  +0x3c=0x08005db0 +0x40=0x08005a04 +0x44=0x08005af8 +0x30=0x08005cd8`. These are
+  the read/write/erase/readspare leaves a capture harness hooks to a `WritableNand`.
+
+* **Descriptor geometry decode** (builder `0x080056d4`, `r4 = 0x0801f751 = blob`):
+  `desc[+4]=LE32(blob[0x14:0x18])` (block count), `desc[+0x14]=LE16(blob[6:8])`
+  (page size), `desc[+0x10]=LE16(blob[0xc:0xe])`, `desc[+0xc]=LE16(blob[8:0xa]) /
+  desc[+0x10]`, `desc[+0x1c]=LE16(blob[4:6])`, `desc[+0x18]=LE16(blob[4:6]) /
+  desc[+0x1c]` (=1), `desc[+0]=blob[0x13]`, `desc[+8]=n_chips·desc[+0xc]`;
+  `blob[0xf]==1` selects a different path (`0x08001590`). (`0x080133f8` is an
+  unsigned divide.)
+
+**Now-precise remaining wall.** With `cmd 2 → cmd 3 (matching chip-ID + blob) →
+cmd 5`, the gNand init `0x08002eb4` **no longer prints "init error gNand"** — the
+alloc succeeds against the real geometry. It then builds the FatLib/MtdLib
+**medium** (`0x0800cd78` + `0x08012a88`) and calls a still-**null** method pointer
+→ fetch fault at PC `0x10000`, **caller LR `0x0801271c`** (the nandflash band). Two
+coupled next steps: (1) the EXACT geometry sub-field encoding needs the real host
+`flash_ic.ini` values (the pen's true NAND chip-ID + page/block byte sizes) so the
+medium's method table initialises fully — the placeholder blob here yields a
+partially-scrambled geometry (`page size=1`, `planes=64`, `plane size=512`); (2)
+once the medium builds, cmd 5's format worker `0x0800849c` iterates the chip and
+its writes (through the `0x08005b14/...` leaves) are captured to a `WritableNand`.
