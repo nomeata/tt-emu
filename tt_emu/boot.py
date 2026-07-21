@@ -401,7 +401,7 @@ def build_zc3201_machine(
     )
     machine.add_peripheral(oid)
 
-    machine.set_entry_state(profile.prog_entry, SVC_STACK_TOP, CPSR_SVC_IRQS_ON)
+    machine.set_entry_state(profile.prog_entry, profile.svc_stack_top, CPSR_SVC_IRQS_ON)
     machine.nand = nand
     machine.oid = oid
     log.info(

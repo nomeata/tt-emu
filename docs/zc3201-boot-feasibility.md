@@ -1487,3 +1487,154 @@ The success criterion (a GME plays on a tapped ZC3201 OID; gme tests on both fir
 the `build_zc3201_machine` OID wiring + `machine.oid`, and the `firmware/zc3201.py` dispatch
 correction + OID landmarks. Probes: `scripts/zc3201_oid_probe.py`, `scripts/zc3201_oid_trace.py`,
 `scripts/zc_nb.py` (nandboot disassembler).
+
+## Leg 21 — the codepage IS resolved (simple-widening); game discovery RE'd end-to-end; two precise FS-layer blockers pinned
+
+Leg 20 left two "FS-layer" walls: (1) the recurring codepage full-load, and (2) game
+discovery never enumerating `B:/*.gme`. This leg **resolves the codepage** (authentically),
+**adds the missing A: factory content**, and **reverse-engineers the entire ZC3201 discovery /
+mount / play chain** — pinning the two remaining blockers to a precision the next leg can
+close. All findings Proven (disasm + live-instrumented; probes
+`scripts/zc3201_fsopen_probe.py`, `scripts/zc3201_cprecover_probe.py`,
+`scripts/zc3201_discovery_probe.py`).
+
+### Wall 1 SOLVED — the codepage size-unit contradiction is resolved: the pen falls back to simple widening
+
+The Leg-16 "size-unit / block-unit contradiction" is fully cracked, and the resolution is
+**authentic, not a hack**. The nandboot boot-file loader (`func_0x08000dcc` →
+`FUN_0x08000868` index search → `FUN_0x08000cd0` content walk, disasm-cited) and the codepage
+**demand-pager** (`codepage_recover` `0x08025b7c`) tie the record `size` field to three
+consumers, all keyed to the **16-KiB block / 512-B page** device geometry:
+
+* **W1 guard** (`func_0x08000dcc` `0x08000e2c`): rejects the bin unless `size >> 14 <= max`
+  (codepage `max = 8`, i.e. **128 KiB**).
+* **block-map copy** count `r7 = 1 + (size-1)>>14` — the loader copies exactly `r7`
+  `{origin,backup}` entries into the codepage descriptor's **inline** block-map (`cp+6`), which
+  is **only 9 entries** wide (`cp+6 .. cp+0x18`, where the 0x20-byte header begins).
+* the demand-pager `codepage_recover(off)`: indexes `cp+6[off>>14]` for the origin block, reads
+  `32·origin + (off>>9 & 31)`, returns `page[off & 0x1ff]`.
+
+The codepage is **0xD6CCC = 879 820 B = 54 blocks** — far over the 8-block (128-KiB) cap. There
+is **no** size value where W1 passes *and* the full table loads. The self-heal fallback
+(`codepage_recover` → `FUN_080088c4` re-reads the on-NAND block-map for the faulting block)
+**cannot rescue a partial pre-load on this hardware**: a real K9F5608 has a 16-bit row address,
+so an out-of-range physical read (from a stale/garbage high `cp+6[]` entry) **wraps to a valid
+page and succeeds with wrong data** — `FUN_08025b04` returns success, so the fallback never
+fires. Therefore the **only** self-consistent behaviour is that the 879-KiB codepage **fails
+W1, `codepage_load` returns 0, the codepage-type flag `*0x08007c4c` stays 0, and the path
+converter (`FUN_080265ec`) takes its `flag==0` branch = plain byte-widening** (ASCII → UTF-16).
+Every tiptoi filename is ASCII, so simple widening is exactly right — this is what the real pen
+does, and it matches Leg 19's observation that forcing `*0x08007c4c = 0` yields the correct
+paths.
+
+**Fix (landed, product):** `nand_image_zc3201._lay_system_bin_index` now stores the system-bin
+record `size` in **bytes** (was 512-B sectors), so codepage's true `0xD6CCC` trips W1 → flag 0 →
+simple widening. **Verified** (`scripts/zc3201_fsopen_probe.py`): flag `*0x08007c4c == 0`, and
+every `fs_open` path across boot converts **non-empty** — `A:/SYSTEM/profile.dat`, `B:/FLAG.bin`,
+`A:/VOIMG/Chomp_Voice.bin` (the chomp path Leg 19/20 saw empty), `A:/studylist.lst` (the
+discovery list — previously empty, which was the hidden discovery blocker), `A:/African.fen`, …
+**Zero empty paths** (was 4). The MT nand tests are unaffected (large-page builder untouched);
+`tests/test_firmware_profile.py` + `tests/test_nand.py` green.
+
+### A: factory content — merge the container's `to_udisk` payload (DIAGNOSED, HELD)
+
+The authentic A: factory content is the ZC3201 `.upd`'s own `to_udisk` payload
+(`firmware.udisk_files` = **`VOIMG/Chomp_Voice.bin`, 4 320 228 B**), which MT's
+`build_nand_image` merges into A:. Merging it into `build_zc3201_nand_image` makes
+`A:/VOIMG/Chomp_Voice.bin` **exist**, so with the simple-widening codepage the power-on chime's
+`fs_open` succeeds and `play_chomp_voice` **actually plays the chime** (`voice_play_sample` runs
+once — real progress, the chime never played before). **But this is HELD** (the merge is
+commented in `build_zc3201_nand_image`): the ZC3201 audio **DAC DMA shares the `0x04010000`
+block with the L2 NAND staging buffer and its completion is unmodelled** (Leg 18). Verified
+(`scripts/…` diag): once the chime plays, the boot still reaches book-mode idle and the OID tap
+is **captured** (`ctx+8 == 0x400000|oid`), but the DAC/L2 interaction **parks the event pump** so
+the tap event `0x1063` is no longer **dispatched** into the statechart (`0x080037d8`). So a real
+`.gme` play needs the ZC3201 DAC modelled / separated from the L2 buffer **first**; until then
+the merge is left off to keep the OID/standby tests green. (The test `.gme` stays B: content.)
+
+### Wall 2 — game discovery is fully RE'd; it is the MT flow, renamed `studylist.lst`
+
+ZC3201's discovery is the structural twin of MT's `oidfilelist.lst` flow
+(`2N-update3202MT/docs/book-discovery-and-load.md`), with the list file renamed
+**`A:/studylist.lst`** (list-id 1), scan root **`B:`**, filter **`*.gme`**, identical
+**0x424-header + 0x214-record** format. Pinned addresses (runtime base `0x08008000`):
+
+* discovery setup `FUN_080a178c` → open/create list `FUN_080a1f9c` (`lst_file_open_or_create`
+  twin; `fs_open(path,2,2)` r/w else `fs_open(path,1,1)` create; handle → `ctx+0x62c`) →
+  gate `FUN_080a2224` (skip if the list already has a valid 0x424 header) → finalize
+  `FUN_080a2070` → recursive scanner **`FUN_080a1d40`** (`opendir` `FUN_080ab860`, per non-dir
+  dirent writes a 0x214 record via `FUN_080a089c`, count → `ctx+4`).
+* mount = **`gme_mount_check_product` `FUN_080297dc`**: loop bound `*(u16)*DAT_08029b68` (the
+  fresh scan count); per record `fs_open(path,0,0)`, magic `hdr@8 == 0x238B`, and (mode 1)
+  `hdr@0x14 == game_subctx+4` (tapped OID); match ⇒ handle → `p_filehandle_current_gme`
+  `0x080d20a0`. (No language check, unlike MT.)
+* tap dispatch = **`study_main` `0x0804dc38`** (event `0x1063`): product band → `FUN_080297dc`;
+  content band → `gme_oid_to_playscript 0x0804d358` → `gme_exec_command 0x0804c6e4` /
+  `voice_load_and_play 0x0809f16c`. Initial book-open mount is `akoid_open_check 0x080299a0`
+  (mode 0). example.gme = product **42**, magic 0x238B, content OIDs 8065-8067.
+
+**Requirement (confirmed):** the `.gme` lives on **B:**, and the firmware **creates + writes
+`A:/studylist.lst`** at scan time, so the emulator's A: FAT must be **writable at runtime**
+(MT's tt-emu already relies on this — it never pre-seeds `oidfilelist.lst`). Our `NfcController`
+small-page write path round-trips (Leg 13), so this should hold once the two blockers below are
+cleared.
+
+### Blocker #1 (Proven) — the scan root path is built on a stack the ZC3201 pointer-guard rejects
+
+The scan root `"B:"` is converted to a **stack-local** wide string and copied into the scan
+context (`ctx+8`) by `FUN_08024d84` — but that copy is **guarded**: `FUN_08024d84` copies only if
+`FUN_08008a04(src)` passes, and `FUN_08008a04(p) = (p ∈ [0x08000000, 0x08200000])` (disasm:
+`p + 0xf8000000 < 0x200001`). ZC3201's SVC stack seed is the MT `svc_stack_top = 0x08400000`, so
+at discovery **SP ≈ 0x083f_fce0** and the stack-resident `"B:"` (0x083f_fce8) **fails the range
+check** → the copy is skipped → `ctx+8` keeps stale heap garbage (observed: `"…v0136…GERMAN…"`
+firmware-version/language bytes) → `opendir` gets a garbage root → **0 records** → nothing
+discovered. (This is a genuine ZC3201 delta: its valid-pointer window is only the lower **2 MiB**,
+vs MT's 4 MiB.)
+
+Lowering `svc_stack_top` **fixes the root** (`opendir` path becomes `"B:/"`), and OID *capture*
+still works (`ctx+8 == 0x400000|oid`), **but** every value tried below the guard limit
+(`0x08200000`, `0x081d0000`) **perturbs the fixed high-heap objects** (iterator `0x081d8058`,
+services vtable `0x081d9ad8`, high-heap `0x081dd000`) enough that the OID tap event `0x1063` is
+**no longer dispatched at `PC_EVENT_DISPATCH 0x080037d8`** (the boot's deep stack overruns them).
+So the change was **reverted** (kept at the MT default) to keep the boot/OID tests green; the
+`FirmwareProfile.svc_stack_top` field + a full note are in place. **Next:** recover the *real*
+ZC3201 SVC stack base (the skipped boot ROM sets it; it must be < 0x08200000 yet clear of the
+`0x081dxxxx` high objects — candidate: just under `0x081d8000`, with the high-heap objects
+relocated or the stack given a dedicated lower window), or move the high-heap allocations.
+
+### Blocker #2 (Proven) — `opendir("B:/")` resolves to a NON-directory → enumeration finds nothing
+
+Independently of #1 (i.e. even with the correct `"B:/"` root), the recursive scanner's
+`opendir` (`FUN_080ab860`) calls `File_Open("B:/")` (`0x080a8e04`) and then
+`FUN_080a8a8c(handle)`, which returns 1 **only if the handle is a directory** (`*(fh+0x1c)` ==
+valid-magic `0x123455aa` **and** `dirent+0x3c & 0x10`). For `"B:/"` the resolved handle has
+`dirent+0x3b = 1` but **`dirent+0x3c (attr) = 0`** (not a directory) → `FUN_080a8a8c` returns 0 →
+`opendir` returns NULL → the scan loop never runs → **0 records**. So `File_Open("B:/")` is not
+resolving the B: **root directory** as a directory (attr 0x10). The B: FAT16 itself is correct
+(built with `EXAMPLE.GME` attr 0x20 in the root dir), so the fault is in how FatLib resolves the
+drive-root path `"B:/"` (trailing-slash handling, or the B: partition-1 FAT read through the
+MtdLib map). **Next:** trace `File_Open`'s drive-root path parse (compare against MT, whose
+`opendir("B:/")` succeeds), and/or verify the B: FAT16 boot sector + root-dir clusters read back
+correctly through the partition-1 map (Leg 13 verified only A:).
+
+### Leg 21 resume pointer
+
+The codepage wall is closed (Wall 1 done); discovery is fully mapped; the two remaining blockers
+are FS-layer and precisely pinned. **To finish:** (a) place the ZC3201 SVC stack in a window that
+is `< 0x08200000` *and* clear of the `0x081dxxxx` high-heap objects (recover the real base or
+relocate the objects) so the scan root copies and the event pump stays intact; (b) fix
+`File_Open("B:/")` to resolve the B: root as a directory (attr 0x10) so `opendir` enumerates
+`EXAMPLE.GME`; then `studylist.lst` gains a record, a **product tap (OID 42)** mounts example.gme
+via `FUN_080297dc`, a **content tap (8065)** reaches `gme_oid_to_playscript` →
+`voice_load_and_play 0x0809f16c` (capture there — the lab observable), and
+`tests/test_scripting.py` parametrises over both firmwares. **State:** MT green; ZC3201 boots →
+book-mode idle → OID poll runs → tap captured (`ctx+8 == 0x400000|oid`) → discovery scan runs with
+the correct list path; blocked at the two FS-layer walls above. Product change this leg (kept, green):
+`nand_image_zc3201._lay_system_bin_index` (system-bin record size in **bytes** → the 879-KiB
+codepage trips W1 → flag 0 → simple-widening path conversion). Diagnosed but **held** (not landed):
+the `firmware.udisk_files` → A: merge (chime plays but the unmodelled DAC/L2 interaction drops the
+OID tap dispatch — needs the DAC modelled first) and the `FirmwareProfile.svc_stack_top` field
+(added + documented; ZC3201 kept at the MT default because every in-range value collides with the
+fixed high-heap objects and perturbs the event pump). Probes:
+`scripts/zc3201_fsopen_probe.py`, `scripts/zc3201_cprecover_probe.py`,
+`scripts/zc3201_discovery_probe.py`.

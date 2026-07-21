@@ -173,6 +173,19 @@ class FirmwareProfile:
     #: the OID data line, so the mirror must move or it clobbers OID data).
     gpio_amp_pin: int = 16
 
+    #: Initial SVC-mode stack top the boot seed sets (SP grows down from here).
+    #: The stack must lie inside the firmware's **valid-pointer window**: the
+    #: ``Utl_UStr*`` bounded string-copy routines guard every operand with a
+    #: pointer-range check and **silently no-op** on an out-of-range address. MT's
+    #: guard admits the full 4-MiB RAM (top ``0x08400000``); **ZC3201's guard
+    #: (``FUN_08008a04``) is only the lower 2 MiB — ``addr ∈ [0x08000000,
+    #: 0x08200000]``**. With the MT stack top the discovery scan builds its ``"B:"``
+    #: root path on a stack ~``0x083f…`` that fails the check, so the copy into the
+    #: scan context is skipped, the root stays garbage, the ``B:`` ``*.gme`` scan
+    #: enumerates nothing, and no game is ever discovered. The stack must sit below
+    #: ``0x08200000`` (above the ~``0x081e…`` heap top).
+    svc_stack_top: int = 0x0840_0000
+
     #: SoC chip-ID constant read at ``0x04000000`` (SysCon REG_CHIP_ID). Per-
     #: generation: 2N-MT ``0x30393031`` ("1090"), ZC3201 ``0x33323931`` ("1923").
     #: The firmware's FAT/MtdLib version gate (``fw_version_ref`` 0x0802c880 /
@@ -391,6 +404,17 @@ ZC3201 = FirmwareProfile(
     oid_pin_data=16,           # ...and samples data/attention on GPIO16 (MT: GPIO9)
     oid_bit_count_addr=0x0800_7BF9,  # capture-state struct 0x08007bf8, bit_count +1
     gpio_amp_pin=9,            # ZC3201 audio amp is GPIO9 (frees GPIO16 for OID data)
+    # NOTE (Leg 21): ZC3201's ``Utl_UStr*`` guard (``FUN_08008a04``) admits only the
+    # lower 2 MiB ([0x08000000, 0x08200000]), and the discovery scan's stack-resident
+    # "B:" root path fails it at the current top (SP ~0x083f…), so the scan root stays
+    # garbage and no ``.gme`` is enumerated. Lowering ``svc_stack_top`` fixes the root
+    # path, BUT any value < 0x08200000 tested so far (0x08200000, 0x081d0000) collides
+    # with / perturbs the fixed high-heap objects (iterator 0x081d8058, services vtable
+    # 0x081d9ad8) enough that the OID tap event (0x1063) is no longer dispatched at
+    # 0x080037d8 (OID *capture* still works; ctx+8 == 0x400000|oid). Finding the real
+    # ZC3201 stack base (or relocating the high-heap objects) is the next discovery
+    # step — see docs/zc3201-boot-feasibility.md "Leg 21". Kept at the MT default for
+    # now so the boot/OID tests stay green.
     soc_chip_id=0x3332_3931,  # "1923" — the ZC3201 SoC chip-ID (FS version gate)
     nand_small_page=True,     # Samsung K9F5608: 512-B page + 16-B OOB, 32 pages/block
     nand_page_size=512,

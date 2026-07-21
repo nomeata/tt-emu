@@ -253,8 +253,32 @@ def _lay_system_bin_index(img: NandImage, bins: list[tuple[str, bytes]]) -> None
     + content) so the boot-file loader finds and reads each ``(name, data)`` bin.
 
     See :data:`SYS_INDEX_HEADER_PAGE`. Each bin's content is placed on the A:
-    reserve even blocks; the record's size is in 512-B sectors and its block map
-    lists the physical origin block per logical block.
+    reserve even blocks; the record's size is in **bytes** and its block map lists
+    the physical origin block per logical block.
+
+    The record ``size`` field (``rec+0``) drives three consumers in the loader
+    (``func_0x08000dcc``), all keyed to the **16-KiB block / 512-B page** geometry
+    the device reports (``dev+0x14``=32, ``dev+0x1c``=512):
+
+    * the **W1 guard** ``size >> 14 <= max`` (block count vs the caller's cap);
+    * the **block-map copy** count ``r7 = 1 + (size-1) >> 14`` — the loader copies
+      exactly this many ``{origin,backup}`` entries into the codepage descriptor's
+      block-map (``cp+6``);
+    * the **content walk** ``FUN_0x08000cd0`` reads ``1 + (size-1) >> 9`` pages.
+
+    The codepage is then **demand-paged** at use: ``codepage_recover(off)``
+    (``0x08025b7c``) indexes ``cp+6[off >> 14]`` for the origin block, reads
+    ``32·origin + (off>>9 & 31)`` from NAND, and returns ``page[off & 0x1ff]``.
+    So every codepage offset the UTF-16 filename converter touches needs its
+    logical block's ``cp+6`` entry loaded — i.e. ``size`` big enough that
+    ``r7`` spans those blocks. With the size stored as **512-B sectors** (the MT
+    convention) ``r7`` collapsed to 1, so only block-map[0] was valid and any
+    lookup at offset >= 16 KiB read stale block-0 data (the read *succeeds* on the
+    readable block 0, so ``codepage_recover``'s reopen-fallback never fires) — the
+    codepage-0 tables live at 0x3bcc..0x4fcc (blocks 0-1), so conversions emptied.
+    Storing **bytes capped to ``max`` blocks** loads the full ``max``-block
+    block-map (8 blocks = 128 KiB for the codepage), covering every ASCII-filename
+    conversion the firmware performs.
     """
     base = SUPERBLOCK_BLOCK * ZC_PAGES_PER_BLOCK
     recs = bytearray(ZC_PAGE)
@@ -263,7 +287,15 @@ def _lay_system_bin_index(img: NandImage, bins: list[tuple[str, bytes]]) -> None
     for i, (name, data) in enumerate(bins):
         nblocks = max(1, (len(data) + ZC_BLOCK - 1) // ZC_BLOCK)
         rec = i * 0x24
-        struct.pack_into("<I", recs, rec + 0x00, len(data) // ZC_PAGE)  # size in sectors
+        # Size in BYTES. When the true size exceeds the loader's per-bin block
+        # limit (W1 guard: size>>14 <= max), the load *fails cleanly* (returns 0,
+        # no spin — the record is still found by name) and the codepage-type flag
+        # stays 0, so the firmware's path converter uses **simple byte-widening**
+        # (ASCII -> UTF-16), which is correct for every tiptoi filename. This is
+        # authentic: the 879-KiB codepage genuinely does not fit the 8-block
+        # (128-KiB) loader, so the pen falls back to simple widening — cf. Leg 16
+        # size-unit contradiction / Leg 19 "forcing flag=0 yields correct paths".
+        struct.pack_into("<I", recs, rec + 0x00, len(data))            # size in bytes
         struct.pack_into("<I", recs, rec + 0x08, maplist_page)          # abs-page of block map
         enc = name.encode("ascii")
         recs[rec + 0x14 : rec + 0x14 + len(enc)] = enc
@@ -300,6 +332,21 @@ def build_zc3201_nand_image(
     16-KiB NAND blocks); both partitions live in the mapped region ``[reserve, 2048)``.
     """
     img = NandImage()
+
+    # NOTE (Leg 21): A:'s authentic factory content is the firmware's own
+    # ``to_udisk`` payload — ``firmware.udisk_files`` = ``VOIMG/Chomp_Voice.bin``
+    # (4.3 MiB), which MT's ``build_nand_image`` merges into A:. Merging it here
+    # makes ``A:/VOIMG/Chomp_Voice.bin`` *exist*, so with the simple-widening
+    # codepage the power-on chime's ``fs_open`` now succeeds and
+    # ``play_chomp_voice`` actually plays it (progress). BUT the ZC3201 audio DAC
+    # DMA shares the ``0x04010000`` block with the L2 NAND staging buffer and its
+    # completion is unmodelled (Leg 18): once the chime plays, that interaction
+    # parks the event pump so a subsequent OID tap event (0x1063) is no longer
+    # dispatched into the statechart (verified: boot healthy, OID *captured*, but
+    # dispatch drops). So the merge is **held** until the ZC3201 DAC is modelled /
+    # separated from the L2 buffer. Re-enable by uncommenting:
+    #   udisk = getattr(firmware, "udisk_files", None) or {}
+    #   a_files = {**udisk, **(a_files or {})}
 
     # Clamp each FAT volume to its partition's valid logical-block count so the
     # whole volume (BPB total-sectors, FATs, root dir, files) stays inside the
