@@ -50,6 +50,7 @@ __all__ = [
     "ZC_NBLOCKS",
     "ZC_RESERVE_BLOCKS",
     "MAP_OOB_MAGIC",
+    "BBT_PAGES",
 ]
 
 # --- K9F5608 geometry (update.upd flash_ic row; docs §10) ----------------------------
@@ -71,6 +72,22 @@ ZC_RESERVE_BLOCKS = 64
 SUPERBLOCK_BLOCK = 0
 SUPERBLOCK_PAGES = (29, 30, 31)
 SHIFT = 9  #: log2(512) — the page/sector shift the mount reads at ``buf+8``.
+
+#: The on-media **bad-block table (BBT)**. The map-table build gates its OOB scan
+#: (``FUN_0802edb8`` ``0x0802edb8``) on a per-page bad-block check (``dev+0x40`` =
+#: ``FUN_08030108`` ``0x08030108``), which — on first use — *reads the BBT from
+#: NAND* via the nandboot leaf ``func_0x080006fc`` ``0x080006fc`` into a manager
+#: bitmap. That leaf reads absolute pages from ``32·flash_ic[0] + flash_ic[2] +
+#: block`` (``flash_ic`` = the descriptor at ``0x08007c3c``); with the from-entry
+#: boot's zeroed ``flash_ic`` (``[0]=[2]=0``) it reads **device pages 0..3**, and
+#: the manager bitmap is exactly ``page-0 bytes [0:256]`` (2048 blocks / 8). A byte
+#: of **0x00** there = all-good; the blank ``0xFF`` we would otherwise serve marks
+#: every block bad → the scan reads no OOB tag → ``map_table_build`` returns NULL →
+#: ``fs_storage_mount_init`` hangs at ``0x0802d208``. So an authentic formatted
+#: image lays a zeroed BBT across block-0 pages 0..3. (This mirrors what the
+#: producer's format writes into the reserve zone; the read address tracks the
+#: seeded ``flash_ic`` descriptor — see ``docs/zc3201-boot-feasibility.md`` Leg 11.)
+BBT_PAGES = (0, 1, 2, 3)
 
 #: OOB map magic: a mapped (live) page carries ``0x12560000 | logical_page`` in its
 #: 4-byte OOB tag (``FUN_0802edb8`` ``0x0802edb8`` classifier).
@@ -150,6 +167,13 @@ def build_zc3201_nand_image(
 
     a_sectors = a_bytes // ZC_PAGE
     b_sectors = b_bytes // ZC_PAGE
+
+    # Bad-block table (block 0, pages 0..3) — an all-good (zeroed) BBT the mount's
+    # per-page bad-block check reads from NAND before scanning OOB tags. Without it
+    # every block reads "bad" and the map-table build returns NULL (see BBT_PAGES).
+    for page in BBT_PAGES:
+        _place_page(img, SUPERBLOCK_BLOCK * ZC_PAGES_PER_BLOCK + page,
+                    b"\x00" * ZC_PAGE, struct.pack("<I", 0x1234_5678))
 
     # Superblock (block 0, last pages) — read by the map read + FUN_0802ccf0.
     sb = _superblock_payload(ZC_RESERVE_BLOCKS, a_sectors, b_sectors)

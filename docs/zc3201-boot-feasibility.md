@@ -628,3 +628,76 @@ pump → standby → product/cover-OID tap → book → GME play (re-point `OidS
 
 **Not yet met:** the success criterion (all gme tests on both firmwares) needs the mount to
 complete first. This leg unblocked the 4-leg geometry wall and pinned the exact next failure.
+
+## Leg 11 — the bad-block wall is SOLVED (on-media BBT); the tag source is CORRECTED (page data, not OOB)
+
+Leg 10's candidate #1 (bad-block bitmap) is fully cracked and fixed **authentically** in the
+NAND image; candidates #2/#3 are re-characterised with a load-bearing correction. All findings
+below are Proven (byte/disasm-cited + live-run instrumented; probes
+`scripts/zc3201_badblock_probe.py`, `scripts/zc3201_diag_forcegood.py`, plus scratch traces).
+
+### Candidate #1 — SOLVED: the bad-block table is READ FROM NAND, not computed
+
+`FUN_08030108` `0x08030108` (`dev+0x40`) is the per-page bad-block check the map scan
+(`FUN_0802edb8`) gates its readspare loop on. On its first call it **populates a manager
+bitmap** (`0x081d97d8` = `DAT_08030418`; state byte `+0`, bitmap ptr `+4`, initial state **1**,
+bitmap heap-alloced `0x80fa200`) via the nandboot leaf `func_0x080006fc` `0x080006fc`, then reads
+one bit per (block,page). `func_0x080006fc(start, buf, len)` is **not** a scanner — it is a
+**read-range primitive**: `dst = buf + 512·i`, it reads absolute pages via `0x80028b0` from
+`addr = 32·flash_ic[0] + flash_ic[2] + start/4096 + block`, where `flash_ic` = the descriptor at
+**`0x08007c3c`** (`DAT_08000858`). In the from-entry boot that descriptor sits **inside the zeroed
+`bss_seed` window** (the skipped nandboot chip-detect would fill it), so `flash_ic[0]=[2]=0` and the
+read address collapses to **device pages 0..3**; the manager bitmap is then exactly **page-0 bytes
+`[0:256]`** (2048 blocks / 8). A blank `0xFF` there marks *every* block bad → the readspare never
+runs → `map_table_build` (`FUN_0802cbd8→FUN_0802ea54`) returns NULL → hang `0x0802d208`.
+
+**Fix (landed, product):** `build_zc3201_nand_image` lays a zeroed BBT across **block-0 pages 0..3**
+(`nand_image_zc3201.BBT_PAGES`). With it the *real* bad-block check returns "good" and the readspare
+runs (Proven: `readspare_leaf` `0x08030224` 50144× with the real check, vs 0 before). The nandboot
+scratch allocator `0x8000a14` (used by `func_0x080006fc`) returns a correctly-zeroed high-heap buffer
+(`0x081dd000`; its fixed-slot pool descriptor at `~0x80074e0` is bss-zeroed → falls through to the
+`0x081dd060+` heap search), so the only missing ingredient was the on-media BBT.
+
+### Candidate #2 — CORRECTED: the readspare reads its tag from window[0] = **page data[0:4]**, not OOB
+
+With the BBT fixed, the map scan runs `FUN_0802edb8` 960× but still fails: it never matches a
+`0x1256` tag. Traced the readspare end-to-end (`FUN_08030224` `0x08030224` → `func_0x08002bac`
+`0x08002bac`): the low-level read issues a normal small-page read (micro-ops `0x64/0x62/0x119`, our
+`NfcController` deposits into the window), waits ready (`0x80030f8`, NFC `+0x158` bit31), **strobes
+GPIO-out bit 3** (`0x080030d8` → `0x8006954` sets `*0x04000080` bit 3; fires 56324×), then reads the
+4-byte tag from **`*0x08005800`** (`ldr r0,[sl]; str r0,[r7]`, `sl = DAT_08002508 = 0x08005800` =
+the NAND SRAM staging window head) — i.e. **window[0]**. `func_0x08002bac` **returns 0 (success)**
+every time (no poll timeout; ~3.7 ready-polls/read). So the mechanism works — the read is NOT a
+distinct spare command (no `0x50`), and window[0] is **page data[0:4]**, the *same* path the
+superblock read (`FUN_0800c208`) uses successfully (it read `reserve=64` correctly). **Therefore the
+map-table `0x1256` tags must live in the mapped page's DATA[0:4], not in the 16-byte OOB** — a
+correction to Leg 10's "OOB tag" model (`build_zc3201_nand_image` currently writes them via
+`set_tag`/OOB; the firmware never reads OOB on this path). The GPIO-3 strobe is a hardware detail
+(spare/ready latch), not a separate surface the emulator must model — window[0] already carries what
+the firmware reads.
+
+### The precise remaining wall (Leg 11 resume pointer) — candidate #3: the reserve-zone map format
+
+The scan reads **reserve-zone pages** (observed row 127 = block 3 page 31, col 0) and gets
+`0xFFFFFFFF` (blank) because the hand-built image lays nothing there. The MtdLib map-table is a
+**logical→physical translation table stored in the reserve zone** (blocks 0..63), as tagged pages
+whose **data[0:4]** carries `0x1256_0000 | logical` (live), `0x12345678` (system/reserved), or
+`0xFFFFFFFF` (blank); `FUN_0802edb8`'s classifier and `FUN_0802ea54`'s per-partition builder
+(`local_48`/`local_68` bounds, `piVar6[10] + n·0x18` partition records) consume it. Next steps,
+precise and now unblocked:
+
+1. **RE the map-table on-media format** from `FUN_0802ea54` `0x0802ea54` + `FUN_0802e5e0`
+   `0x0802e5e0` + the readspare's physical-page computation in `FUN_08030224` (`page = 32·param_3
+   + divmod(dev[0x18], col)`), and lay it into `build_zc3201_nand_image`: put the `0x1256|logical`
+   tags in page **data[0:4]** (not OOB), in the reserve/map zone the scan actually reads. The
+   fastest disambiguation is still to capture ONE producer-formatted image (Legs 8/9 USB ring) and
+   diff the reserve zone + a data page's first 4 bytes against this spec.
+2. Then A:/B: mount → drive pump → standby → product/cover-OID tap → book → GME play (re-point
+   `OidSensor`, add a ZC3201 `firmware.mt`-style debugger), and parametrise `tests/test_scripting.py`
+   over both firmwares.
+
+**State now:** the unmodified firmware boots `boot_task_main → app_init_main →
+fs_storage_mount_init 0x0802d0e0`: map_read (reserve=64 ✓) → whole_disk_map_build →
+map_table_build → **bad-block check passes (BBT)** → **readspare runs (960 scans × ~52 reads)** →
+still fails to match a map tag because the reserve-zone map-table pages are absent (candidate #3).
+MT unregressed. Product change this leg: the BBT in `nand_image_zc3201.py` only.

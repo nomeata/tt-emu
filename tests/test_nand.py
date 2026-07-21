@@ -615,3 +615,21 @@ def test_build_zc3201_nand_image_superblock_and_fat() -> None:
     assert boot[0x1FE:0x200] == b"\x55\xaa"
     assert boot[0x36:0x3E] == b"FAT16   "
     assert struct.unpack_from("<I", img.get_tag(base), 0)[0] == (MAP_OOB_MAGIC | 0)
+
+
+def test_build_zc3201_nand_image_bad_block_table_is_zeroed() -> None:
+    """The image lays a zeroed on-media bad-block table across block-0 pages 0..3.
+
+    The mount's per-page bad-block check (``FUN_08030108`` ``0x08030108``) reads
+    this region from NAND via the nandboot leaf ``func_0x080006fc`` ``0x080006fc``;
+    the manager bitmap is exactly page-0 bytes ``[0:256]``. A blank ``0xFF`` there
+    marks every block bad and the map-table build returns NULL (mount hang at
+    ``0x0802d208``). Zeros = all-good, so the readspare scan runs. (Leg 11.)
+    """
+    from tt_emu.nand_image_zc3201 import BBT_PAGES, ZC_PAGE, build_zc3201_nand_image
+
+    img = build_zc3201_nand_image(None)
+    for page in BBT_PAGES:
+        assert img.read(page * ZC_PAGE, ZC_PAGE) == b"\x00" * ZC_PAGE
+    # The bad-block manager bitmap is page-0 bytes [0:256] (2048 blocks / 8).
+    assert img.read(0, 256) == b"\x00" * 256
