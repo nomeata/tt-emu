@@ -27,12 +27,66 @@ from dataclasses import dataclass, field
 __all__ = [
     "FetchInfo",
     "FirmwareProfile",
+    "ProducerProfile",
     "MT",
     "PROFILES",
     "ZC3201",
     "by_key",
     "detect",
 ]
+
+
+@dataclass(frozen=True)
+class ProducerProfile:
+    """Addresses to DRIVE this generation's factory ``producer.bin`` under Unicorn.
+
+    The factory USB-flash tool formats the NAND with the exact ``MtdLib``/``FatLib``
+    layout the firmware later mounts, so running it against a Python NAND model is
+    the authoritative way to provision a mountable image (see
+    :mod:`tt_emu.nand_provision` and ``docs/producer-run-results.md`` for the MT
+    ground truth, ``docs/zc3201-producer-addresses.md`` for the 1st-gen addresses).
+    Every address is producer-image absolute (the producer loads flat at
+    ``load_base``, unrelated to the PROG firmware's own link base).
+    """
+
+    load_base: int          #: producer.bin load/entry address (reset vector)
+    entry: int              #: startup entry (== load_base for a `b reset` word0)
+    usb_loop: int           #: main's host-command loop — the harness stops here
+    svc_sp: int
+    irq_sp: int
+
+    disp_burn: int          #: pr_cmd_burn dispatcher (cmds 7 / 0x10 / 0x11 / 0x22)
+    disp_media: int         #: pr_cmd_media dispatcher (cmds 5 / 6 / 9 / 10 / …)
+    cmd_ctx: int            #: command-context global; command number at +4
+
+    #: OS/HAL vtable NAND-op leaves (the seam the harness hooks to the NAND model).
+    n_erase: int            #: vtable +0x20  erase block          (r1=block)
+    n_write: int            #: vtable +0x24  write page           (r1=blk,r2=pg,r3=data)
+    n_read: int             #: vtable +0x28  read page
+    n_bootwr: int           #: vtable +0x2c  boot-page write      (r0=block,r1=data)
+    n_wrpg0: int            #: vtable +0x34  write page0 + tag
+    n_rdpg0: int            #: vtable +0x38  read page0 / bad-check
+
+    r_malloc: int           #: vtable +0x00  malloc
+    r_free: int             #: vtable +0x04  free
+    r_printf: int           #: vtable +0x1c  printf (log oracle)
+
+    #: chip read-ID: the NFC data register the producer polls for the chip-ID
+    #: dword, the read-id peek site (records the CE index), and the dword to
+    #: return for CE0 (the pen has ONE chip; other CEs answer 0xffffffff).
+    nfc_readid_reg: int
+    readid_peek: int
+    chip_id: int
+
+    pr_ctx: int             #: PR ctx global ({+0 chip count; +4 mode; …})
+    anyka_ic_gate: int      #: MtdLib "is-Anyka-IC" check → force 1 (real pen is Anyka)
+    ready_poll: int         #: is_bad_bitmap/ready poll → force "ready" (0)
+    badchk: int             #: chip[+0x38] bad-block-check primitive (0 good / 1 OOB)
+
+    #: Optional: the startup calibration-loop bound literal to shorten (addr, value).
+    calib_bound: tuple[int, int] | None = None
+    #: FsLib driver object + the null method slot to stub for mkfs (cmd 10).
+    fslib_driver_obj: int | None = None
 
 
 @dataclass(frozen=True)
@@ -110,6 +164,10 @@ class FirmwareProfile:
     #: bring-up has them in one place. Not wired into any hardware model.
     symbols: dict[str, int] = field(default_factory=dict)
 
+    #: Addresses to drive this generation's ``producer.bin`` to format a NAND
+    #: image (:mod:`tt_emu.nand_provision`); ``None`` until reverse-engineered.
+    producer: ProducerProfile | None = None
+
     def recognize(self, prog: bytes) -> bool:
         """True iff ``prog`` carries this profile's build fingerprint."""
         return prog[: len(self.build_prefix)] == self.build_prefix
@@ -134,6 +192,37 @@ MT = FirmwareProfile(
         size=11_303_276,
     ),
     boots_to_book=True,
+    # Proven against fw/2N-update3202MT/data/producer.bin (mt-producer-addresses.md
+    # + firmware-re/tools/ttrun_producer.py); the reusable seam is validated here
+    # before retargeting to ZC3201 (which has no reference output).
+    producer=ProducerProfile(
+        load_base=0x0800_0000,
+        entry=0x0800_02F0,
+        usb_loop=0x0800_6C58,
+        svc_sp=0x0802_E000,
+        irq_sp=0x0802_F000,
+        disp_burn=0x0800_6D9C,
+        disp_media=0x0800_70CC,
+        cmd_ctx=0x0802_C9C0,
+        n_erase=0x0800_5978,
+        n_write=0x0800_59B4,
+        n_read=0x0800_5ACC,
+        n_bootwr=0x0800_5BA8,
+        n_wrpg0=0x0800_6018,
+        n_rdpg0=0x0800_60EC,
+        r_malloc=0x0800_04AC,
+        r_free=0x0800_0510,
+        r_printf=0x0800_07B4,
+        nfc_readid_reg=0x0404_A150,
+        readid_peek=0x0800_35EC,
+        chip_id=0x9510_DCAD,
+        pr_ctx=0x0802_CA00,
+        anyka_ic_gate=0x0801_22B8,
+        ready_poll=0x0800_10B8,
+        badchk=0x0800_5410,
+        calib_bound=(0x0800_03EC, 2),
+        fslib_driver_obj=0x0802_CC48,
+    ),
 )
 
 
