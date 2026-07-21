@@ -404,17 +404,19 @@ ZC3201 = FirmwareProfile(
     oid_pin_data=16,           # ...and samples data/attention on GPIO16 (MT: GPIO9)
     oid_bit_count_addr=0x0800_7BF9,  # capture-state struct 0x08007bf8, bit_count +1
     gpio_amp_pin=9,            # ZC3201 audio amp is GPIO9 (frees GPIO16 for OID data)
-    # NOTE (Leg 21): ZC3201's ``Utl_UStr*`` guard (``FUN_08008a04``) admits only the
-    # lower 2 MiB ([0x08000000, 0x08200000]), and the discovery scan's stack-resident
-    # "B:" root path fails it at the current top (SP ~0x083f…), so the scan root stays
-    # garbage and no ``.gme`` is enumerated. Lowering ``svc_stack_top`` fixes the root
-    # path, BUT any value < 0x08200000 tested so far (0x08200000, 0x081d0000) collides
-    # with / perturbs the fixed high-heap objects (iterator 0x081d8058, services vtable
-    # 0x081d9ad8) enough that the OID tap event (0x1063) is no longer dispatched at
-    # 0x080037d8 (OID *capture* still works; ctx+8 == 0x400000|oid). Finding the real
-    # ZC3201 stack base (or relocating the high-heap objects) is the next discovery
-    # step — see docs/zc3201-boot-feasibility.md "Leg 21". Kept at the MT default for
-    # now so the boot/OID tests stay green.
+    # The AUTHENTIC ZC3201 SVC stack top (Leg 22): the reset handler's own stack
+    # setup — nandboot ``0x07ff8108`` does ``mov r1, #0x8200000; mov sp, r1`` in SVC
+    # mode immediately before ``ldr pc, =boot_task_main``. ZC3201's ``Utl_UStr*``
+    # pointer guard (``FUN_08008a04``) admits only ``[0x08000000, 0x08200000]``
+    # (2 MiB, vs MT's 4 MiB), and the discovery scan builds its ``"B:"`` root path on
+    # the stack; at the MT top (0x08400000) SP ~0x083f… fails the guard, the copy is
+    # skipped, the root stays garbage and no ``.gme`` is enumerated. At the real
+    # 0x08200000 the stack-resident root passes the guard, discovery enumerates
+    # ``B:/EXAMPLE.GME`` into ``studylist.lst``, and a product-OID tap mounts + reaches
+    # the play path — with the high-heap objects (0x081d8058, 0x081d9ad8, 0x081dd000,
+    # all < 0x08200000) intact, exactly as on hardware. (Leg 21 saw perturbation only
+    # because the B: partition was unmountable then — see nand_image_zc3201.)
+    svc_stack_top=0x0820_0000,
     soc_chip_id=0x3332_3931,  # "1923" — the ZC3201 SoC chip-ID (FS version gate)
     nand_small_page=True,     # Samsung K9F5608: 512-B page + 16-B OOB, 32 pages/block
     nand_page_size=512,

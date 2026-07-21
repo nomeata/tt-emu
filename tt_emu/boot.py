@@ -298,6 +298,13 @@ def build_zc3201_machine(
     machine.add_peripheral(intc)
     machine.add_peripheral(gpio)
     machine.add_peripheral(BatteryAdc())
+    # Audio codec (0x04036000) + DAC/dormant scratch blocks (like MT's build_machine).
+    # ZC3201's nandboot codec-command HAL writes 0x04036004 then spins on bit 27
+    # (command-complete) — without the codec model that spin never ends once a voice
+    # plays, parking the event pump (the OID content tap is then never dispatched).
+    machine.add_peripheral(stubs.make_zc3201_audio_codec_stub())
+    machine.add_peripheral(stubs.make_dac_stub())
+    machine.add_peripheral(stubs.make_dormant_bank_stub())
     machine.intc = intc
 
     # Storage trio, re-pointed verbatim from MT (same Anyka NFC/ECC/L2 registers).

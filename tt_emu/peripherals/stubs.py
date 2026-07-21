@@ -66,6 +66,50 @@ def make_audio_clock_stub() -> ConstRegisterStub:
     )
 
 
+class OrBitsRegisterStub(WordRegisterPeripheral):
+    """RAM-like registers with a fixed set of *sticky-high* read bits.
+
+    ``or_reads`` maps a word-aligned offset to a bitmask the model **OR**\\ s into
+    every read of that offset (preserving whatever the firmware last wrote there,
+    unlike :class:`ConstRegisterStub`, which replaces it). Models a peripheral
+    whose command/handshake register reflects the written command bits but always
+    reads back its "ready"/"complete" status bits set.
+    """
+
+    def __init__(
+        self, name: str, base: int, size: int, or_reads: dict[int, int] | None = None
+    ) -> None:
+        super().__init__()
+        self.name = name
+        self.base = base
+        self._size = size
+        self._or_reads = dict(or_reads or {})
+
+    @property
+    def regions(self) -> tuple[MmioRegion, ...]:
+        return (MmioRegion(self.base, self._size),)
+
+    def read_reg(self, offset: int) -> int:
+        return super().read_reg(offset) | self._or_reads.get(offset, 0)
+
+
+#: ZC3201 audio-codec command register ``0x04036004`` ready/complete bits. The
+#: 1st-gen nandboot codec-command HAL (alias ``0x08005bf0``) writes a command
+#: (``val & 0x3fe00000 | 0x10000 | 0x10``) to ``+0x04`` and then **spins until
+#: bit 27 (command-complete)** reads set — and the audio-clock bring-up (like MT)
+#: gates on bit 19. The real codec sets both once the command latches; the model
+#: reads them back sticky-high so the unmodified handshake completes.
+ZC_CODEC_READY_BITS = (1 << 27) | (1 << 19)
+
+
+def make_zc3201_audio_codec_stub() -> OrBitsRegisterStub:
+    """``0x04036000`` ZC3201 audio codec; ``+0x04`` reads back bits 19+27 set."""
+    return OrBitsRegisterStub(
+        "audiocodec", 0x0403_6000, 0x1000,
+        or_reads={AUDIO_CLK_STATUS: ZC_CODEC_READY_BITS},
+    )
+
+
 # --- USB / DAC / dormant bank ------------------------------------------------------
 
 

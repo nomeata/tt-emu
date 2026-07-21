@@ -234,17 +234,37 @@ def _lay_map_tags(img: NandImage, partition: int) -> None:
         img.set_tag(row, struct.pack("<I", tag))
 
 
-def _place_volume(img: NandImage, volume: bytes, partition: int) -> int:
-    """Place a FAT16 volume identity-mapped onto ``partition``'s live blocks.
+def _place_volume(img: NandImage, volume: bytes, logical_offset: int = 0) -> int:
+    """Place a FAT16 volume into the whole-disk (even-block) map at ``logical_offset``.
 
-    FAT logical block ``L`` (16 KiB) lands at physical block ``_phys_block(L,
-    partition)``, matching the map so a post-mount logical read resolves to the
-    data. Returns the number of logical blocks placed.
+    The FatLib layer mounts **both** A: and B: through the *whole-disk* map object
+    (``FUN_0802f0c0``/``FUN_0802cbd8``), which is a **single contiguous even-block
+    logical space**: A: occupies whole-disk logical blocks ``[0, a_blocks)`` and B:
+    ``[a_blocks, a_blocks+b_blocks)`` — the FAT B: partition base (``FUN_0802ca7c``)
+    is exactly A:'s block count. So FAT logical block ``L`` of a volume placed at
+    ``logical_offset`` maps to **whole-disk logical block ``logical_offset + L`` →
+    physical block ``128 + 2·(logical_offset + L)``** (``_phys_block`` partition 0,
+    the even-block plane the whole-disk map resolves). Proven: with B: placed on the
+    even blocks at ``logical_offset = a_blocks`` the firmware reads B:'s FAT16 boot
+    sector at its logical sector 0 (``sig 0x55AA``, ``"FAT16   "``) and registers B:
+    as the second FAT drive — whereas placing it on the odd (plane-1) blocks made
+    B:'s logical sector 0 read ``0xFF`` (the whole-disk map never routes there;
+    ``docs/zc3201-boot-feasibility.md`` Leg 22). Returns the block count placed.
+
+    (The plane-1 odd-block *map tags* are still laid — the lower ``MtdLib`` InitPlane
+    scan wants a second plane — but the FAT *data* for both volumes lives on the
+    even-block whole-disk map.)
     """
     nblocks = (len(volume) + ZC_BLOCK - 1) // ZC_BLOCK
     for L in range(nblocks):
-        phys = _phys_block(L, partition)
+        logical = logical_offset + L
+        phys = _phys_block(logical, partition=0)
         img.place(phys * ZC_BLOCK, volume[L * ZC_BLOCK : (L + 1) * ZC_BLOCK])
+        # Ensure the live map tag is present for this whole-disk logical block
+        # (``_lay_map_tags`` already tags [0, lo); this is belt-and-braces for
+        # placements near the top of the mapped range).
+        img.set_tag(phys * ZC_PAGES_PER_BLOCK + MAP_TAG_PAGE,
+                    struct.pack("<I", MAP_OOB_MAGIC | logical))
     return nblocks
 
 
@@ -333,27 +353,27 @@ def build_zc3201_nand_image(
     """
     img = NandImage()
 
-    # NOTE (Leg 21): A:'s authentic factory content is the firmware's own
-    # ``to_udisk`` payload — ``firmware.udisk_files`` = ``VOIMG/Chomp_Voice.bin``
-    # (4.3 MiB), which MT's ``build_nand_image`` merges into A:. Merging it here
-    # makes ``A:/VOIMG/Chomp_Voice.bin`` *exist*, so with the simple-widening
-    # codepage the power-on chime's ``fs_open`` now succeeds and
-    # ``play_chomp_voice`` actually plays it (progress). BUT the ZC3201 audio DAC
-    # DMA shares the ``0x04010000`` block with the L2 NAND staging buffer and its
-    # completion is unmodelled (Leg 18): once the chime plays, that interaction
-    # parks the event pump so a subsequent OID tap event (0x1063) is no longer
-    # dispatched into the statechart (verified: boot healthy, OID *captured*, but
-    # dispatch drops). So the merge is **held** until the ZC3201 DAC is modelled /
-    # separated from the L2 buffer. Re-enable by uncommenting:
-    #   udisk = getattr(firmware, "udisk_files", None) or {}
-    #   a_files = {**udisk, **(a_files or {})}
+    # A:'s authentic factory content is the firmware's own ``to_udisk`` payload
+    # (``firmware.udisk_files`` = ``VOIMG/Chomp_Voice.bin``, 4.3 MiB), exactly as
+    # MT's ``build_nand_image`` merges it (nand_image.py:384). With the
+    # simple-widening codepage (Leg 21) ``A:/VOIMG/Chomp_Voice.bin`` now exists, so
+    # the power-on chime's ``fs_open`` succeeds and ``play_chomp_voice`` plays it.
+    # (Leg 21 held this because the unmodelled DAC parked the event pump once a voice
+    # played; Leg 22's audio-codec model — ``make_zc3201_audio_codec_stub``, the
+    # ``0x04036004`` bit-27 command-complete handshake — clears that spin, so the
+    # chime plays AND later OID taps still dispatch. Verified: chime + product-tap
+    # mount + content-tap GME play all fire.)
+    udisk = getattr(firmware, "udisk_files", None) or {}
+    a_files = {**udisk, **(a_files or {})}
 
-    # Clamp each FAT volume to its partition's valid logical-block count so the
-    # whole volume (BPB total-sectors, FATs, root dir, files) stays inside the
-    # blocks the firmware's map actually resolves (unmapped high blocks read
-    # 0xFF / fault). lo(A:) = 951, lo(B:) = 1015.
-    a_blocks = min(a_blocks, _partition_geom(0)[1])
-    b_blocks = min(b_blocks, _partition_geom(1)[1])
+    # A: and B: FAT volumes share the ONE even-block whole-disk map (the FatLib
+    # layer mounts both through it): A: = whole-disk logical [0, a_blocks), B: =
+    # [a_blocks, a_blocks+b_blocks). Clamp both so the pair fits inside the mapped,
+    # non-free even blocks (lo = 951 valid; the top ZC_SPARE_BLOCKS stay free spares
+    # for the MtdLib map-table ring). B: sits above A:, so it is what gets squeezed.
+    lo0 = _partition_geom(0)[1]  # 951 valid even-block slots
+    a_blocks = min(a_blocks, lo0 - 1)
+    b_blocks = min(b_blocks, lo0 - a_blocks)
     a_bytes = a_blocks * ZC_BLOCK
     b_bytes = b_blocks * ZC_BLOCK
     # 512-B page == 1 FAT sector, so no allocation-unit coupling is needed (au=1)
@@ -388,9 +408,11 @@ def build_zc3201_nand_image(
     _lay_map_tags(img, partition=0)
     _lay_map_tags(img, partition=1)
 
-    # FAT volumes on the mapped physical blocks (A: partition 0, B: partition 1).
-    _place_volume(img, bytes(vol_a.data), partition=0)
-    _place_volume(img, bytes(vol_b.data), partition=1)
+    # FAT volumes on the even-block whole-disk map: A: at logical 0, B: stacked
+    # immediately above it at logical a_blocks (its FAT partition base). Both
+    # resolve through partition 0's even-block formula (phys = 128 + 2·logical).
+    _place_volume(img, bytes(vol_a.data), logical_offset=0)
+    _place_volume(img, bytes(vol_b.data), logical_offset=a_blocks)
 
     # nandboot system-bin index: place ``codepage`` so app_init's boot-file loader
     # finds it (else a fatal spin at 0x08000944) and reaches the statechart (Leg 16).

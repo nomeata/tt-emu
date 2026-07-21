@@ -73,6 +73,27 @@ def firmware_path_zc3201() -> Path | None:
     return None
 
 
+#: Legacy local path to the 1st-gen ZC3201 test game (product 42, OIDs 8065-8067).
+_LEGACY_GME_ZC3201 = Path(
+    "/home/jojo/tiptoi/firmware-re/tools/ttemu/content/B/example.gme"
+)
+
+
+def gme_zc3201() -> Path | None:
+    """Resolve the ZC3201 test ``.gme`` (``example.gme``), or ``None``.
+
+    ``$TT_EMU_GME_ZC3201`` if set and it exists, else the legacy local path if it
+    exists, else ``None``. This is a small hand-built game (product 42, content
+    OIDs 8065-8067) used for the 1st-gen discover → mount → OID-tap → play test.
+    """
+    env = os.environ.get("TT_EMU_GME_ZC3201")
+    if env and Path(env).exists():
+        return Path(env)
+    if _LEGACY_GME_ZC3201.exists():
+        return _LEGACY_GME_ZC3201
+    return None
+
+
 def game_dir() -> Path | None:
     """Resolve a tiptoi game directory (``.gme`` + ``.yaml``), or ``None``.
 

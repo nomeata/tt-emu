@@ -1638,3 +1638,109 @@ OID tap dispatch — needs the DAC modelled first) and the `FirmwareProfile.svc_
 fixed high-heap objects and perturbs the event pump). Probes:
 `scripts/zc3201_fsopen_probe.py`, `scripts/zc3201_cprecover_probe.py`,
 `scripts/zc3201_discovery_probe.py`.
+
+## Leg 22 — ALL THREE walls solved: the .gme is discovered, mounted, and PLAYS on a tapped OID
+
+Leg 21's three pinned walls are each closed, with the fix Proven against the firmware's own
+behaviour (live-instrumented probes). The unmodified 1st-gen firmware now boots → discovers
+`B:/EXAMPLE.GME` into `A:/studylist.lst` → mounts it on a product-OID tap → and **plays a
+content-OID's media through the shared GME interpreter** (`gme_oid_to_playscript` →
+`voice_load_and_play` → `voice_play_sample`), with the played `(offset,size)` matching the game's
+own media table. A dedicated gme-based test asserts the whole chain
+(`tests/test_zc3201_scripting.py`); the full suite is **165 passed** (MT unregressed at 164 + the
+new ZC3201 test).
+
+### Wall 1 SOLVED — the authentic SVC stack top is `0x08200000` (not the MT `0x08400000`)
+
+The real value came straight from the firmware's **own reset handler** (nandboot `0x07ff8094`,
+disasm): after zeroing `.bss` `[0x08006fe4,0x08008000)` and setting the IRQ/ABT mode stacks, it
+does — in SVC mode, immediately before `ldr pc, =boot_task_main` —
+
+```
+07ff8108  mov r1, #0x8200000
+07ff810c  mov sp, r1          ; the SVC stack top
+07ff8110  ldr pc, [pc,#..]    ; = boot_task_main 0x0802b8bc
+```
+
+So ZC3201's SVC stack top is **`0x08200000`** = exactly the top of its `Utl_UStr*` pointer-guard
+window (`FUN_08008a04` admits `[0x08000000, 0x08200000]`). At the MT `0x08400000` the discovery
+scan's stack-resident `"B:"` root fails the guard, the copy is skipped, and nothing enumerates; at
+the authentic `0x08200000` the root passes, discovery enumerates `EXAMPLE.GME`, and the OID tap
+dispatches. The high-heap objects (`0x081d8058`, `0x081d9ad8`, `0x081dd000`) live below
+`0x08200000` and are **not** perturbed — Leg 21 saw perturbation only because B: was unmountable
+then (Wall 2), so the boot never got far enough to matter. Fix: `FirmwareProfile.svc_stack_top =
+0x08200000` (ZC3201; MT stays `0x08400000`).
+
+### Wall 2 SOLVED — A: and B: share ONE even-block whole-disk map (B: was on the wrong plane)
+
+`opendir("B:/")` returned NULL because **B: was never registered as a FAT drive** (drive count 1):
+`FUN_0802c09c`'s read of B:'s logical sector 0 returned `0xFF`. Tracing the NAND rows the FatLib
+mount reads (`_data_read_smallpage`) showed B:'s partition base (`FUN_0802ca7c`, = A:'s block count
+= 512) resolving logical sector 0 to **physical block 1152 = `128 + 2·512`** — i.e. the FatLib
+layer mounts *both* A: and B: through the **single whole-disk map object**
+(`FUN_0802f0c0`/`FUN_0802cbd8`), a **contiguous even-block logical space** (A: = whole-disk logical
+`[0,a_blocks)`, B: = `[a_blocks, a_blocks+b_blocks)`, `phys = 128 + 2·logical`) — *not* two hardware
+planes. The Leg-13 image placed B:'s FAT data on the odd (plane-1) blocks at an independent logical
+0, which the whole-disk map never routes to. Fix (`nand_image_zc3201.py`): place B:'s FAT volume on
+the **even-block map at logical offset `a_blocks`** (`_place_volume(logical_offset=…)`), clamp
+`a_blocks+b_blocks ≤ lo (951)`. Proven: B: then reads its FAT16 boot sector at logical 0
+(`0x55AA`, `"FAT16   "`), registers as the 2nd drive, `opendir("B:/")` resolves the root as a
+directory (attr `0x10`), and the scanner enumerates `B:/EXAMPLE.GME`. (The plane-1 odd-block map
+*tags* are still laid — the lower MtdLib InitPlane scan wants a second plane — but both FAT volumes'
+*data* lives on the even-block whole-disk map.)
+
+### Wall 3 SOLVED (for dispatch + capture) — the audio-codec command-complete handshake
+
+After the first voice submits, the event pump parked in a 6.5 M-iteration spin at nandboot alias
+`0x08005c08`: the codec-command HAL writes `0x04036004` (`val & 0x3fe00000 | 0x10000 | 0x10`) and
+**polls bit 27 (command-complete)** — and `0x04036000` was unmapped in `build_zc3201_machine` (only
+MT mapped it, and only for the bit-19 clock-enable gate). With bit 27 never set the codec handshake
+never returns, so a played voice hangs the pump and the OID content tap is never dispatched. Fix: a
+ZC3201 audio-codec model (`stubs.make_zc3201_audio_codec_stub` / `OrBitsRegisterStub`) that reads
+`0x04036004` back with bits 19 **and** 27 sticky-high (the "clock ready" + "command complete" status
+the real codec latches), plus the DAC/dormant scratch blocks MT also maps. This is authentic
+hardware modelling, not a firmware hook. With it the handshake completes, the pump stays alive, and
+**every content-OID tap reaches `voice_play_sample`** (capture point). The full PCM decode path
+(medialib → DAC → S16LE) is **not** modelled — the test captures at `voice_play_sample`
+`(r1=offset, r2=size)`, the same observable the `firmware-re` lab `zc3201_emu.py` validates.
+
+### A: factory content re-enabled — the power-on chime plays
+
+With Wall 3's codec model the DAC no longer parks the pump, so the Leg-21-held
+`firmware.udisk_files` → A: merge is **re-enabled** (`build_zc3201_nand_image`, mirroring
+`nand_image.py:384`): `A:/VOIMG/Chomp_Voice.bin` (4.3 MiB) exists, the power-on chime's `fs_open`
+succeeds, and `play_chomp_voice` plays it (`voice_play_sample` offset `0x55116`) — while the
+subsequent product/content OID taps still dispatch and play (verified in one run: chime + product
+mount + content play).
+
+### Verified chain (`tests/test_zc3201_scripting.py`, probes `scripts/zc3201_opendir_probe.py`)
+
+boot → book idle → power-on chime plays → **product tap (OID 42)** → `gme_mount_check_product`
+mounts `EXAMPLE.GME` → its welcome media plays (media 1, offset `0x2d4a`) → **content tap (OID
+8065)** → `gme_oid_to_playscript` → `voice_load_and_play` → `voice_play_sample` plays media 2
+(offset `0x6332`, matching the game's media table). MT byte-for-byte unregressed (all ZC3201 changes
+are ZC3201-profile / `build_zc3201_machine`-only).
+
+### Leg 22 resume pointer — the remaining piece is Emulator-API/PCM parametrization
+
+The **hardware bring-up is complete**: the core "GME interpreter / OID-tap / play" criterion passes
+on ZC3201 at the machine level (`tests/test_zc3201_scripting.py`). What is **not** yet done is
+parametrising the *high-level* `tests/test_scripting.py` over ZC3201, because its assertions ride the
+MT-specific `Emulator` scripting API (`pen.state`/`registers`/`now_playing`/`tap`/`wait_for_audio`
+/`expect_play`, `MtDebugger`, the MMU `read_va`, and **real S16LE PCM** capture). To finish:
+
+1. **A ZC3201 `Emulator` build path** — select `build_zc3201_machine` + the existing
+   `Zc3201Debugger` when `firmware.recognize` is ZC3201; map its book-mode state, mount/product
+   detection (`gme_mount_check_product`), OID `tap` (already `machine.oid.hold/lift`), and a play
+   observable at `voice_play_sample` (offset/size → media index via `GmeScripts.media_table`).
+2. **PCM capture (only if a byte-level clip assertion is wanted on ZC3201)** — model the ZC3201 DAC
+   DMA PCM output (medialib decoder → `0x04010000`/`0x04080000` → S16LE), the one genuinely large
+   remaining model. Until then the ZC3201 play test asserts *media identity* (offset/size), not PCM.
+3. **Parametrise** `test_scripting.py`'s mount+tap+play core over both firmwares; keep the
+   PCM/register/YAML/multi-part-readout assertions MT-only (marked with a reason) unless (2) is done.
+
+Product changes this leg: `FirmwareProfile.svc_stack_top` (ZC3201 `0x08200000`),
+`nand_image_zc3201._place_volume(logical_offset=…)` + the even-block A:/B: layout + the re-enabled
+udisk merge, `stubs.OrBitsRegisterStub`/`make_zc3201_audio_codec_stub`, the codec/DAC/dormant wiring
+in `build_zc3201_machine`. New: `tests/test_zc3201_scripting.py`, `tests/_data.gme_zc3201`,
+`scripts/zc3201_opendir_probe.py`. Full suite **165 passed**.
