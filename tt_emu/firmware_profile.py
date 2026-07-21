@@ -147,8 +147,20 @@ class FirmwareProfile:
     #: generation: 2N-MT ``0x30393031`` ("1090"), ZC3201 ``0x33323931`` ("1923").
     #: The firmware's FAT/MtdLib version gate (``fw_version_ref`` 0x0802c880 /
     #: ``mtd_helper_eb24`` 0x080b6b24) reads this and zeroes its library descriptor
-    #: on mismatch — a wrong value silently corrupts the FS heap during mount.
+    #: on mismatch — a wrong value silently corrupts the FS heap during mount. It is
+    #: *also* the value the producer's MtdLib pool-init SoC-signature check
+    #: (``0x08012a0c``) matches — a wrong value there wipes the allocator pool and
+    #: aborts the format (docs/zc3201-producer-addresses.md §10).
     soc_chip_id: int = 0x3039_3031
+
+    #: NAND READ-ID dword the pen's boot probe expects (``NfcController.read_id``).
+    #: 2N-MT: Samsung K9GAG08U0M ``0x9551D3EC`` (bytes EC D3 51 95, 4-KiB page).
+    #: ZC3201: Samsung K9F5608 ``0xBDA575EC`` (bytes EC 75 A5 BD, 512-byte page) —
+    #: recovered from the ``.upd`` ``flash_ic`` descriptor at offset ``0x200`` and
+    #: confirmed against the producer's own chip-detect (§10). Small-page geometry:
+    #: page 512, spare 16, 32 pages/block, 2048 blocks, planeblocks 1024, 1 column
+    #: + 2 row address cycles. Serving it faithfully is the remaining mount step.
+    nand_read_id: int = 0x9551_D3EC
 
     #: Whether tt-emu can boot this firmware to book mode authentically today.
     #: MT: yes (the whole §5 recipe). ZC3201: not yet — the from-entry boot RE
@@ -292,6 +304,7 @@ ZC3201 = FirmwareProfile(
     bss_seed=(0x0800_6FE4, 0x0800_8000 - 0x0800_6FE4),
     nand_sram_window=0x0800_5800,  # L2 buffer 4 (base 0x08005000 + 4·0x200)
     soc_chip_id=0x3332_3931,  # "1923" — the ZC3201 SoC chip-ID (FS version gate)
+    nand_read_id=0xBDA5_75EC,  # Samsung K9F5608 (bytes EC 75 A5 BD, 512-byte page)
     boots_to_book=False,
     symbols={
         # HAL / FSLib (names.csv, lab hook points) — reveng PROG addrs + 0x8000

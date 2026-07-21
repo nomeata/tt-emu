@@ -173,13 +173,22 @@ class NfcController(WordRegisterPeripheral):
     base = 0x0404_A000
 
     def __init__(
-        self, flash: NandImage, ecc: EccEngine, sram_window: int = SRAM_WINDOW
+        self,
+        flash: NandImage,
+        ecc: EccEngine,
+        sram_window: int = SRAM_WINDOW,
+        read_id: int = NAND_READ_ID,
     ) -> None:
         super().__init__()
         self.flash = flash
         self.ecc = ecc
         #: L2 buffer-4 SRAM staging address (per-generation; see SRAM_WINDOW).
         self.sram_window = sram_window
+        #: READ-ID answer this pen's boot probe expects. Per-generation: 2N-MT
+        #: Samsung K9GAG08U0M (``NAND_READ_ID`` 0x9551D3EC, 4-KiB page); ZC3201
+        #: Samsung K9F5608 (0xBDA575EC, bytes EC 75 A5 BD, 512-byte page). Driven
+        #: from ``firmware_profile.<gen>.nand_read_id`` so MT is unaffected.
+        self.read_id = read_id
         self._datard = [0, 0]
         self._addr: list[int] = []
         self._pending_cmd: int | None = None
@@ -276,7 +285,7 @@ class NfcController(WordRegisterPeripheral):
         elif cmd == _CMD_READ_ID:
             self._pending_cmd = cmd
             self._addr = []
-            self._datard = [NAND_READ_ID, 0]  # §8.5: +0x154 = 0
+            self._datard = [self.read_id, 0]  # §8.5: +0x154 = 0
         elif cmd == _CMD_STATUS:
             self._datard = [NAND_STATUS_BYTE, 0]  # §8.4
         elif cmd == _CMD_READ_CONFIRM:  # 0x30: read page/AU (§8.1)

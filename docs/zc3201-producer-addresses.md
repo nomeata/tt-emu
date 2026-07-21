@@ -328,3 +328,69 @@ medium's method table initialises fully — the placeholder blob here yields a
 partially-scrambled geometry (`page size=1`, `planes=64`, `plane size=512`); (2)
 once the medium builds, cmd 5's format worker `0x0800849c` iterates the chip and
 its writes (through the `0x08005b14/...` leaves) are captured to a `WritableNand`.
+
+---
+
+## 10. The MtdLib-init wall is SOLVED — `transc_format` completes (Proven)
+
+§9's "still-null method pointer → PC `0x10000` fault" is **fully cracked**. It was
+*not* the geometry alone; it was a **SoC-signature check**. Three ingredients,
+all Proven by running `scripts/zc3201_producer_probe.py`:
+
+1. **The cmd-3 chip-param blob IS the `.upd`'s own `flash_ic` descriptor**, not a
+   hand-built struct. It sits at **`update.upd[0x200:0x240]`** (the first 64-byte
+   `flash_ic` row): the Samsung **K9F5608** entry —
+   `ec75a5bd 0002 2000 0008 0008 0004 10 01 0f 02 0b 01 00000010 … "Samsung K9F5608"`.
+   Fields (`chipid u32, pagesize u16, pagesperblock u16, totalblocknum u16,
+   groupblocknum u16, planeblocknum u16, sparesize u8, columnaddrcycle u8,
+   lastcolumnaddrcyclemask u8, rowaddrcycle u8, lastrowaddrcyclemask u8,
+   customnandflash u8, flag u32, cmdlen u32, datalen u32, descriptor[32]`) decode
+   to **page 512, spare 16, 32 pages/block, 2048 blocks, planeblocks 1024,
+   col-cycles 1, row-cycles 2, custom 1**. The builder `0x080056d4` decode
+   (r4=blob, r5=desc), corrected from §9:
+     - `desc[+0]  = blob[0x13]` (custom = 1)
+     - `desc[+4]  = LE32(blob[0x14:0x18])` (**flag** `0x10000000`, *not* block count)
+     - `desc[+0x1c]= LE16(blob[4:6])` (**page size** 512)
+     - `desc[+0x10]= LE16(blob[0xc:0xe])` (**planeblocks** 1024)
+     - `desc[+0xc] = LE16(blob[8:0xa]) / desc[+0x10]` (**planes** = 2048/1024 = 2)
+     - `desc[+0x14]= LE16(blob[6:8])` (**pages/block** 32)
+     - `desc[+0x18]= LE16(blob[4:6]) / desc[+0x1c]` (= 1)
+     - `desc[+8]  = n_chips · desc[+0xc]` (= 2)
+   The load-bearing branch is **`blob[0xf]==1`** (`columnaddrcycle==1` → *small-page*
+   NAND). The Leg-6 placeholder blob had `blob[0xf]=0` → the large-page path →
+   the scrambled `page size=1, planes=64`. Feeding the real descriptor prints
+   `small page nand`, `NandPageCycle is 1`, `find chip=1 page size=512`,
+   `planes=2 plane size=1024`.
+
+2. **The physical chip-ID `0xBDA575EC`** on NFC `0x0404a150` — the dword the builder
+   assembles from bytes `EC 75 A5 BD` (`blob[0]|blob[1]<<8|blob[2]<<16|blob[3]<<24`);
+   it must equal `blob[0:4]` for `find chip=1`.
+
+3. **The SoC chip-ID `0x33323931` ("1923") at `0x04000000`** (`SysCon REG_CHIP_ID`).
+   *This is the real wall.* `mtd_set_pool` **`0x08012a88`** copies the pool method
+   table (6 words) to the global **`0x08027090`**, prints the MtdLib banner, then
+   calls the SoC-signature check **`0x08012a0c`** — a jump table
+   (`cmp r0,#4; ldr pc,[pc,r0,lsl#2]`) of variants that each `ldr *0x04000000; cmp
+   <sig>` (`0x33323931` "1923", `0x33323236` "6223", `0x414b3620`, `0x414b3224`).
+   On **success** (`ldmdbne`) it returns with the pool intact; on **failure** it
+   runs `pool[0xc](pool, 0, 0x18)` — an error-cleanup **memset that zeroes the pool
+   method table**. The next `mov lr,pc; ldr pc,[sb]` at **`0x08012718`** (sb =
+   `0x08027090`) then loads a zeroed slot → the PC-fault §9 saw. A harness returning
+   `0` at `0x04000000` fails the check every time; returning the ZC3201 SoC chip-ID
+   passes it, the pool survives, and cmd 5 finishes.
+
+With all three, **cmd 2 → cmd 3 → cmd 5 completes**: `transc_format` returns
+`RET r0=1` and MtdLib initialises the partition —
+`MtdLib - NandPart:Bits=0x10000000,FstPl=0,StartB=0,BCnt=2048,PCnt=2,LPCnt=2,
+BPerP=1024,PgPerB=32,BytPSec=512`.
+
+**Remaining wall (next leg).** `transc_format` (cmd 5, worker `0x08001660`) only
+**initialises** the MtdLib partition — it calls **none** of the 8 static NAND leaves
+(verified: 0 hits during cmd 5). The actual chip erase + FS-metadata + FAT write is
+driven by **other** commands: `transc_erase` cmd 4 (`0x080015f8`), the full-chip
+iterate worker `0x0800849c` (cmd 7/10), and the block/boot writers
+`0x0800cf14`/`0x08009cb4` (cmd 11). These need the **host protocol's real packet
+argument layout** — cmd 4's "erase start/end" came through as `0/0` with the naive
+`pkt[4..7]`/`pkt[8..9]` ring-word mapping, so the args are a small struct pointed to
+by `arg0`, not the two ring words. Reconstruct that packet sequence (the Windows
+host tool's driver), then hook the static leaves to a `WritableNand` and capture.

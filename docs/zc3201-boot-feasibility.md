@@ -421,3 +421,49 @@ PC `0x10000`, **caller LR `0x0801271c`** (nandflash band). Two coupled next step
    ZC3201 variant of `tt_emu.nand_provision` (ring-dispatch driver, hooks at the static leaves).
    Then convert to a `NandImage` the real `NfcController` serves and reach `fs_storage_mount_init`
    `0x0802d0e0` mounting A:/B:.
+
+### Leg 7 — the MtdLib-init wall is SOLVED; `transc_format` completes
+
+Leg 6's "still-null method → PC `0x10000` fault" is **fully cracked** (Proven, byte/disasm-cited in
+`docs/zc3201-producer-addresses.md` §10). It was not the geometry alone — it was a **SoC-signature
+check**. `scripts/zc3201_producer_probe.py` now drives cmd 2 → cmd 3 → cmd 5 to completion.
+
+Three ingredients:
+
+1. **The cmd-3 blob IS the `.upd`'s own `flash_ic` descriptor** at `update.upd[0x200:0x240]` — the
+   Samsung **K9F5608** row (chip-ID `EC 75 A5 BD`; page 512, spare 16, 32 pages/block, 2048 blocks,
+   planeblocks 1024, col-cycles 1, row-cycles 2, custom 1). NOT a hand-built struct and NOT the
+   K9GAG08U0M the Leg-6 note guessed — ZC3201 is a **512-byte-page** chip, MT's `NAND_READ_ID =
+   0x9551D3EC` is the *MT* chip. The critical field is `columnaddrcycle==1` (`blob[0xf]`), which
+   selects the small-page decode path; the Leg-6 placeholder took the large-page path → the
+   scrambled `page size=1, planes=64` geometry.
+2. **Physical chip-ID `0xBDA575EC`** on NFC `0x0404a150` (must equal `blob[0:4]`).
+3. **SoC chip-ID `0x33323931` ("1923") at `0x04000000`** — the real wall. `mtd_set_pool`
+   `0x08012a88` writes the pool method table to global `0x08027090`, then a SoC-signature check
+   `0x08012a0c` reads `*0x04000000`; on mismatch it `memset(pool,0,0x18)`-zeroes the table, so the
+   `ldr pc,[sb]` at `0x08012718` fetch-faults. Returning the SoC chip-ID passes the check.
+
+Result: cmd 5 `transc_format` returns `RET r0=1` and MtdLib inits the partition —
+`MtdLib - NandPart:…,BCnt=2048,PCnt=2,LPCnt=2,BPerP=1024,PgPerB=32,BytPSec=512`.
+
+**Leg 7 resume pointer.** `transc_format` (worker `0x08001660`) only *initialises* the MtdLib
+partition — it fires **none** of the 8 static NAND leaves (verified 0 hits during cmd 5). The actual
+full-chip erase + FS-metadata + FAT write is other commands: `transc_erase` cmd 4 (`0x080015f8`), the
+full-chip iterate worker `0x0800849c` (cmd 7/10), the block/boot writers `0x0800cf14`/`0x08009cb4`
+(cmd 11). These need the **host protocol's real packet-argument layout** — cmd 4's "erase start/end"
+came through as `0/0` with the naive ring-word mapping, so `arg0` points at a small args struct, not
+two inline words. Next steps, precise:
+1. **Reconstruct the host format-packet sequence** (the Windows tool's driver): the exact `arg0`
+   struct each of cmd 4 / 7 / 10 / 11 expects. Disassemble the workers `0x080015f8` / `0x0800849c` /
+   `0x0800cf14` for their arg reads.
+2. **Capture** — hook the 8 static leaves (`0x08005c1c` read / `0x08005b14` write / `0x08005be0`
+   readspare / `0x08005d44` / `0x08005db0` / `0x08005a04` / `0x08005af8` / `0x08005cd8`), determine
+   their calling convention (block/page/data/tag regs, likely different from MT), drive the format,
+   and capture into a `WritableNand` — the ZC3201 **ring-dispatch** variant of `tt_emu.nand_provision`
+   (a new `run_producer_zc3201`, since the MT `run_producer` is burn/media-dispatcher-shaped).
+3. **Serve it** — convert to a `NandImage` with **512-byte-page + 16-byte-spare** fidelity (the
+   `NfcController` decode is tuned to MT's 4-KiB pages; ZC3201's small-page + 1-col/2-row addressing
+   differs) and give ZC3201 its **K9F5608** read-ID (profile-driven, so MT keeps K9GAG08U0M — see
+   `tt_emu/peripherals/nand.py` `read_id` param + `firmware_profile.ZC3201.nand_read_id`). Reach
+   `fs_storage_mount_init` `0x0802d0e0` mounting A:/B:, then book mode + GME play, then parametrize
+   `tests/test_scripting.py` over both firmwares.

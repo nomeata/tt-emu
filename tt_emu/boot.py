@@ -307,7 +307,9 @@ def build_zc3201_machine(
     else:
         nand = NandImage()
     ecc = EccEngine()
-    nfc = NfcController(nand, ecc, sram_window=profile.nand_sram_window)
+    nfc = NfcController(
+        nand, ecc, sram_window=profile.nand_sram_window, read_id=profile.nand_read_id
+    )
     machine.add_peripheral(nfc)
     machine.add_peripheral(ecc)
     machine.add_peripheral(L2NandBuffer(nfc))

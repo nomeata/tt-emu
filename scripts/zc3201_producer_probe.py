@@ -5,53 +5,54 @@ Uses the addresses from docs/zc3201-producer-addresses.md (single ring dispatche
 indirect NAND). This probe drives the **real factory command protocol** and shows
 how far the producer formats a NAND under a Python harness.
 
-KEY FINDING (this leg — supersedes the earlier "gNand init fails chip-detect"):
-the producer's format (cmd 5 ``transc_format``) is not a standalone command — it
-requires the geometry to have been loaded first by the host protocol sequence:
+STATUS (this leg): the MtdLib-init wall is SOLVED. cmd 2 -> cmd 3 -> cmd 5
+``transc_format`` runs to completion (``RET r0=1``) and MtdLib initialises the NAND
+partition with the correct 512-byte-page geometry::
 
-  * **cmd 2** ``transc_get_chip_id`` (worker 0x08001260): resets the NAND (``rst
-    nand 0..3``), selects each CE, issues READ-ID over the NFC and reports the
-    chip-ID dword to the host.
-  * **cmd 3** ``transc_set_chip_param`` (worker 0x08001430): the host sends a
-    287-byte chip-param blob (``arg0`` in the ring packet = a POINTER to it). The
-    worker memcpy's it into the static struct 0x0801f751, then the descriptor
-    builder ``0x080056d4`` re-reads the physical chip-ID over the NFC, matches it
-    against the blob's expected ID, and — when they match ("find chip=1") — builds
-    the gNand device descriptor ``*0x08024b50`` (0x54 bytes) and sets the geometry
-    global 0x0801569c. The descriptor's NAND method vtable is filled with the
-    **static** leaves: read/write/erase/readspare at
-    +0x28=0x08005c1c +0x2c=0x08005b14 +0x34=0x08005be0 +0x38=0x08005d44
-    +0x3c=0x08005db0 +0x40=0x08005a04 +0x44=0x08005af8, +0x30=0x08005cd8.
-    (These are the NAND leaves docs/§8 said would need dynamic tracing — they are
-    pinned statically here.)
-  * **cmd 5** ``transc_format`` (worker 0x08001660): now that ``*0x08024b50`` is
-    a real device, the gNand init 0x08002eb4 no longer prints "init error gNand".
+    MtdLib - NandPart:Bits=0x10000000,FstPl=0,StartB=0,BCnt=2048,PCnt=2,
+             LPCnt=2,BPerP=1024,PgPerB=32,BytPSec=512
 
-The descriptor geometry is decoded from the blob (r4 = 0x0801f751 = arg0) as:
+The three ingredients that crack it (see docs/zc3201-producer-addresses.md §10):
 
-    desc[+4]   = LE32(blob[0x14:0x18])                    # total block count
-    desc[+0x14]= LE16(blob[6:8])                          # page size (bytes)
-    desc[+0x10]= LE16(blob[0xc:0xe])                      # plane/sector size
-    desc[+0xc] = LE16(blob[8:0xa]) / desc[+0x10]          # pages-per-block group
-    desc[+0x1c]= LE16(blob[4:6])
-    desc[+0x18]= LE16(blob[4:6]) / desc[+0x1c]  (=1)
-    desc[+0]   = blob[0x13]
-    desc[+8]   = n_chips * desc[+0xc]
-    blob[0xf]  = a flag; if ==1 a different (bad-block?) path 0x08001590 runs.
+  1. **The cmd-3 chip-param blob IS the ``.upd``'s own flash_ic descriptor**
+     (``update.upd[0x200:0x240]``), NOT a hand-built struct. It is the Samsung
+     **K9F5608** row: chip-ID ``EC 75 A5 BD``, page 512, spare 16, 32 pages/block,
+     2048 blocks, planeblocks 1024, col-cycles 1, row-cycles 2, custom 1. The
+     descriptor builder ``0x080056d4`` decodes it (r4=blob, r5=desc):
+       desc[+0]=blob[0x13] (custom) ; desc[+4]=LE32(blob[0x14:0x18]) (flag) ;
+       desc[+0x1c]=LE16(blob[4:6]) (page size 512) ;
+       desc[+0x10]=LE16(blob[0xc:0xe]) (planeblocks 1024) ;
+       desc[+0xc]=LE16(blob[8:0xa]) / desc[+0x10] (planes=2048/1024=2) ;
+       desc[+0x14]=LE16(blob[6:8]) (pages/block 32) ;
+       desc[+0x18]=LE16(blob[4:6]) / desc[+0x1c] (=1).
+     The critical branch is ``blob[0xf]==1`` (columnaddrcycle==1) selecting the
+     **small-page** path; the earlier placeholder blob had ``blob[0xf]=0`` and took
+     the large-page path, yielding the scrambled ``page size=1, planes=64`` geometry.
+  2. **The physical chip-ID ``0xBDA575EC``** returned on NFC ``0x0404a150`` (the
+     dword the builder assembles from bytes EC 75 A5 BD; must equal ``blob[0:4]``).
+  3. **The SoC chip-ID ``0x33323931`` ("1923") at ``0x04000000``.** This is the
+     real MtdLib wall: ``mtd_set_pool`` ``0x08012a88`` copies the pool method table
+     to the global ``0x08027090``, then calls a SoC-signature check ``0x08012a0c``
+     (a jump table of ``ldr *0x04000000; cmp "1923"`` variants). On **failure** it
+     runs an error-cleanup ``memset(pool, 0, 0x18)`` that zeroes the method table,
+     so the next ``ldr pc,[sb]`` (``0x08012718``, sb=pool) fetch-faults at PC=0. The
+     placeholder harness returned 0 at 0x04000000 -> check failed -> pool wiped ->
+     the PC=0x10000 fault docs/§9 "Leg 6" hit. Returning the SoC chip-ID passes the
+     check, the pool survives, and transc_format completes.
 
-The chip-ID must be returned on the NFC read-ID register **0x0404a150** (the same
-register the MT producer uses; the ZC3201 NAND HAL uses BOTH the 0x0404a000 band
-— status/ready at +0x158 bit31, data at +0x150 — AND the 0x04070000 band). The
-blob's [0:3] expected-ID must equal the returned chip-ID for "find chip=1".
-
-REMAINING WALL: with a valid descriptor, cmd 5's gNand init 0x08002eb4 gets past
-the alloc, but the medium/FatLib build (via 0x0800cd78 / 0x08012a88) then calls a
-still-null method pointer -> fetch fault at PC=0x10000. Two coupled next steps:
-(1) the EXACT geometry sub-field encoding needs the real host flash_ic.ini values
-(the pen's true NAND chip-ID + page/block bytes) so the medium's method table
-initialises fully; (2) once the medium builds, cmd 5's format worker 0x0800849c
-iterates the chip and its NAND writes (through the 0x08005b14/... leaves, hooked
-here) can be captured to a WritableNand.
+REMAINING WALL (next leg): ``transc_format`` (cmd 5, worker 0x08001660) only
+*initialises* the MtdLib partition — it calls **none** of the NAND write/erase
+leaves (verified: the 8 static leaves 0x08005b14/... fire 0 times during cmd 5).
+The actual full-chip erase + FS-metadata + FAT write is driven by **other** commands
+(``transc_erase`` cmd 4 worker 0x080015f8; the full-chip iterate worker 0x0800849c
+reached by cmd 7/10; the block/boot writers 0x0800cf14/0x08009cb4 via cmd 11) — but
+these need the **host protocol's real packet arguments** (cmd 4's "erase start/end"
+came through as 0/0 with a naive ``pkt[4..7]``/``pkt[8..9]`` mapping, so the arg
+layout is a small struct, not the two ring words). Reconstructing that packet
+sequence (the Windows host tool's driver) is the next step: then hook the static
+leaves to a WritableNand (ZC3201 ring-dispatch variant of tt_emu.nand_provision),
+capture the writes, convert to a NandImage with 512B-page + 16B-spare fidelity, and
+reach fs_storage_mount_init 0x0802d0e0 mounting A:/B:.
 """
 import struct
 import sys
@@ -68,6 +69,7 @@ from unicorn.arm_const import (
 )
 
 PROD = "/home/jojo/tiptoi/tt-firmware-reveng/ZC3201/data/producer.bin"
+UPD = "/home/jojo/tiptoi/tt-firmware-reveng/ZC3201/data/update.upd"
 
 BASE = 0x08000000
 USB_LOOP = 0x080034A4
@@ -79,28 +81,33 @@ FREE_W = 0x080004E0
 GEOM_PTR = 0x0801569C        # NAND geometry global (set by cmd 3)
 DEV_OBJ = 0x08024B50         # gNand device descriptor pointer (set by cmd 3)
 NFC_READID_REG = 0x0404A150  # producer reads the chip-ID dword here
+SOC_CHIPID_REG = 0x04000000  # SysCon REG_CHIP_ID — MtdLib checks this == "1923"
 
 # NAND method-vtable leaves (from the cmd-3 descriptor builder 0x080056d4) — the
-# seam a capture harness hooks to a WritableNand (n_read/n_write/n_erase/...).
+# seam a capture harness hooks to a WritableNand (read/write/erase/readspare).
 NAND_LEAVES = {
-    "read?": 0x08005C1C, "write?": 0x08005B14, "readspare": 0x08005BE0,
-    "m0x38": 0x08005D44, "m0x3c": 0x08005DB0, "m0x40": 0x08005A04,
-    "m0x44": 0x08005AF8, "m0x30": 0x08005CD8,
+    "l28": 0x08005C1C, "l2c": 0x08005B14, "l34_rdspare": 0x08005BE0,
+    "l38": 0x08005D44, "l3c": 0x08005DB0, "l40": 0x08005A04,
+    "l44": 0x08005AF8, "l30": 0x08005CD8,
 }
 
-# The pen's NAND chip-ID (returned on NFC read-ID). This value must match the
-# blob's expected-ID [0:3]. Placeholder Hynix id (AD DC 10 95) pending the real
-# ZC3201 flash_ic.ini value — see module docstring.
-CHIP_ID = 0x9510DCAD
+# The pen's real NAND chip-ID (Samsung K9F5608), returned on the NFC read-ID
+# register; equals blob[0:4] = bytes EC 75 A5 BD assembled little-endian.
+CHIP_ID = 0xBDA575EC
+# The ZC3201 SoC chip-ID ("1923") the MtdLib pool-init SoC-signature check reads.
+SOC_CHIP_ID = 0x33323931
 
 
 def main() -> int:
     prod = open(PROD, "rb").read()
+    upd = open(UPD, "rb").read()
     uc = Uc(UC_ARCH_ARM, UC_MODE_ARM | UC_MODE_LITTLE_ENDIAN)
     uc.mem_map(BASE, 0x0040_0000)
     uc.mem_map(0x0900_0000, 0x0800_0000)
     uc.mem_write(BASE, prod)
     uc.mem_map(0x0400_0000, 0x0020_0000)
+
+    leaf_counts: dict[str, int] = {}
 
     def rd(a, n=4):
         return int.from_bytes(uc.mem_read(a, n), "little")
@@ -109,6 +116,9 @@ def main() -> int:
         b0 = addr & ~3
         if addr == NFC_READID_REG:
             uc.mem_write(b0, struct.pack("<I", CHIP_ID))
+            return True
+        if b0 == SOC_CHIPID_REG:
+            uc.mem_write(b0, struct.pack("<I", SOC_CHIP_ID))
             return True
         if (0x0407_0000 <= addr < 0x0407_2000 or addr == 0x0401_0010
                 or 0x0404_A000 <= addr < 0x0404_C000
@@ -190,6 +200,15 @@ def main() -> int:
     uc.hook_add(UC_HOOK_CODE, lambda *a: print("  [*** init error gNand ***]"),
                 None, 0x08003030, 0x08003030)
 
+    # Count NAND-leaf hits (the WritableNand capture seam for the next leg).
+    def mk_leaf(name):
+        def cb(uc, a, sz, ud):
+            leaf_counts[name] = leaf_counts.get(name, 0) + 1
+        return cb
+
+    for nm, ad in NAND_LEAVES.items():
+        uc.hook_add(UC_HOOK_CODE, mk_leaf(nm), None, ad, ad)
+
     uc.reg_write(UC_ARM_REG_CPSR, 0x13 | 0xC0)
     uc.reg_write(UC_ARM_REG_SP, SVC_SP)
     print("== startup -> USB loop %#x ==" % USB_LOOP)
@@ -204,7 +223,7 @@ def main() -> int:
     PKT = 0x0805_0000
     DATA = 0x0805_2000
 
-    def call_cmd(cmd, blob=b"", arg1=0, budget=40_000_000):
+    def call_cmd(cmd, blob=b"", arg1=0, budget=80_000_000):
         # ring packet [cmd:4][arg0:4][arg1:2][pad]; dispatcher forwards r0=arg0
         # (a POINTER to the data buffer), r1=arg1.
         uc.mem_write(DATA, blob.ljust(512, b"\x00"))
@@ -224,15 +243,10 @@ def main() -> int:
         except UcError as e:
             print("[cmd %d] FAULT %s PC=%#x" % (cmd, e, uc.reg_read(UC_ARM_REG_PC)))
 
-    # --- build the 287-byte chip-param blob (see module docstring decode) -------
-    blob = bytearray(287)
-    struct.pack_into("<I", blob, 0, CHIP_ID)   # [0:4] expected chip-ID (must match)
-    struct.pack_into("<H", blob, 4, 1)         # [4:6]  -> desc+0x1c ; desc+0x18=1
-    struct.pack_into("<H", blob, 6, 2048)      # [6:8]  page size    -> desc+0x14
-    struct.pack_into("<H", blob, 8, 0x8000)    # [8:0xa] block bytes -> /planesize
-    struct.pack_into("<H", blob, 0xC, 512)     # [0xc:0xe] plane sz  -> desc+0x10
-    blob[0xF] = 0                              # flag (!=1)
-    struct.pack_into("<I", blob, 0x14, 4096)   # [0x14:0x18] block count -> desc+4
+    # --- feed the REAL flash_ic descriptor (from .upd @0x200) as the cmd-3 blob ---
+    # The Samsung K9F5608 row: bytes EC 75 A5 BD 00 02 20 00 ... (see module docs).
+    blob = bytearray(upd[0x200:0x240].ljust(287, b"\x00"))
+    assert struct.unpack_from("<I", blob, 0)[0] == CHIP_ID, "flash_ic chip-ID mismatch"
 
     print("\n== cmd 2 (transc_get_chip_id) ==")
     call_cmd(2)
@@ -250,7 +264,8 @@ def main() -> int:
               (rd(dev + 0x28), rd(dev + 0x2C), rd(dev + 0x34), rd(dev + 0x38),
                rd(dev + 0x3C), rd(dev + 0x40), rd(dev + 0x44)))
     print("\n== cmd 5 (transc_format) ==")
-    call_cmd(5, budget=80_000_000)
+    call_cmd(5, budget=120_000_000)
+    print("  NAND leaf hits during format:", leaf_counts or "{} (init only, no writes)")
     print("\nfinal geom=%#x dev=%#x" % (rd(GEOM_PTR), rd(DEV_OBJ)))
     return 0
 
