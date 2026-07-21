@@ -394,3 +394,69 @@ argument layout** — cmd 4's "erase start/end" came through as `0/0` with the n
 `pkt[4..7]`/`pkt[8..9]` ring-word mapping, so the args are a small struct pointed to
 by `arg0`, not the two ring words. Reconstruct that packet sequence (the Windows
 host tool's driver), then hook the static leaves to a `WritableNand` and capture.
+
+---
+
+## 11. The write protocol — cmd semantics corrected; erase captured (Proven, Leg 8)
+
+§10's Leg-7 resume pointer assumed cmd 4/7/10/11 were "erase / iterate-format /
+writers" all funnelling through the 8 static gNand leaves. Driving them under
+`scripts/zc3201_producer_capture.py` (which reuses the §10 cmd 2→3→5 recipe)
+**corrects the command semantics** and pins the real write seam. All Proven from the
+workers' own debug strings + disasm + a live run.
+
+### 11.1 Dispatcher arg forwarding (re-confirmed)
+`0x08003664`: `cmd = pkt[0..3]`; **`r0 = pkt[4..7]` (arg0)**, **`r1 = pkt[8..9]`
+(arg1)**. Each worker receives arg0 in r0 (a POINTER) and arg1 in r1.
+
+### 11.2 Real command semantics (from the `+++<name>+++` debug prints)
+| cmd | worker | name | arg0 (pointer) target | fires leaves? |
+|---|---|---|---|---|
+| **4** | `0x080015f8` | **`transc_erase`** | **8-byte** `{u32 start, u32 end}` (memcpy 8 via `0x8013204`) → erase impl `0x08008320(start,end)` | **YES** — erase leaf `desc+0x38` |
+| **7** | `0x08001aa8` → `0x0800849c` | **`transc_data`** | **0x18-byte** `{u32 dataLen; u32 ?; char name[16]}` (memcpy 0x18 into `0x08020a9c`) | via medium (below) |
+| **10** | — | **`transc_update_self`** | — | no |
+
+The Leg-7 labels ("iterate/format worker 0x0800849c is cmd 7/10", "cmd 11 writers")
+were **wrong**: `0x0800849c` is `transc_data`'s **file-write** worker, not a format
+iterator, and cmd 10 is `transc_update_self`.
+
+### 11.3 `transc_erase` — PROVEN captured
+`0x08008320(start,end)`: reads the gNand device `*0x08024b50`, clamps `end` to
+`blocks·planes`, and for each block calls the **erase leaf `desc+0x38` = `0x08005d44`**
+as **`leaf(dev, r1=0, r2=block)`** (block steps by the plane count = 2). Inside the
+leaf, `abs_page = block · [dev+0x14](pages/block)`. Driving cmd 4 with
+`arg0 → {0, 2048}` prints `erase start:0, end:2048` and fires the leaf **2043×**
+(1019 distinct blocks) — the **full-chip erase is captured** into a `WritableNand`.
+
+### 11.4 `transc_data` — the write seam + its blocker
+`0x08001aa8` memcpy's the 0x18-byte arg0 into descriptor `0x08020a9c`, prints
+`file:%s` (`desc+8` = the name) and `dataLen:%d` (`desc+0`), then calls the
+write worker `0x0800849c(desc)`. That worker:
+
+* returns early if `desc[8..0xb] == 0` (empty name);
+* **looks up the file** by name in the producer's **file-records table** — global
+  **`0x08020888`** (record **count at `0x0802088c`**; 0x24-byte records at
+  **`0x08020898`**). The search is `strcmp 0x08007b40` driven by the record iterator
+  **`0x08007bc8`**;
+* streams the matching file's bytes to NAND through the **medium object
+  `0x08027060`** (a method table built by cmd 5; write via `[0x08027060+8]`,
+  finalize via `[+0x14]`). The medium's write reaches the gNand **write leaf
+  `desc+0x2c` = `0x08005b14`** (`r0=dev, r2=block, data+tag via r1/r3/stack`).
+
+**Blocker (the next leg's wall):** with an empty file-records table, cmd 7 finds
+nothing and writes nothing (0 leaves, verified: `count@0x0802088c == 0`). The
+file records **and their data** must be UPLOADED by *another* host command before
+`transc_data` can commit them. Reversing that upload command — which fills
+`0x08020888`/`0x08020898` and the data source the iterator `0x08007bc8` drains — is
+the precise next step, after which cmd 7 fires the write leaf and the writes
+(MtdLib metadata + FAT + file content) capture into the `WritableNand`. The
+BurnTool plan (`BurnTool*/config_researcher.txt`) names the files: `PROG.bin`→NAND
+`0x0`, voice→`A:VOIMG` udisk, one FAT partition (type 2), `fs start 0xcc0000`, 64
+reserve blocks — a 32 MiB K9F5608 (2048×32×512).
+
+### 11.5 Harness state
+`scripts/zc3201_producer_capture.py` drives cmd 2→3→5→4→7, hooks the 8 static leaves
+to a `WritableNand`, captures the full-chip erase, logs the leaf calling convention,
+and reports the (empty) file-records table. It is the ZC3201 ring-dispatch analogue
+of `firmware-re/tools/ttrun_producer.py`; once the file-upload command is reversed it
+becomes the `run_producer_zc3201` seam for `tt_emu.nand_provision`.

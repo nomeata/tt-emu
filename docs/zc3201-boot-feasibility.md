@@ -467,3 +467,43 @@ two inline words. Next steps, precise:
    `tt_emu/peripherals/nand.py` `read_id` param + `firmware_profile.ZC3201.nand_read_id`). Reach
    `fs_storage_mount_init` `0x0802d0e0` mounting A:/B:, then book mode + GME play, then parametrize
    `tests/test_scripting.py` over both firmwares.
+
+### Leg 8 — the write protocol is mapped; erase captured; the file-upload command is the next wall
+
+Leg 7's resume pointer assumed cmd 4/7/10/11 all funnelled writes through the 8 static
+gNand leaves. Driving them under the new `scripts/zc3201_producer_capture.py` (reusing
+Leg 7's cmd 2→3→5 recipe) **corrects the command semantics** and pins the real write
+seam (full detail, byte/disasm-cited + live run, in `docs/zc3201-producer-addresses.md`
+§11):
+
+* **cmd 4 = `transc_erase`** — arg0 → an **8-byte** `{u32 start, u32 end}` struct (memcpy
+  8, not two ring words). It fires the gNand **erase leaf `desc+0x38` = `0x08005d44`** as
+  `leaf(dev, 0, block)` across the whole chip. **PROVEN captured**: cmd 4 with
+  `arg0 → {0,2048}` fires the leaf 2043× (1019 distinct blocks) → the full-chip erase
+  lands in a `WritableNand`.
+* **cmd 7 = `transc_data`** (worker `0x08001aa8` → `0x0800849c`) — arg0 → a **0x18-byte**
+  `{u32 dataLen; u32 ?; char name[16]}` descriptor. It **looks up `name`** in the
+  producer's **file-records table** (global `0x08020888`, count `0x0802088c`, 0x24-byte
+  records `0x08020898`; search = strcmp `0x08007b40` via iterator `0x08007bc8`) and streams
+  the matching file to NAND through the **medium object `0x08027060`** (write via
+  `[+8]`), which reaches the gNand **write leaf `desc+0x2c` = `0x08005b14`**.
+* **cmd 10 = `transc_update_self`** (not an iterate/format).
+
+**The wall (next leg), now precise.** With an *empty* file-records table cmd 7 finds
+nothing and writes nothing (verified `count@0x0802088c == 0`, 0 write leaves). The file
+records **and their data** must be UPLOADED by *another* host command before `transc_data`
+can commit them. Reverse that upload command — it fills `0x08020888`/`0x08020898` and the
+data source the iterator `0x08007bc8` drains — then cmd 7 fires the write leaf and the
+writes (MtdLib metadata + FAT + file content) capture into the `WritableNand`. Then:
+convert with **512 B page + 16 B spare** fidelity (give ZC3201 its K9F5608 read-ID via the
+profile), serve through `NfcController`, reach `fs_storage_mount_init` `0x0802d0e0`
+mounting A:/B:, drive pump → standby → OID tap → book → GME play, and parametrise
+`tests/test_scripting.py` over both firmwares. The BurnTool plan
+(`BurnTool*/config_researcher.txt`) names the files/geometry: `PROG.bin`→NAND `0x0`,
+voice→`A:VOIMG` udisk, one FAT partition (type 2), `fs start 0xcc0000`, 64 reserve blocks,
+32 MiB K9F5608 (2048×32×512).
+
+The success criterion — *all gme-based tests passing on both firmwares* — remains **not
+met**: MT is green (150 passed), ZC3201 has no gme test yet (blocked on mount, which is
+blocked on the producer write above). No product code changed this leg (only the capture
+script + these docs), so MT is unregressed.
