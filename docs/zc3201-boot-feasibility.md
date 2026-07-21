@@ -135,28 +135,71 @@ plus the fetch and the substrate:
 The success criterion — *all gme-based tests passing on both firmwares* — is **not met**: those
 tests require booting to book mode and running the interpreter through the unmodified firmware
 (taps via the OID sensor, the `.gme` served through NAND, audio via the DAC DMA), which is
-blocked on the missing boot RE above. This is the same multi-stage bring-up the 2N boot was, and
-the reference material for the ZC3201 half of it does not exist yet.
+blocked on the remaining boot RE below.
+
+## Leg 2 update — the real boot entry, the crt0 seed, and reaching storage init
+
+The **true pre-init boot task was identified** and the firmware now runs authentically from it
+through tt-emu's real `Machine` into storage init — steps 1 and (the critical part of) 2 of the
+plan. Concretely:
+
+* **Corrected the boot entry.** `state_init_power_on` `0x08030e48` is **not** the boot task — it
+  is the INIT-*state leaf handler* (it plays the power-on chomp voice `0x19`, opens files) that
+  the event pump dispatches; it has no xrefs. The real chain (all previously unnamed `FUN_*` in
+  the ZC3201 decomp, twins of the MT `boot_task_main`/`app_init_main`):
+  * **`boot_task_main` `0x080238bc`** — ROM entry (no PROG callers). SoC bring-up, then calls
+    `app_init_main`, then the infinite **event-pump loop** dispatching statechart events via
+    `sm_dispatch_hierarchy` `0x080016a8` (fetch event → map → call current-state handler at
+    `obj+0xc`). The pen's event ring is at `+0x180/+0x182` masked `&0x1f` (not the MT's
+    `+0xc0/+0xc2` `&0xf`).
+  * **`app_init_main` `0x080236c0`** — subsystem inits, then `fs_storage_mount_init`
+    `0x080250e0` (**hangs forever via empty `while(true)` on mount failure**), sets the initial
+    statechart state byte, installs the timer/event objects. App-context ≈ `0x0800779c`.
+  * `prog_entry` in `firmware_profile.ZC3201` is now `0x080238bc`; the recovered addresses are in
+    `ZC3201.symbols` (`boot_task_main`, `app_init_main`, `fs_storage_mount_init`,
+    `sm_dispatch_hierarchy`, `mtd_extra_bitmap`, `irq_mask_push/pop`, …).
+* **Solved the from-entry seed-state blocker (step 2).** The ZC3201 boot ROM / C-runtime zeroes
+  low working RAM (`.bss`) before jumping to `boot_task_main`; entering there skips it, so the
+  region keeps the PROG image's stale bytes. The first casualty is the HAL **IRQ-nesting struct**
+  at `0x08007d7c` (depth byte `0x08007d8c`): `irq_mask_push` `0x07ffdb00` reads it, and a
+  non-zero depth trips its 4-deep overflow guard → `b 0x07ffdb14` (hang) on the *first* critical
+  section. The fix — the ZC3201 analogue of the MT `§5.6` seeds — is to zero the `.bss` window
+  crt0 clears: `ZC3201.bss_seed = (0x08007000, 0x2000)` (verified **no PROG code executes** in
+  that window). This alone takes the run from **88 → ~800 distinct PROG PCs**.
+* **The SoC core peripherals are reused verbatim.** ZC3201 is the same Anyka family; the MT
+  `SysCon`/`IntcTimer`/`GpioBlock`/`BatteryAdc` at the identical `0x040000xx` addresses work
+  unchanged (chip-ID gate passes, clock latches self-clear, battery reads healthy).
+* **New substrate + coverage.** `boot.build_zc3201_machine(fw)` assembles the real machine
+  (reused core peripherals, no MMU, the crt0 seed, entry at the boot task).
+  `scripts/zc3201_realmachine_probe.py` and `tests/test_firmware_profile.py::
+  test_zc3201_boots_through_app_init_to_storage` exercise it: the unmodified firmware runs
+  `boot_task_main` → `app_init_main` → subsystem inits → **MTD/storage init**
+  (`mtd_extra_bitmap` `0x08022a8c`), ~800 distinct PROG PCs, span `0x08000070..0x080c2af8`,
+  **no hang**. MT suite unregressed.
 
 ## Resume pointer
 
-Next actionable step is **step 2 (from-entry seed state)** — but first the true blocker,
-**identifying the ZC3201 pre-init boot entry and driving the event pump**:
+The firmware now boots authentically to **storage/MTD init and there spins in calibrated
+storage-probe delay loops** (HAL udelay `0x07ffb1c0`) waiting on flash hardware that is not
+modelled — it has **not** yet reached `fs_storage_mount_init`'s success path, the event pump,
+standby, or book mode. Next actionable step is **step 3 (NAND/NFC + image)**:
 
-1. Start from `build_bare_machine` (proven). Find the ZC3201 `app_init_main` equivalent (MT
-   `0x08038f5c`; not `state_init_power_on`, which just returns) by tracing what calls
-   `state_init_power_on` / `event_post` `0x08001544` / `state_stdb_standby` `0x08036454`, and
-   what registers the QHsm dispatch table — the ghidra project is at
-   `tt-firmware-reveng/ZC3201/`.
-2. Reverse the **SoC MMIO map** for this pen (the lab's all-zero stub is enough to *reach* the
-   init leaf but not to pass the boot self-tests — clock/battery calibration, timer tick). This
-   is the bulk of the new RE. Re-point tt-emu's `syscon`/`intc`/`gpio`/`battery` models once the
-   addresses are known (they are currently all `0x040000xx`, MT-specific).
-3. Reverse the **NAND geometry + NFC registers** to serve the `.gme` authentically, and the
-   **OID capture-state address** + GPIO pins, and the **DAC/DMA registers** for real PCM.
-4. Add a ZC3201 branch of the `firmware.mt` debugger (statechart frame base, product-id addr,
-   register-file addr `0x081d8328`, the `gme_exec_command`/`voice_*` watchpoints from
-   `FirmwareProfile.symbols`) so `Emulator` / `runner` can observe book mode, taps and plays —
-   then parametrise `tests/test_scripting.py` etc. over both firmwares.
+1. **Model the ZC3201 NAND/NFC controller and provide a NAND image** so `fs_storage_mount_init`
+   `0x080250e0` mounts instead of spinning/hanging. Start from `build_zc3201_machine`; trace the
+   storage init from `app_init_main` `0x080236c0` → the MTD/NFTL layer (`mtd_*` names in
+   `ZC3201/input/names.csv`: `mtd_extra_bitmap` `0x08022a8c`, `mtd_open_maptbl` `0x08027f50`,
+   `nand_disk_mount` `0x0802b45c`) and find which MMIO register block + status/ready bit the
+   probe delay loop polls (disassemble the caller of udelay `0x07ffb1a4`). Cross-check the NAND
+   geometry against the MT `NandImage`/`NfcController` — likely re-pointable, as the core
+   peripherals were. This unblocks `app_init_main` returning and the event pump starting.
+2. Once the pump runs: drive the descent power-on → standby → (cover/product-OID tap) → book via
+   the modelled OID sensor + GPIO (re-point the MT `OidSensor`), and serve the `.gme` through the
+   NAND/FS. The generic scripted-GME interpreter is a proven twin (`ZC3201.symbols` gme_* + the
+   `firmware-re` lab), so once book mode is reached the interpreter path should run.
+3. Add a ZC3201 branch of the `firmware.mt` debugger (the ZC3201 AO struct / event-ring geometry
+   above, register-file `0x081d8328`, the `gme_exec_command`/`voice_*` watchpoints from
+   `FirmwareProfile.symbols`) so `Emulator`/`runner` observe book mode, taps and plays — then
+   parametrise `tests/test_scripting.py` etc. over both firmwares.
 
-Everything up to the `build_bare_machine` return is done and green; the work resumes at item 1.
+Everything up to `build_zc3201_machine` reaching storage init is done and green; work resumes at
+item 1 (the ZC3201 NAND/NFC model + image).

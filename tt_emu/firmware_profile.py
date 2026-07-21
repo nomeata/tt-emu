@@ -70,6 +70,17 @@ class FirmwareProfile:
 
     fetch: FetchInfo
 
+    #: Crt0-equivalent from-entry seed: ``(addr, size)`` of the low working-RAM
+    #: ``.bss`` window the C-runtime / boot ROM zeroes before handing control to
+    #: the boot task. A from-entry boot skips crt0, so this region keeps the
+    #: PROG image's stale bytes; the firmware's HAL IRQ-nesting struct lives here
+    #: (ZC3201: depth byte ``0x08007d8c``), and a non-zero depth trips the
+    #: nesting-overflow guard (``irq_mask_push`` ``0x07ffdb00`` → hang) on the
+    #: first critical section. Zeroing it is the ZC3201 analogue of the MT boot's
+    #: §5.6 RAM seeds. ``None`` for firmwares whose entry runs after crt0 (MT).
+    #: Verified no PROG code executes in this window (pure scratch/bss).
+    bss_seed: tuple[int, int] | None = None
+
     #: Whether tt-emu can boot this firmware to book mode authentically today.
     #: MT: yes (the whole §5 recipe). ZC3201: not yet — the from-entry boot RE
     #: (seed state, SoC MMIO map, NAND geometry, OID/audio register addresses)
@@ -115,10 +126,18 @@ MT = FirmwareProfile(
 #
 # Load layout from the ``firmware-re`` lab (nandboot @ 0x07ff8000 reset entry
 # 0x07ff8094; PROG @ 0x08000000 identity, 1 MiB). ``prog_entry`` is the
-# statechart's init leaf ``state_init_power_on``; running from it executes 132
-# instructions and returns (the QP init returns to let the event pump drive) —
-# NOT the pre-init boot entry MT uses (which for ZC3201 is not yet identified).
-# See docs/zc3201-boot-feasibility.md.
+# **pre-init boot task** ``boot_task_main`` ``0x080238bc`` — the address the boot
+# ROM hands PROG control at (no callers in PROG; ROM-entered). It does SoC
+# bring-up, calls ``app_init_main`` ``0x080236c0`` (which mounts storage and
+# installs the statechart), then runs the infinite event-pump loop dispatching
+# statechart events via ``0x080016a8``. (An earlier revision mis-set this to the
+# INIT-*state handler* ``state_init_power_on`` ``0x08030e48`` — a leaf dispatched
+# BY the pump that plays the power-on chomp voice 0x19, not the boot task.)
+# From this entry, with the reused SoC core peripherals + the ``bss_seed`` crt0
+# zeroing, the unmodified firmware runs app_init_main → subsystem inits → MTD /
+# storage init; it then spins in calibrated storage-probe waits until the
+# NAND/NFC controller is modelled (next step). See
+# docs/zc3201-boot-feasibility.md.
 
 ZC3201 = FirmwareProfile(
     key="zc3201",
@@ -126,7 +145,7 @@ ZC3201 = FirmwareProfile(
     boot_generation="ANYKANB0",
     build_prefix=b"v0136\x00\x00\x00\x00\x00" + b"120117" + b"\x00\x00\x00\x00" + b"Tiptoi",
     prog_load=0x0800_0000,
-    prog_entry=0x0803_0E48,  # state_init_power_on
+    prog_entry=0x0802_38BC,  # boot_task_main (ROM entry: SoC init + event pump)
     nandboot_load=0x07FF_8000,
     nandboot_alias=None,  # PROG occupies 0x08000000; nandboot loads once
     codepage_size=0xD6CCC,
@@ -136,6 +155,10 @@ ZC3201 = FirmwareProfile(
         filename="update_zc3201.upd",
         size=6_396_452,
     ),
+    # Crt0 zeroes low working RAM before boot_task_main; a from-entry boot must
+    # reproduce that (see the field doc). [0x08007000, 0x08009000) is the MT
+    # low-working-RAM analogue; verified no PROG code executes there.
+    bss_seed=(0x0800_7000, 0x2000),
     boots_to_book=False,
     symbols={
         # HAL / FSLib (names.csv, lab hook points)
@@ -147,7 +170,16 @@ ZC3201 = FirmwareProfile(
         "play_chomp_voice": 0x0809_7374,
         "game_play_oid_voice": 0x0805_4730,
         "akoid_open_check": 0x0802_19A0,
-        "state_init_power_on": 0x0803_0E48,
+        # Boot / statechart-pump path (recovered this bring-up; unnamed FUN_* in
+        # the ZC3201 decomp — see docs/zc3201-boot-feasibility.md):
+        "boot_task_main": 0x0802_38BC,  # = prog_entry; ROM entry, tail event pump
+        "app_init_main": 0x0802_36C0,  # SoC init + mount + install statechart
+        "fs_storage_mount_init": 0x0802_50E0,  # hangs forever on mount failure
+        "sm_dispatch_hierarchy": 0x0800_16A8,  # per-event dispatch to current state
+        "mtd_extra_bitmap": 0x0802_2A8C,  # MTD/NFTL bitmap init (reached at boot)
+        "irq_mask_push": 0x07FF_DB00,  # HAL: save+zero INT_ENABLE; nesting depth @0x08007d8c
+        "irq_mask_pop": 0x07FF_DB48,  # HAL: restore INT_ENABLE
+        "state_init_power_on": 0x0803_0E48,  # INIT-state LEAF handler (dispatched, not entry)
         "state_stdb_standby": 0x0803_6454,
         "event_post": 0x0800_1544,
         "nand_disk_mount": 0x0802_B45C,

@@ -235,28 +235,86 @@ def build_machine(
     return BootedMachine(machine, firmware, zc90b, nand, oid, audio, gpio, mmu)
 
 
-def build_bare_machine(
+def build_zc3201_machine(
     firmware: Firmware,
     config: MachineConfig | None = None,
     *,
     profile: FirmwareProfile = ZC3201,
 ) -> Machine:
-    """A minimal machine for a from-entry boot probe of a non-MT firmware.
+    """Assemble a ZC3201 machine and seed it to its real boot-task entry.
 
-    This is the substrate for the ZC3201 bring-up (``docs/zc3201-boot-feasibility.md``):
-    it loads PROG + nandboot at the *profile's* addresses (ZC3201: PROG identity
-    at ``0x08000000``, nandboot at ``0x07ff8000``) and seeds the CPU at the
-    profile's entry (``state_init_power_on``), but registers **no** peripherals
-    and **no** MMU — so every MMIO read returns 0, exactly the model the
-    ``firmware-re`` lab uses for this build (it has no SoC register map,
-    NAND geometry, or OID/audio addresses yet). It is deliberately hook-free:
-    it only *loads and runs*, so a caller can observe how far the unmodified
-    firmware executes from entry.
+    The 1st-gen bring-up substrate (``docs/zc3201-boot-feasibility.md`` step 2/3).
+    Unlike the MT recipe (:func:`build_machine`), ZC3201's PROG is **identity-mapped**
+    at ``0x08000000`` so **no demand-paging MMU** is needed — the whole
+    :mod:`tt_emu.mmu_boot` layer is absent here. The SoC is the same Anyka family, so
+    the MT **core-page peripheral models are reused verbatim at the identical
+    ``0x040000xx`` addresses**: :class:`SysCon` (chip-ID/clock gate), :class:`IntcTimer`
+    (top-level IRQ + timer1), :class:`GpioBlock` and :class:`BatteryAdc`.
 
-    Reaching book mode from here needs the ZC3201 boot RE that does not exist
-    yet (seed state, the SoC MMIO map, NAND geometry, the OID/audio registers);
-    until then this proves the profile-driven load path end-to-end and the
-    :func:`tt_emu.firmware_profile.detect` result on the real image.
+    Two ZC3201-specific from-entry seeds, both authentic (they reproduce state the
+    skipped boot ROM / C-runtime would have left):
+
+    * ``profile.bss_seed`` — zero the low working-RAM ``.bss`` window crt0 clears, so
+      the HAL IRQ-nesting depth (``0x08007d8c``) starts at 0 rather than the PROG
+      image's stale byte (otherwise ``irq_mask_push`` ``0x07ffdb00`` trips its
+      nesting-overflow guard and hangs on the first critical section);
+    * entry at ``profile.prog_entry`` (``boot_task_main`` ``0x080238bc``) — the address
+      the boot ROM hands PROG control at.
+
+    From here the **unmodified** firmware runs ``boot_task_main`` → ``app_init_main``
+    (``0x080236c0``) → SoC/subsystem inits → MTD/storage init. It does **not** yet
+    reach book mode: mounting the ``.gme`` needs the ZC3201 NAND/NFC controller +
+    image (step 3), which is not modelled here — the firmware currently spins in
+    calibrated storage-probe delays waiting on that hardware. No hooks: this only
+    loads, seeds and runs.
+    """
+    machine = Machine(config)
+    gpio = GpioBlock()
+    intc = IntcTimer(gpio)
+    machine.add_peripheral(SysCon())
+    machine.add_peripheral(intc)
+    machine.add_peripheral(gpio)
+    machine.add_peripheral(BatteryAdc())
+    machine.intc = intc
+
+    machine.write_bytes(profile.prog_load, firmware.prog.data)
+    machine.write_bytes(profile.nandboot_load, firmware.nandboot.data)
+    if profile.nandboot_alias is not None:
+        machine.write_bytes(profile.nandboot_alias, firmware.nandboot.data)
+    if profile.bss_seed is not None:
+        addr, size = profile.bss_seed
+        machine.write_bytes(addr, b"\x00" * size)
+
+    machine.set_entry_state(profile.prog_entry, SVC_STACK_TOP, CPSR_SVC_IRQS_ON)
+    log.info(
+        "zc3201 machine for %s (%s): PROG @ %#010x, boot-task entry %#010x",
+        profile.label, firmware.boot_generation, profile.prog_load, profile.prog_entry,
+    )
+    return machine
+
+
+def build_bare_machine(
+    firmware: Firmware,
+    config: MachineConfig | None = None,
+    *,
+    profile: FirmwareProfile = ZC3201,
+    entry: int | None = None,
+) -> Machine:
+    """A minimal from-entry probe: load PROG + nandboot, run from ``entry``.
+
+    Loads PROG + nandboot at the *profile's* addresses (ZC3201: PROG identity at
+    ``0x08000000``, nandboot at ``0x07ff8000``) with **no** peripherals and **no**
+    MMU — every MMIO read returns 0, exactly the model the ``firmware-re`` lab
+    uses for this build. Hook-free: it only loads and runs, so a caller can
+    observe how far the unmodified firmware executes from a chosen ``entry``.
+
+    ``entry`` defaults to ``profile.prog_entry`` (ZC3201: ``boot_task_main``); a
+    ``bx lr`` back to the low sentinel is trapped as a clean return. Note the boot
+    task never returns (it runs the event pump) and, with no SoC peripherals and
+    no crt0 ``.bss`` seed, stalls at the HAL IRQ-nesting overflow guard
+    (``0x07ffdb14``) — pass a *returning* leaf (e.g. the INIT-state handler
+    ``state_init_power_on`` ``0x08030e48``) to observe a bounded run, or use
+    :func:`build_zc3201_machine` for the real bootable substrate.
     """
     from unicorn.arm_const import UC_ARM_REG_LR
 
@@ -265,15 +323,16 @@ def build_bare_machine(
     machine.write_bytes(profile.nandboot_load, firmware.nandboot.data)
     if profile.nandboot_alias is not None:
         machine.write_bytes(profile.nandboot_alias, firmware.nandboot.data)
-    machine.set_entry_state(profile.prog_entry, SVC_STACK_TOP, CPSR_SVC_IRQS_ON)
-    # Return-trap: the entry leaf ends with ``bx lr``; land it on a mapped
-    # sentinel in the low (zero) page and stop there, so a probe observes the
-    # clean return rather than running off into the zero page. (The MT recipe
-    # never returns — it runs the event pump — so this is bare-probe-only.)
+    machine.set_entry_state(entry if entry is not None else profile.prog_entry,
+                            SVC_STACK_TOP, CPSR_SVC_IRQS_ON)
+    # Return-trap: a leaf ending with ``bx lr`` lands on a mapped sentinel in the
+    # low (zero) page and stops there, so a probe observes the clean return
+    # rather than running off into the zero page.
     machine.uc.reg_write(UC_ARM_REG_LR, BARE_LR_SENTINEL)
     machine.on_code(BARE_LR_SENTINEL, lambda m: m.request_stop("returned to entry sentinel"))
     log.info(
         "bare machine for %s (%s): PROG @ %#010x, entry %#010x",
-        profile.label, firmware.boot_generation, profile.prog_load, profile.prog_entry,
+        profile.label, firmware.boot_generation, profile.prog_load,
+        entry if entry is not None else profile.prog_entry,
     )
     return machine

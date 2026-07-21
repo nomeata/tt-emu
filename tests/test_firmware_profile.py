@@ -33,7 +33,13 @@ def test_profile_load_layout_distinct() -> None:
     # The layout difference that motivated the abstraction.
     assert MT.prog_load == 0x0800_9000 and MT.nandboot_alias == 0x07FF_8000
     assert ZC3201.prog_load == 0x0800_0000 and ZC3201.nandboot_alias is None
-    assert ZC3201.prog_entry == 0x0803_0E48  # state_init_power_on
+    # prog_entry is the pre-init boot task (ROM entry), NOT the INIT-state leaf
+    # handler 0x08030e48 (which is dispatched by the pump; recorded in symbols).
+    assert ZC3201.prog_entry == 0x0802_38BC  # boot_task_main
+    assert ZC3201.symbols["state_init_power_on"] == 0x0803_0E48  # the leaf handler
+    assert ZC3201.symbols["app_init_main"] == 0x0802_36C0
+    assert ZC3201.bss_seed == (0x0800_7000, 0x2000)  # crt0-equivalent .bss zero
+    assert MT.bss_seed is None  # MT enters after crt0
     assert MT.boots_to_book and not ZC3201.boots_to_book
 
 
@@ -78,28 +84,40 @@ def test_detect_real_zc3201() -> None:
 
 
 @pytest.mark.skipif(ZC_PATH is None, reason="ZC3201 firmware .upd not available")
-def test_zc3201_from_entry_runs_init_leaf() -> None:
-    """The unmodified ZC3201 firmware runs from ``state_init_power_on`` and
-    returns cleanly — the proven forward progress (131 distinct PCs, no unmapped
-    access), reproduced through tt-emu's real ``Machine`` via the profile-driven
-    load path. Reaching book mode from here needs the not-yet-existing boot RE.
+def test_zc3201_boots_through_app_init_to_storage() -> None:
+    """The unmodified ZC3201 firmware, from its real boot-task entry
+    (``boot_task_main`` 0x080238bc) with the reused MT SoC core peripherals + the
+    crt0 ``.bss`` seed, runs ``app_init_main`` → subsystem inits → MTD/storage
+    init — no demand-paging MMU, no hooks. It must clear the HAL IRQ-nesting
+    overflow guard (which the crt0 seed defuses) and reach ``mtd_extra_bitmap``.
+    Reaching book mode from here needs the ZC3201 NAND/NFC controller + image
+    (``docs/zc3201-boot-feasibility.md`` step 3).
     """
+    from collections import Counter
+
     from unicorn import UC_HOOK_CODE
 
-    from tt_emu.boot import build_bare_machine
+    from tt_emu.boot import build_zc3201_machine
     from tt_emu.loader import load_upd
     from tt_emu.machine import MachineConfig
 
     fw = load_upd(str(ZC_PATH))
-    machine = build_bare_machine(fw, MachineConfig(instructions_per_tick=20_000))
-    pcs: list[int] = []
-    machine.uc.hook_add(UC_HOOK_CODE, lambda uc, addr, size, ud: pcs.append(addr))
-    result = machine.run(2_000_000)
+    machine = build_zc3201_machine(fw, MachineConfig(instructions_per_tick=20_000))
+    reached: set[str] = set()
+    machine.on_code(ZC3201.symbols["app_init_main"], lambda _m: reached.add("app_init"))
+    machine.on_code(ZC3201.symbols["mtd_extra_bitmap"], lambda _m: reached.add("mtd"))
+    hot: Counter[int] = Counter()
+    machine.uc.hook_add(UC_HOOK_CODE, lambda _uc, a, _s, _u: hot.update((a,)))
 
-    assert result.reason == "returned to entry sentinel"
-    in_prog = [p for p in pcs if 0x0800_0000 <= p < 0x0810_0000]
-    assert in_prog, "PROG never executed"
-    assert min(in_prog) >= 0x0800_0000 and max(in_prog) < 0x0810_0000
-    # No demand-paging MMU needed: the identity image runs without an unmapped
-    # access (the run stops at the sentinel, not on a fault).
-    assert len(set(pcs)) < 500  # the init leaf is short (~131 distinct PCs)
+    result = machine.run(15_000_000)
+
+    # Forward progress well past the seed: the boot task called app_init_main and
+    # the firmware reached storage/MTD init.
+    assert "app_init" in reached, "app_init_main never entered"
+    assert "mtd" in reached, "MTD/storage init (mtd_extra_bitmap) never reached"
+    # It did NOT wedge on the HAL IRQ-nesting overflow guard (the seed defused it).
+    HANG = 0x07FF_DB14
+    assert hot.get(HANG, 0) == 0, "hung at irq_mask_push nesting-overflow guard"
+    assert result.pc >> 24 == 0x08 or result.pc >> 20 == 0x07F  # in PROG or HAL, running
+    in_prog = {a for a in hot if 0x0800_0000 <= a < 0x0810_0000}
+    assert len(in_prog) > 400, f"expected deep PROG coverage, got {len(in_prog)}"
