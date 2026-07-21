@@ -899,3 +899,89 @@ boot sector reads back — and dies in **FatLib** at a divide-by-zero: a 512-byt
 `_phys_block`/`_partition_geom`/`_lay_map_tags`/`_place_volume` + volume clamp in
 `nand_image_zc3201.py`. Tests updated: `test_smallpage_nfc_program_round_trip` (real FIFO protocol),
 `test_build_zc3201_nand_image_map_tags` (both partitions' geometry).
+
+## Leg 15 — the FatLib "heap collision" was a NAND read-count overrun; the FatLib mount COMPLETES; new wall = nandboot `codepage` file-index lookup
+
+Leg 14's "heap collision" hypothesis (a use-after-free / missing heap bound handing out
+overlapping allocations) was **wrong** — the allocator is fine. Instrumenting it
+(`scripts/zc3201_heap_probe.py`: the services vtable `0x081d9ad8` slot 0 = `malloc`
+`0x080a0a88`, slot 1 = `free`, slot 4 = `logf`) shows a plain **upward bump allocator**
+handing out *contiguous, non-overlapping* blocks: the whole-disk-map object
+(`FUN_0802f0c0`, `malloc(0x60)` = `0x80fa3c0`) then the MtdLib manager (`FUN_0802ea54`,
+`malloc(0x28c)` = `0x80fa420`) — adjacent, no overlap. The real bug is a **read that
+overruns its buffer** (all Proven, disasm + live-run instrumented):
+
+* **The clobber is a memcpy** `0x0800339c` (`src = 0x08005800` the L2 NAND window, `n =
+  0x200`, `dst = 0x80fa400`) fired from the nandboot bulk page-read `func_0x080028b0`
+  (`lr = 0x08002a08`). The read primitive assembles a page as `dst = buf + i·512` for
+  `i in range(count)`.
+* **The buffer is `0x80fa000`** — the map-read scratch the mount `fs_storage_mount_init`
+  `0x0802d0e0` allocates as `iVar5 = FUN_0802b350(dev+0x1c)` (**512 bytes**, `dev+0x1c` =
+  page bytes), stashes in the disk-info global `*(0x081d97d8+8)`, reads page 31 into via
+  `dev+0x2c` = `FUN_0800c208`, then **frees** — after which the whole-disk-map (`0x80fa3c0`)
+  and manager (`0x80fa420`) are bump-allocated *just above it*.
+* **`count = *(0x08006fa0)[1] = 4`.** The bulk reader's sub-page count is byte `+1` of a
+  **nandboot NAND-geometry descriptor** at `0x08006fa0` (read via the literal at
+  `0x080024ec`). The nandboot image ships the **large-page default 4** (MT's 2-KiB page =
+  4×512-B sub-pages). So the map-read reads **4×512 = 2 KiB into the 512-B buffer**:
+  `buf+2·512 = 0x80fa400` lands on the manager's `+0x2c` pages-per-block divisor
+  (`0x80fa44c`), zeroing it → the compiler divide-by-zero guard in `FUN_0800c974` (FatLib
+  global-block → (partition, block)) fires the ARM-state semihosting **`svc 0x123456`
+  `SYS_EXIT`**.
+
+**Root cause = a skipped-chip-detect seed, exactly the `bss_seed`/`nand_dev_geometry`/
+`NAND_ROW_CYCLES` class.** ZC3201's 512-byte-page K9F5608 reads **1** sub-page per page;
+the skipped nandboot chip-detect never corrects the image's large-page default (4). The
+byte `+0 = 2` in that descriptor is already correct in the image (every earlier read
+worked) and is kept.
+
+### Fix (landed, product)
+
+* **`FirmwareProfile.nandboot_geom_seed = (0x08006fa0, bytes([2, 1, 0, 0]))`** — byte `+1`
+  = 1 (512-B sub-pages per page). `boot.build_zc3201_machine` writes it to the nandboot
+  **alias** (the read literal targets `0x08006fa0`) *and* the load copy (`0x07ffefa0`),
+  mirroring MT's `NAND_ROW_CYCLES`. MT has no such seed (its real boot populates it).
+* **`machine._on_intr` now honours ARM-state semihosting `svc 0x123456`** (Thumb is
+  `0xAB`): `SYS_EXIT` (`r0 = 0x18`) becomes a clean `request_stop("firmware SYS_EXIT …")`
+  instead of "ignored" + a garbage fall-through deref. Generation-agnostic (MT never
+  issues it — 158 green).
+
+**Verified** (`scripts/zc3201_mtdlog.py`): `FUN_0800c974`'s divisor stays `0x20` (32 clean
+divides, 0 zero); the **complete MtdLib mount** (`InitPlane succeed P=0,V=951` /
+`P=1,V=1015`) **and the FatLib mount** now finish; the boot proceeds into `app_init`'s
+post-mount sequence and opens `A:` (system partition) 3×.
+
+### Leg 15 resume pointer — the nandboot `codepage` file-index lookup
+
+Past the FatLib mount, `app_init` runs a nandboot **boot-file loader** `0x08000868`
+(callers `0x08000b3c` / `0x08000df4`) that **strcmp-searches an on-media file-index table**
+— 8 records of `0x24` bytes at `0x08007c52`, name at `record+0x14` — for the name **`codepage`**
+(`r8`). In the hand-built image **every record's name is empty**, so `codepage` is not found
+and the loader hits a **fatal self-spin `b .` at `0x08000944`** (Proven: 20M instructions all
+at that PC, `0` IRQs delivered, `state_init_power_on` never reached — the statechart never
+starts). The table is **not** the FAT directory (placing a `codepage` file in `a_files`
+does *not* populate it — verified): it is an on-media file-index the producer writes. The
+`0x080032d8` "log" the panic calls first is a `bx lr` stub, so the spin is a bare halt.
+
+**Next steps, precise:**
+1. **Populate the system-partition file-index** the mount reads into `0x08007c52` (the 8
+   `0x24`-byte records, incl. `codepage`) so nandboot finds and loads the codepage. Trace
+   who fills `0x08007c52` (the caller `0x08000df4` / the mount's directory read) to recover
+   the on-media format, and lay it into `build_zc3201_nand_image` — or capture it from a
+   producer-formatted system image. (`codepage.bin` is `Firmware.codepage`, 0xD6CCC bytes.)
+2. Then `app_init` reaches the **event pump** → statechart **INIT leaf**
+   (`state_init_power_on` `0x08038e48`) → standby → book. Re-point `OidSensor`, add a ZC3201
+   `firmware.mt`-style debugger (statechart/AO/event-ring, via `FirmwareProfile` +
+   `tt-firmware-reveng/correspondences.tsv`), drive the pump → OID tap → GME play, and
+   parametrise `tests/test_scripting.py` over both firmwares.
+
+**State now:** the unmodified firmware boots through the **complete MtdLib + FatLib mount**
+of both partitions and into `app_init`'s post-mount file loading; it halts at the nandboot
+`codepage` file-index lookup (`0x08000868` → spin `0x08000944`) because the hand-built
+image's on-media file-index is empty — the first point that needs authentic **system-partition
+content**. MT unregressed (158 passed). Product changes this leg:
+`FirmwareProfile.nandboot_geom_seed` (+ ZC3201 value), the `boot.build_zc3201_machine`
+seed wiring, and the `machine._on_intr` ARM `SYS_EXIT` clean-stop. Tests:
+`test_profile_load_layout_distinct` (the seed field) + `test_zc3201_fatlib_mount_completes`
+(divisor never zero, boot past the mount into the post-mount lookup, no `SYS_EXIT`). Probe:
+`scripts/zc3201_heap_probe.py`.

@@ -1010,6 +1010,20 @@ class Machine:
                 imm = self.read_u32(pc - 4) & 0x00FFFFFF
         except UcError:
             imm = -1
+        # ARM-state semihosting uses SVC 0x123456 (Thumb uses 0xAB); the two share
+        # the operation-in-r0 ABI. Honour SYS_EXIT (r0 = 0x18) as a clean, explicit
+        # stop rather than logging "ignored" and falling through — the firmware's
+        # compiler-emitted divide-by-zero / abort guards exit this way, and a
+        # silent fall-through then derefs garbage. Generation-agnostic: MT never
+        # issues it on the happy path (§1.1). Other ARM-svc numbers are still logged.
+        if imm == 0x123456:
+            op = self.uc.reg_read(UC_ARM_REG_R0)
+            if op == 0x18:  # SYS_EXIT (fatal abort)
+                self.request_stop(f"firmware SYS_EXIT (semihosting abort) at pc={pc:#010x}")
+            else:
+                log.warning("ARM semihosting svc 0x123456 op=%#x at pc=%#010x — ignored",
+                            op, pc)
+            return
         if imm != 0xAB:
             log.warning("svc #%#x at pc=%#010x (intno=%d) — ignored", imm, pc, intno)
             return

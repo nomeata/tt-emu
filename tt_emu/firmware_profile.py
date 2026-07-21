@@ -200,6 +200,22 @@ class FirmwareProfile:
     #: itself. Seeded *after* :attr:`bss_seed` (it lives inside that window).
     nand_dev_geometry: tuple[int, bytes] | None = None
 
+    #: ``(addr, bytes)`` of the nandboot NAND-geometry descriptor the skipped
+    #: chip-detect fills — distinct from :attr:`nand_dev_geometry` (the MtdLib
+    #: device object) in that it is a low-level nandboot struct. Its byte ``+1``
+    #: is the **number of 512-byte sub-page transfers per page read**
+    #: (``page_size / 512``): the nandboot bulk-read primitive
+    #: (``func_0x080028b0``) loops ``dst = buf + i·512`` for ``i in
+    #: range(desc[1])`` when assembling a page. The nandboot image ships the
+    #: large-page default (**4**, MT's 2-KiB page); ZC3201's 512-byte-page chip
+    #: (K9F5608) reads **1** sub-page, so the skipped chip-detect would set it to
+    #: 1. Left at 4, the map-read (into a ``dev+0x1c`` = 512-byte buffer) reads
+    #: 2 KiB and overruns the buffer into the just-allocated MtdLib manager,
+    #: zeroing its pages-per-block divisor → a FatLib divide-by-zero
+    #: (``docs/zc3201-boot-feasibility.md`` "Leg 15"). ``None`` for firmwares whose
+    #: real boot populates it (MT). Seeded after the nandboot image is loaded.
+    nandboot_geom_seed: tuple[int, bytes] | None = None
+
     #: Addresses to drive this generation's ``producer.bin`` to format a NAND
     #: image (:mod:`tt_emu.nand_provision`); ``None`` until reverse-engineered.
     producer: ProducerProfile | None = None
@@ -342,6 +358,11 @@ ZC3201 = FirmwareProfile(
         struct.pack("<8I", 1, 0x1000_0000, 2, 2, 1024, 32, 1, 512),
     ),
     nand_read_id=0xBDA5_75EC,  # Samsung K9F5608 (bytes EC 75 A5 BD, 512-byte page)
+    # nandboot NAND-geometry descriptor 0x08006fa0: byte +1 = 512-byte sub-page
+    # transfers per page read. The image ships the large-page default 4; the
+    # 512-byte-page K9F5608 reads 1 (byte +0 = 2 is already correct in the image
+    # and is kept). See nandboot_geom_seed.
+    nandboot_geom_seed=(0x0800_6FA0, bytes([2, 1, 0, 0])),
     boots_to_book=False,
     symbols={
         # HAL / FSLib (names.csv, lab hook points) — reveng PROG addrs + 0x8000

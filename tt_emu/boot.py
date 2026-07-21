@@ -343,6 +343,22 @@ def build_zc3201_machine(
         addr, size = profile.bss_seed
         machine.write_bytes(addr, b"\x00" * size)
 
+    if profile.nandboot_geom_seed is not None:
+        # Seed the nandboot NAND-geometry descriptor's sub-page-transfer count
+        # (byte +1) the skipped chip-detect would have set — otherwise the
+        # bulk-read primitive reads the large-page default (4 × 512 B) into the
+        # 512-byte map-read buffer and overruns the MtdLib manager allocated just
+        # after it (FatLib divide-by-zero — see FirmwareProfile.nandboot_geom_seed).
+        # Written to the nandboot alias (the read literal targets it) and the load
+        # copy, matching NAND_ROW_CYCLES for MT.
+        geom_addr, geom_bytes = profile.nandboot_geom_seed
+        machine.write_bytes(geom_addr, geom_bytes)
+        if profile.nandboot_alias is not None:
+            machine.write_bytes(
+                profile.nandboot_load + (geom_addr - profile.nandboot_alias),
+                geom_bytes,
+            )
+
     if profile.nand_dev_geometry is not None:
         # Seed the MtdLib device-geometry struct the skipped nandboot chip-detect
         # (READ-ID -> flash_ic decode) would have written — the ZC3201 analogue of

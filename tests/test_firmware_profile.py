@@ -46,6 +46,11 @@ def test_profile_load_layout_distinct() -> None:
     assert ZC3201.bss_seed == (0x0800_6FE4, 0x0800_8000 - 0x0800_6FE4)  # crt0 .bss zero
     assert MT.bss_seed is None  # MT enters after crt0
     assert MT.boots_to_book and not ZC3201.boots_to_book
+    # The nandboot NAND-geometry sub-page count seed (skipped chip-detect): ZC3201's
+    # 512-byte-page chip reads 1 sub-page per page; the nandboot image default is 4
+    # (MT's 2-KiB large page). MT has no such seed (its real boot populates it).
+    assert MT.nandboot_geom_seed is None
+    assert ZC3201.nandboot_geom_seed == (0x0800_6FA0, bytes([2, 1, 0, 0]))
     # Per-generation hardware: the L2 NAND-staging SRAM window and the SoC chip-ID.
     assert MT.nand_sram_window == 0x0800_6800 and ZC3201.nand_sram_window == 0x0800_5800
     assert MT.soc_chip_id == 0x3039_3031 and ZC3201.soc_chip_id == 0x3332_3931
@@ -161,3 +166,57 @@ def test_zc3201_boots_through_app_init_to_storage() -> None:
     # nandboot-alias code here) is never written as a staging deposit / clobbered.
     in_prog = {a for a in hot if 0x0800_0000 <= a < 0x0810_0000}
     assert len(in_prog) > 2000, f"expected deep PROG coverage, got {len(in_prog)}"
+
+
+@pytest.mark.skipif(ZC_PATH is None, reason="ZC3201 firmware .upd not available")
+def test_zc3201_fatlib_mount_completes() -> None:
+    """The unmodified ZC3201 firmware boots through the **complete FatLib mount** of
+    both partitions — past the Leg-14 divide-by-zero abort.
+
+    The MtdLib mount (``docs/zc3201-boot-feasibility.md`` Leg 13) reaches ``InitPlane
+    succeed`` on both partitions; FatLib then reads sectors through the MtdLib
+    manager. Before Leg 15 a nandboot bulk page-read (``func_0x080028b0``) used the
+    large-page sub-page count (4) baked into the nandboot image — the skipped
+    chip-detect never corrected it to 1 for the 512-byte-page K9F5608 — so the
+    map-read read 2 KiB into the 512-byte map buffer and overran the just-allocated
+    MtdLib manager, zeroing its ``+0x2c`` pages-per-block divisor → a compiler
+    divide-by-zero guard (``FUN_0800c974``) fired an ARM-state semihosting
+    ``SYS_EXIT``. The ``nandboot_geom_seed`` (byte +1 = 1) fixes it.
+
+    Assert: (1) the map divisor ``FUN_0800c974`` is entered and is **never zero**;
+    (2) the boot proceeds **past** the whole FatLib mount into app_init's post-mount
+    nandboot file lookup (``0x08000868``) — reaching it proves both partitions
+    mounted and FatLib built; (3) no ``SYS_EXIT`` abort stop.
+    """
+    from tt_emu.boot import build_zc3201_machine
+    from tt_emu.loader import load_upd
+    from tt_emu.machine import MachineConfig
+    from unicorn.arm_const import UC_ARM_REG_R0
+
+    fw = load_upd(str(ZC_PATH))
+    machine = build_zc3201_machine(fw, MachineConfig(instructions_per_tick=20_000))
+
+    divisors: list[int] = []
+    reached_lookup = {"v": False}
+
+    def on_div(m: object) -> None:
+        r0 = machine.uc.reg_read(UC_ARM_REG_R0)
+        divisors.append(int.from_bytes(machine.read_bytes(r0 + 0x2C, 4), "little"))
+
+    def on_lookup(m: object) -> None:
+        reached_lookup["v"] = True
+        machine.request_stop("post-mount file lookup reached")
+
+    machine.on_code(0x0800_C974, on_div)   # FUN_0800c974 (global-block → part/block)
+    machine.on_code(0x0800_0868, on_lookup)  # nandboot post-mount file-by-name lookup
+
+    machine.run(250_000_000)
+
+    assert divisors, "FUN_0800c974 (FatLib block translation) never reached"
+    assert 0 not in divisors, "map divisor zeroed — manager overrun (nandboot_geom_seed?)"
+    assert reached_lookup["v"], (
+        "boot did not reach the post-mount file lookup — FatLib mount did not complete"
+    )
+    assert machine.stop_reason is not None and "SYS_EXIT" not in machine.stop_reason, (
+        f"firmware aborted via SYS_EXIT: {machine.stop_reason!r}"
+    )
