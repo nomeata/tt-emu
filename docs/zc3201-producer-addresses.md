@@ -317,7 +317,11 @@ running the updated `scripts/zc3201_producer_probe.py`:
 cmd 5`, the gNand init `0x08002eb4` **no longer prints "init error gNand"** — the
 alloc succeeds against the real geometry. It then builds the FatLib/MtdLib
 **medium** (`0x0800cd78` + `0x08012a88`) and calls a still-**null** method pointer
-→ fetch fault at PC `0x10000`, **caller LR `0x0801271c`** (the nandflash band). Two
+→ fetch fault at PC `0x10000`, **caller LR `0x0801271c`** (the nandflash band). The
+faulting call is `ldr pc,[sb]` at `0x08012718` where `sb = *0x08027090` — the
+**MtdLib allocator-pool object**, still null because the MtdLib init aborts on the
+scrambled placeholder geometry (so both next-steps below reduce to "supply the real
+geometry blob"). Two
 coupled next steps: (1) the EXACT geometry sub-field encoding needs the real host
 `flash_ic.ini` values (the pen's true NAND chip-ID + page/block byte sizes) so the
 medium's method table initialises fully — the placeholder blob here yields a
