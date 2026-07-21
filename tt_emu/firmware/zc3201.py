@@ -29,7 +29,9 @@ if TYPE_CHECKING:
     from ..machine import Machine
 
 __all__ = [
+    "CURRENT_GME_HANDLE",
     "FINGERPRINT",
+    "PC_VOICE_PLAY_SAMPLE",
     "STATE_HANDLERS",
     "Zc3201DebugSnapshot",
     "Zc3201Debugger",
@@ -80,6 +82,20 @@ PC_VOICE_POLL = 0x0800_96A8
 PC_SM_DISPATCH = PC_VOICE_POLL        # back-compat alias (was mislabelled)
 PC_TIMER_TICK = 0x0800_6D38          # HAL software-timer tick (per 20 ms IRQ)
 
+#: The GME play observable (``docs/zc3201-boot-feasibility.md`` "Leg 22"):
+#: ``voice_play_sample`` is entered with ``r1 = media file-offset`` and
+#: ``r2 = media byte-size`` — exactly the ``(offset, size)`` key the game's own
+#: media table stores, so a play resolves to a media index by that key (the same
+#: observable the ``firmware-re`` lab ``zc3201_emu.py`` validates against, and the
+#: twin of MT's ``PC_PLAY_MEDIA``).
+PC_VOICE_PLAY_SAMPLE = 0x0809_F068
+
+#: ``p_filehandle_current_gme``: the file handle of the currently-mounted ``.gme``,
+#: written by ``gme_mount_check_product`` (``0x080297dc``) when a product-OID tap
+#: matches a discovered game. It changes from its book-idle value once a game is
+#: mounted, so a change is the hook-free "a game got mounted" signal (Leg 22).
+CURRENT_GME_HANDLE = 0x080D_20A0
+
 #: OID sensor nandboot HAL (Leg 20). The two-wire bit-bang: clock GPIO7, data /
 #: attention GPIO16, capture-state struct ``0x08007BF8`` (``+1`` = ``bit_count``,
 #: ``0x17`` = 23 on the gameplay decode). ``hal_oid_timer_start`` arms the 40 ms
@@ -95,14 +111,20 @@ OID_CAPTURE_STATE = 0x0800_7BF8
 OID_BIT_COUNT = 0x0800_7BF9
 EVENT_OID_TAP = 0x1063
 
+#: The power-on voice AO leaf reached once the standby SM descends past the GPIO
+#: pin0 wait (docs Leg 18): the **stable book-idle leaf** — entered ~22 M insn into
+#: boot and held from then on, so "the pump has reached this leaf" is the hook-free
+#: "book descent complete / ready for the first tap" signal.
+BOOK_IDLE_LEAF_PC = 0x0809_EDA4
+
 #: The statechart state handlers, by their entry PC (the leaf observable).
 STATE_HANDLERS: dict[int, str] = {
     0x0803_8E48: "init_power_on",     # state_init_power_on (INIT leaf)
     0x0803_EF7C: "standby",           # standby state machine (MT standby_handler twin)
     0x0803_E454: "standby_setrefresh",  # SetRefresh helper in the standby file
-    0x0809_EDA4: "voice_player",      # Fwl_pfVoice_fn — the power-on voice AO leaf
+    BOOK_IDLE_LEAF_PC: "voice_player",  # Fwl_pfVoice_fn — the power-on voice AO leaf
                                       # reached once standby descends past the GPIO
-                                      # pin0 wait (docs Leg 18)
+                                      # pin0 wait (docs Leg 18); the book-idle leaf
 }
 
 #: The QF event vocabulary observed on this build (partial; the shared 0x10xx band

@@ -54,13 +54,16 @@ from typing import Callable, Iterable, Iterator
 from unicorn.arm_const import UC_ARM_REG_R0, UC_ARM_REG_R1, UC_ARM_REG_R2, UC_ARM_REG_R3
 
 from .audio_capture import CHANNELS, FRAME_BYTES, SAMPLE_BYTES, AudioCapture, AudioStats
-from .boot import BootedMachine, build_machine
+from .boot import BootedMachine, build_machine, build_zc3201_machine
 from .firmware import mt as fw_mt
+from .firmware import zc3201 as fw_zc3201
 from .firmware.mt import MtDebugger, Transition
+from .firmware.zc3201 import Zc3201Debugger
 from .firmware.symbols import GmeScripts, TttoolSymbols, derive_media_names, load_tttool_yaml
 from .firmware_fetch import ensure_firmware
 from .loader import load_upd
 from .machine import Machine, MachineConfig
+from .peripherals.oid import OidSensor
 from .runner import (
     AUDIO_CHAIN_ACTIVE,
     AUDIO_FLAGS_ADDR,
@@ -87,6 +90,12 @@ __all__ = [
 #: Emulated milliseconds per statechart tick (``interrupts-and-timers.md``: the
 #: 20 ms timer period is the pacing unit).
 _TICK_MS = 20
+
+#: ZC3201's proven emulation cadence (``tests/test_zc3201_scripting.py`` /
+#: ``docs/zc3201-boot-feasibility.md``): the 1st-gen timer/OID-poll timing is
+#: calibrated at 20k instructions per 20 ms tick, not MT's ~1M session cadence.
+#: Used for ZC3201 when the caller left the pacing at the MT default.
+_ZC3201_INSTRUCTIONS_PER_TICK = 20_000
 
 #: Pen buttons (``gpio-buttons-led.md`` §2/§3): name -> (pin, active level).
 _BUTTONS: dict[str, tuple[int, int]] = {
@@ -246,15 +255,22 @@ class Clip:
 
     @property
     def rate(self) -> int:
-        """The capture sample rate (Hz)."""
-        return self._emu._capture.wav_rate
+        """The capture sample rate (Hz); 0 when no DAC PCM is captured (ZC3201)."""
+        capture = self._emu._capture
+        return capture.wav_rate if capture is not None else 0
 
     @property
     def pcm(self) -> bytes:
-        """The captured S16LE stereo PCM of this playback (may grow as it plays)."""
+        """The captured S16LE stereo PCM of this playback (may grow as it plays).
+
+        Empty on ZC3201, whose DAC PCM decode is not modelled — the clip still
+        carries the played media *identity* (:attr:`media` / :attr:`index`)."""
+        capture = self._emu._capture
+        if capture is None:
+            return b""
         end = self._end_clock
         return b"".join(
-            c.data for c in self._emu._capture.chunks if self._start <= c.clock < end
+            c.data for c in capture.chunks if self._start <= c.clock < end
         )
 
     @property
@@ -293,6 +309,13 @@ class Emulator:
     firmware:
         Path to the ``.upd`` firmware, or ``None`` to auto-download and cache
         the official 2N "MT" image (:func:`tt_emu.firmware_fetch.ensure_firmware`).
+        The 1st-generation **ZC3201** image (``v0136 / 120117``) is recognized
+        too and driven through :func:`tt_emu.boot.build_zc3201_machine` + the
+        :class:`~tt_emu.firmware.zc3201.Zc3201Debugger`, exposing the same
+        surface (:meth:`tap`, :attr:`mounted`, :meth:`wait_for_audio` /
+        :meth:`expect_play`, :attr:`now_playing`). The ZC3201 DAC PCM decode is
+        not modelled, so on that firmware a :class:`Clip` carries the played
+        media *identity* (index / offset+size) but no PCM bytes.
     gme, gmes:
         The ``.gme`` file(s) to place on partition B:. ``gme`` is a single file;
         ``gmes`` an iterable of files. The first game's product code is what
@@ -369,8 +392,15 @@ class Emulator:
         # Set on __enter__:
         self._booted: BootedMachine | None = None
         self.machine: Machine = None  # type: ignore[assignment]
-        self._capture: AudioCapture = None  # type: ignore[assignment]
+        self._capture: AudioCapture | None = None
         self._debugger: MtDebugger | None = None
+        #: ZC3201-only: the 1st-gen debugger + firmware flag + OID sensor + the
+        #: current-gme handle observed at book idle (the mount baseline).
+        self._zc_debugger: Zc3201Debugger | None = None
+        self._is_zc3201 = False
+        self._oid_sensor: OidSensor | None = None  # MT: booted.oid; ZC3201: machine.oid
+        self._zc_mount_baseline: int | None = None
+        self._zc_book_reached = False
         self._audio_events: list[_AudioEvent] = []
         self._transitions: list[Transition] = []
         self._book_tail_at: int | None = None
@@ -389,10 +419,31 @@ class Emulator:
             dac_pacing=self._dac_pacing,
             pacing=self._pacing,
         )
+        # Select the machine build + debugger by firmware. The 1st-gen ZC3201
+        # image gets its own substrate (:func:`build_zc3201_machine`, no MMU) and
+        # the :class:`Zc3201Debugger`; every other image is driven through the MT
+        # recipe (unchanged). Both expose the same scripted surface below.
+        if fw_zc3201.recognize(firmware.prog.data):
+            self._enter_zc3201(firmware, config)
+        else:
+            self._enter_mt(firmware, config)
+
+        # Power-on descent into book mode; ready for the first (product) tap.
+        if not self._run_until(self._ready_for_tap, budget=_BOOT_BUDGET):
+            reason = self._halted or f"still {self.state!r} after the boot budget"
+            raise ScriptingError(f"pen did not reach book mode ({reason})")
+        if self._is_zc3201:
+            # The current-gme handle at book idle — a later change is "mounted".
+            self._zc_mount_baseline = self.machine.read_u32(fw_zc3201.CURRENT_GME_HANDLE)
+        self._entered = True
+        return self
+
+    def _enter_mt(self, firmware, config: MachineConfig) -> None:
         booted = build_machine(firmware, config, b_files=self._b_files or None)
         self._booted = booted
         self.machine = booted.machine
         self._capture = booted.audio.capture
+        self._oid_sensor = booted.oid
 
         if fw_mt.recognize(firmware.prog.data):
             self._debugger = MtDebugger(
@@ -410,12 +461,30 @@ class Emulator:
         machine.on_code(fw_mt.PC_PLAY_MEDIA, self._on_play_media)
         machine.on_code(fw_mt.PC_PLAY_VOICE, self._on_play_voice)
 
-        # Power-on descent into book mode; ready for the first (product) tap.
-        if not self._run_until(self._ready_for_tap, budget=_BOOT_BUDGET):
-            reason = self._halted or f"still {self.state!r} after the boot budget"
-            raise ScriptingError(f"pen did not reach book mode ({reason})")
-        self._entered = True
-        return self
+    def _enter_zc3201(self, firmware, config: MachineConfig) -> None:
+        # ZC3201's timer/OID-poll timing is calibrated at 20k insn/tick; if the
+        # caller left the MT session cadence in place, switch to the proven ZC3201
+        # one (its budgets/timeouts convert through self._ipt).
+        if self._ipt == SESSION_INSTRUCTIONS_PER_TICK:
+            self._ipt = _ZC3201_INSTRUCTIONS_PER_TICK
+            config = MachineConfig(
+                instructions_per_tick=self._ipt,
+                dac_pacing=self._dac_pacing,
+                pacing=self._pacing,
+            )
+        machine = build_zc3201_machine(firmware, config, b_files=self._b_files or None)
+        self._is_zc3201 = True
+        self._booted = None
+        self.machine = machine
+        self._capture = None  # the ZC3201 DAC PCM decode is not modelled (identity only)
+        self._oid_sensor = machine.oid
+        self._zc_debugger = Zc3201Debugger(machine)
+        self._zc_debugger.attach_watches()
+
+        # The GME play observable: voice_play_sample (r1=offset, r2=size) — the
+        # same (offset, size) key the media-table join uses, so the MT media
+        # watch is reused verbatim at the ZC3201 PC.
+        machine.on_code(fw_zc3201.PC_VOICE_PLAY_SAMPLE, self._on_play_media)
 
     def __exit__(self, *exc: object) -> None:
         # Nothing to join (single-threaded); mark the machine stopped so a
@@ -524,6 +593,11 @@ class Emulator:
         Only heuristic for plays that do not come from a ``Play n`` action —
         the primary (offset, size) lookup in :meth:`_on_play_media` is exact.
         """
+        if self._is_zc3201:
+            # The fallback reads MT-specific interpreter RAM; on ZC3201 the exact
+            # (offset, size) media-table lookup is authoritative — an unmatched
+            # play (e.g. the A: power-on chime, not game media) stays unresolved.
+            return None
         playlist = self._read_playlist(machine)
         action = self._last_play_action
         if action is not None:
@@ -579,11 +653,37 @@ class Emulator:
         machine = self.machine
         if machine.clock - self._last_lift < SETTLE_INSTRUCTIONS:
             return False
+        if self._is_zc3201:
+            return self._zc_ready_for_tap()
         if not book_ready_for_tap(machine, self._book_tail_at):
             return False
         if machine.read_u8(AUDIO_FLAGS_ADDR) & AUDIO_CHAIN_ACTIVE:
             return False  # a playback is still in progress -> not a clean boundary
         return machine.read_u16(EVENT_RING_HEAD_ADDR) == machine.read_u16(EVENT_RING_TAIL_ADDR)
+
+    def _zc_ready_for_tap(self) -> bool:
+        """The ZC3201 twin of the readiness gate (settle gap already checked).
+
+        The boot has descended to the stable book-idle leaf (``voice_player`` —
+        entered ~22 M insn in and held), and no OID frame is still armed/held. The
+        ZC3201 event ring is a continuously-cycling timer/event pump (rarely
+        momentarily drained), so — unlike MT — readiness keys on the book leaf, not
+        a ring-quiet condition.
+        """
+        assert self._zc_debugger is not None
+        if not self._zc_book_reached:
+            if any(pc == fw_zc3201.BOOK_IDLE_LEAF_PC for _, pc in self._zc_debugger.leaves):
+                self._zc_book_reached = True
+            else:
+                return False
+        return not (self._oid_sensor is not None and self._oid_sensor.pending)
+
+    def _mount_token(self) -> int:
+        """The RAM word whose change signals "a game got mounted" for this
+        firmware: MT's current-product id, or ZC3201's current-gme file handle."""
+        if self._is_zc3201:
+            return self.machine.read_u32(fw_zc3201.CURRENT_GME_HANDLE)
+        return self.machine.read_u32(CURRENT_PRODUCT_ADDR)
 
     # --- actions -----------------------------------------------------------------------
 
@@ -598,32 +698,42 @@ class Emulator:
         the frame; raises :class:`PenTimeout` if it never does.
         """
         code = self._resolve_oid(oid)
-        booted = self._booted
-        assert booted is not None
+        sensor = self._oid_sensor
+        assert sensor is not None
         if not self._run_until(self._ready_for_tap, budget=_READY_BUDGET):
             raise PenTimeout(f"pen not ready to tap {oid!r} within budget (state={self.state!r})")
 
-        mounted_before = self.machine.read_u32(CURRENT_PRODUCT_ADDR)
+        mounted_before = self._mount_token()
         audio_before = len(self._audio_events)
-        base = booted.oid.gameplay_frames_served
-        booted.oid.hold(code)
+        base = sensor.gameplay_frames_served
+        sensor.hold(code)
         latched = self._run_until(
-            lambda: booted.oid.gameplay_frames_served > base, budget=_LATCH_BUDGET
+            lambda: sensor.gameplay_frames_served > base, budget=_LATCH_BUDGET
         )
-        booted.oid.lift()
+        sensor.lift()
         self._last_lift = self.machine.clock
         if not latched:
             raise PenTimeout(f"tap {oid!r} (OID {code}) was never latched by the firmware")
 
-        # A product-band tap mounts a game: wait for that reaction (the product
-        # id changes, and its welcome playlist begins) so the game is actually
+        # A product-band tap mounts a game: wait for that reaction (the mount
+        # token changes, and its welcome playlist begins) so the game is actually
         # mounted when tap() returns. A content tap deliberately does *not* wait
         # for its playback — it returns before the media starts, so the next
         # wait_for_audio() sees the fresh clip (nand-image-layout.md §7.3 tap 2
         # mounts; tap 3 plays).
-        if code <= fw_mt.PRODUCT_OID_MAX:
+        if code <= fw_mt.PRODUCT_OID_MAX and self._is_zc3201:
+            # ZC3201: wait for the mount AND its welcome *game* media to actually
+            # play (a resolved media-table index — not the A: power-on chime,
+            # which stays unresolved), so a following content tap's
+            # wait_for_audio() sees the content media, not the delayed welcome.
             self._run_until(
-                lambda: self.machine.read_u32(CURRENT_PRODUCT_ADDR) != mounted_before
+                lambda: self._mount_token() != mounted_before
+                and any(e.index is not None for e in self._audio_events[audio_before:]),
+                budget=_LATCH_BUDGET,
+            )
+        elif code <= fw_mt.PRODUCT_OID_MAX:
+            self._run_until(
+                lambda: self._mount_token() != mounted_before
                 or len(self._audio_events) > audio_before,
                 budget=_LATCH_BUDGET,
             )
@@ -714,6 +824,8 @@ class Emulator:
 
     def save_wav(self, path: str | Path) -> AudioStats:
         """Write everything captured off the DAC so far as an S16LE stereo WAV."""
+        if self._capture is None:
+            raise ScriptingError("no DAC PCM captured on this firmware (ZC3201): media identity only")
         return self._capture.write_wav(path)
 
     # --- read-only properties (pure, no side effects) ----------------------------------
@@ -733,13 +845,27 @@ class Emulator:
 
     @property
     def state(self) -> str:
-        """The current statechart leaf name (e.g. ``"book"``)."""
+        """The current statechart leaf name (e.g. ``"book"``).
+
+        On ZC3201 this is the current framework leaf-handler name observed by the
+        :class:`Zc3201Debugger` (its QF statechart is dispatched by handler PC, not
+        the MT frame-byte stack)."""
+        if self._is_zc3201:
+            assert self._zc_debugger is not None
+            pc = self._zc_debugger.leaf_pc
+            return fw_zc3201.state_name(pc) if pc else "(pre-init)"
         chain = self._leaf_chain()
         return self._state_name(chain[-1]) if chain else "(pre-init)"
 
     @property
     def state_chain(self) -> tuple[str, ...]:
-        """The statechart parent chain as names, root -> leaf."""
+        """The statechart parent chain as names, root -> leaf.
+
+        On ZC3201 only the current leaf handler is observed (no frame-byte parent
+        stack), so this is the one-element ``(leaf,)`` (empty pre-init)."""
+        if self._is_zc3201:
+            state = self.state
+            return () if state == "(pre-init)" else (state,)
         return tuple(self._state_name(s) for s in self._leaf_chain())
 
     @property
@@ -759,7 +885,17 @@ class Emulator:
 
     @property
     def mounted(self) -> int | None:
-        """The mounted product id, or None if no game is mounted."""
+        """The mounted product id, or None if no game is mounted.
+
+        On ZC3201 (no current-product-id global) mount is detected by the
+        current-gme file handle changing from its book-idle value
+        (``gme_mount_check_product`` writes it on a product match); when a game is
+        mounted this returns the mounted game's product code."""
+        if self._is_zc3201:
+            handle = self.machine.read_u32(fw_zc3201.CURRENT_GME_HANDLE)
+            if self._zc_mount_baseline is None or handle == self._zc_mount_baseline:
+                return None
+            return self._product_code
         product = self.machine.read_u32(CURRENT_PRODUCT_ADDR)
         return product or None
 

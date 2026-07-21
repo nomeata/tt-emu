@@ -17,9 +17,10 @@ import wave
 from pathlib import Path
 
 import pytest
-from _data import firmware_path, game_dir
+from _data import firmware_path, firmware_path_zc3201, game_dir, gme_zc3201
 
 from tt_emu import Clip, Emulator, ExpectationError
+from tt_emu.firmware.symbols import GmeScripts
 
 UPD_PATH = firmware_path()
 GAME_DIR = game_dir()
@@ -29,10 +30,58 @@ YAML_PATH = GAME_DIR / "taschenrechner.yaml" if GAME_DIR is not None else None
 #: The OID code assigned to the "acht" (eight) script (taschenrechner.codes.yaml).
 ACHT_OID = 4716
 
-pytestmark = pytest.mark.skipif(
-    UPD_PATH is None or GME_PATH is None or YAML_PATH is None,
-    reason="firmware .upd / taschenrechner game not available",
+#: The MT-specific tests (real S16LE PCM byte-compare, live ``$``-register file,
+#: the multi-part number readout) ride the taschenrechner game + its YAML, which
+#: are not shipped; skip them when unavailable. The shared mount+tap+play core
+#: (``test_mount_tap_play_core``) is parametrized over BOTH firmwares instead.
+_MT_UNAVAILABLE = UPD_PATH is None or GME_PATH is None or YAML_PATH is None
+mt_only = pytest.mark.skipif(
+    _MT_UNAVAILABLE, reason="firmware .upd / taschenrechner game not available"
 )
+
+
+def _mt_core_case() -> dict | None:
+    """The MT parametrization of the shared mount+tap+play core, or None."""
+    if _MT_UNAVAILABLE:
+        return None
+    return {
+        "firmware": str(UPD_PATH),
+        "gme": GME_PATH,
+        "yaml": YAML_PATH,
+        "product": 42,          # taschenrechner product-id
+        "content": ACHT_OID,    # the "acht" (eight) digit script
+        "expected": "acht",     # resolved media name (YAML join)
+    }
+
+
+def _zc3201_core_case() -> dict | None:
+    """The ZC3201 parametrization of the shared mount+tap+play core, or None.
+
+    ``example.gme`` (product 42) ships no YAML, so the played media is asserted by
+    its **table index** — the play observable (``voice_play_sample`` offset/size)
+    resolves to the same index the OID's playscript references. Content OID 8065's
+    script is a single ``Play(playlist[0])`` whose media index is derived here, so
+    the test asserts the *right* media plays without hard-coding it."""
+    upd = firmware_path_zc3201()
+    gme = gme_zc3201()
+    if upd is None or gme is None:
+        return None
+    scripts = GmeScripts(gme.read_bytes())
+    content = 8065
+    lines = scripts.script(content)
+    expected_index = lines[0].playlist[0]  # Play(playlist[0]) -> media index
+    return {
+        "firmware": str(upd),
+        "gme": gme,
+        "yaml": None,
+        "product": scripts.product,
+        "content": content,
+        "expected": expected_index,
+    }
+
+
+_MT_CASE = _mt_core_case()
+_ZC3201_CASE = _zc3201_core_case()
 
 
 def _valid_wav(path: Path) -> int:
@@ -44,6 +93,53 @@ def _valid_wav(path: Path) -> int:
         return w.getnframes()
 
 
+@pytest.mark.parametrize(
+    "case",
+    [
+        pytest.param(
+            _MT_CASE,
+            id="mt",
+            marks=pytest.mark.skipif(_MT_CASE is None, reason="MT firmware/game unavailable"),
+        ),
+        pytest.param(
+            _ZC3201_CASE,
+            id="zc3201",
+            marks=pytest.mark.skipif(
+                _ZC3201_CASE is None, reason="ZC3201 firmware/example.gme unavailable"
+            ),
+        ),
+    ],
+)
+def test_mount_tap_play_core(case: dict) -> None:
+    """The shared GME-interpreter behavior on BOTH firmwares: boot → mount a game
+    on a product-OID tap → tap a content OID → the *expected* media plays.
+
+    This is the machine-independent play criterion. It rides only the surface both
+    firmwares expose (``tap`` / ``mounted`` / ``expect_play`` / ``now_playing``),
+    resolving "what plays" through each firmware's own play observable — MT's
+    ``play_media`` and ZC3201's ``voice_play_sample``, both keyed on the media
+    table's ``(offset, size)``. MT additionally asserts real PCM, the live register
+    file, and the multi-part readout in :func:`test_scripting_end_to_end` (below);
+    those are genuinely MT-specific and stay MT-only. On ZC3201 the DAC PCM decode
+    is not modelled, so the play is asserted by media identity (index), not bytes.
+    """
+    with Emulator(firmware=case["firmware"], gme=case["gme"], yaml=case["yaml"]) as pen:
+        # Booted into book mode via the authentic power-on descent; nothing mounted.
+        assert pen.mounted is None
+
+        # Mount the game with the product tap.
+        pen.tap("product")
+        assert pen.mounted == case["product"]
+
+        # Tap a content OID; the shared GME interpreter plays its media.
+        pen.tap(case["content"])
+        clip = pen.expect_play(case["expected"], timeout="30s")
+        assert clip.kind == "media"
+        assert clip.index is not None  # a real media-table entry played
+        assert pen.now_playing == case["expected"]
+
+
+@mt_only
 def test_scripting_end_to_end(tmp_path: Path) -> None:
     session_wav = tmp_path / "session.wav"
     clip_wav = tmp_path / "acht.wav"
@@ -153,6 +249,7 @@ def _second_gme() -> Path | None:
     return local if local.exists() else None
 
 
+@mt_only
 def test_tap_immediately_after_mount_plays(tmp_path: Path) -> None:
     """A content tap taken *immediately* after the mount plays real audio.
 
@@ -164,6 +261,7 @@ def test_tap_immediately_after_mount_plays(tmp_path: Path) -> None:
         assert _raw_tap(pen, ACHT_OID) > 3
 
 
+@mt_only
 def test_tap_after_idle_produces_audio(tmp_path: Path) -> None:
     """After ~2s idle since the mount, a content tap still plays real audio.
 

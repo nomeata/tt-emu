@@ -8,6 +8,12 @@ CPU, NAND, audio, the OID (optical) sensor, buttons, and so on — and runs the 
 `.gme` audio-book files either headless (for scripted testing) or through an interactive
 terminal UI where you "tap" OID codes and hear the audio in real time.
 
+The **1st-generation ZC3201 pen** (`v0136 / 120117`) is supported too: its unmodified
+firmware boots and plays GMEs through the same scripting API (discover the `.gme` → mount
+it on a product-OID tap → play a content OID's media). It is recognized automatically from
+the `.upd` you pass. The ZC3201 DAC PCM decode is not modelled, so on that firmware a
+played clip carries the media *identity* (index / offset+size) rather than PCM bytes.
+
 ![The tt-emu TUI with the firmware-aware debugger open — live statechart, GME interpreter
 registers, and OID→script-line routing with symbolic names joined from a tttool
 YAML.](docs/tui-screenshot.svg)
