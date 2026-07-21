@@ -191,6 +191,18 @@ class WritableNand:
         tags are keyed by the NFC row ``block<<8 | au`` (au = page//2, the 2-page
         4-KiB allocation unit the §4.2 decode addresses); page 0's tag is the
         block's chain-head/metadata tag the mount reads.
+
+        CAVEAT (known-imperfect — see docs/zc3201-boot-feasibility.md "Leg 5"):
+        this conversion is *lossy*. The producer writes a **real** on-NAND layout
+        (e.g. block-0 metadata at PAGES 61/62/63 — bin-info / bin-header / zone
+        table), but tt-emu's :class:`NfcController` decode + tag-keying is tuned
+        to the hand-built :func:`~tt_emu.nand_image.build_nand_image` layout
+        (metadata as flat ``row·0x1000`` offsets), and the ``au = page//2``
+        collapse aliases pages 62↔63 onto the same tag row. Serving a producer
+        image faithfully needs the NfcController to model real **page + 64-B OOB**
+        NAND (so the firmware's own ``MtdLib`` reads drive the addressing), or a
+        replay that inverts the ``MtdLib`` decode. Kept as the honest starting
+        point for the ZC3201 mount bring-up, not a finished conversion.
         """
         img = NandImage()
         for block, d in self.data.items():
