@@ -312,3 +312,41 @@ operands is a garbage pointer (`~0x08440000`) — the FAT layer is comparing a p
   `nand_disk_mount` `0x0803345c`. Then drive the pump → standby → (product-OID tap) → book, serve
   the `.gme`, add a ZC3201 branch of the `firmware.mt` debugger, and parametrise
   `tests/test_scripting.py` over both firmwares.
+
+## Leg 5 — the reusable producer-provisioning seam + the exact mount requirement
+
+The unblock is a valid NAND image; the chosen path is to run the firmware's **own factory
+`producer.bin`** (shipped in the `.upd`, `Firmware.producer`) against a Python NAND model and
+capture the exact `MtdLib`/`FatLib` bytes it writes — guaranteed-correct where a hand-built
+image is guesswork, because the producer and firmware share the `MtdLib` library (the producer's
+`MtdLib59:%d` log == the firmware mount's `mtd_helper59` `0x0802d408`).
+
+* **`tt_emu/nand_provision.py` — the standard, profile-driven, cached provisioning seam.** It
+  loads `producer.bin` under Unicorn, hooks only the producer's libc + OS-vtable NAND leaves (it
+  is a provisioning *tool*, not the firmware under test — the same seam the MT reference image was
+  built with, `firmware-re/tools/ttrun_producer.py`), drives the factory format sequence (cmd 5
+  init → 7 ASA → 9 partition → 0x22 write-maps → 10 mkfs), and returns a `NandImage` the real
+  `NfcController` serves to the **unmodified** firmware. Addresses live in
+  `FirmwareProfile.producer` (`ProducerProfile`) so MT and ZC3201 share one path; results cache on
+  disk keyed by producer+firmware content. **Validated on MT**: the port reproduces `firmware-re`'s
+  reference `producer_nand.img` **byte-for-byte** (448/448 pages) and lays down the ASA + block-0
+  metadata magics. `build_zc3201_machine(fw, provision=True)` uses it. ZC3201's `ProducerProfile`
+  is pending its `producer.bin` RE (`docs/zc3201-producer-addresses.md`).
+
+* **The exact mount requirement (traced this leg).** `fs_storage_mount_init` `0x0802d0e0`:
+  `mtd_helper59` builds the fixed MTD device `0x08007d94` and installs its op vtable —
+  `dev+0x2c` (the map-table read) = **`0x0800c208`** (`FUN_0800c208`), which reads the device's
+  **last page** (`row = *(dev+0x14)·0 + (*(dev+0x14)-1)`) via the NAND read primitive
+  `func_0x080028b0` and returns `1` when the read succeeds; the mount then reads an FS-info header
+  from that buffer (`iVar7 = *(buf+4)` sector count, `uVar1 = *(buf+8)` shift) to size the disk
+  objects. **Empirically (instrumented probe): on a blank NAND `0x0800c208` is never reached** —
+  mount bails *before* the map read, because `dev+0x14`/`dev+0x1c` (geometry) and the alloc
+  `FUN_0802b350(*(dev+0x1c))` depend on the earlier `MtdLib` inits (`mtd_extra_bitmap` `0x0802aa8c`,
+  `mtd_MapTblInit` `0x08035318`) having read **real on-NAND map/zone metadata** (they issue the 32
+  NAND reads observed, all returning `0xFF`). Mount then returns 0, the boot proceeds *unmounted*,
+  and `fs_open` walks a garbage FAT → the nandboot `strcmp` leaf `0x0800320c` faults on an OOB
+  path pointer at `0x0844000c` (`ldrbne` at `0x08003228`). So the fix is unchanged and now precise:
+  a producer-formatted image whose `MtdLib` metadata makes those inits populate the device geometry
+  and whose FAT area carries a real directory. (Note: as on MT, the producer's cmd-10 FAT mkfs may
+  not run without the full FsLib/Medium device-I/O stack; the FAT partitions may need `build_fat16`
+  placed into the producer-formatted MtdLib layout — a hybrid mirroring MT's `build_nand_image`.)

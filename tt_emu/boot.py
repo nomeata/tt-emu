@@ -241,6 +241,7 @@ def build_zc3201_machine(
     *,
     profile: FirmwareProfile = ZC3201,
     nand_image: NandImage | None = None,
+    provision: bool = False,
 ) -> Machine:
     """Assemble a ZC3201 machine and seed it to its real boot-task entry.
 
@@ -294,7 +295,17 @@ def build_zc3201_machine(
     machine.intc = intc
 
     # Storage trio, re-pointed verbatim from MT (same Anyka NFC/ECC/L2 registers).
-    nand = nand_image if nand_image is not None else NandImage()
+    # A blank NAND by default; ``provision`` runs the firmware's own producer.bin
+    # to format an authentic MtdLib/FatLib image the mount can walk (the standard
+    # NAND provisioning path — see :mod:`tt_emu.nand_provision`).
+    if nand_image is not None:
+        nand = nand_image
+    elif provision and profile.producer is not None:
+        from .nand_provision import provision_nand_image
+
+        nand = provision_nand_image(firmware, profile)
+    else:
+        nand = NandImage()
     ecc = EccEngine()
     nfc = NfcController(nand, ecc, sram_window=profile.nand_sram_window)
     machine.add_peripheral(nfc)
