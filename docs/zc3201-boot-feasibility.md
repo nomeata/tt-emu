@@ -350,3 +350,35 @@ image is guesswork, because the producer and firmware share the `MtdLib` library
   and whose FAT area carries a real directory. (Note: as on MT, the producer's cmd-10 FAT mkfs may
   not run without the full FsLib/Medium device-I/O stack; the FAT partitions may need `build_fat16`
   placed into the producer-formatted MtdLib layout — a hybrid mirroring MT's `build_nand_image`.)
+
+### Leg 5 — the ZC3201 producer is architecturally different from MT (RE'd)
+
+`docs/zc3201-producer-addresses.md` is the full ZC3201 `producer.bin` RE. The load-bearing
+finding: **the ZC3201 producer is NOT the MT/OLD structural twin the plan assumed** — it shares
+only the FS/MtdLib/FatLib library lineage; the producer app layer is an older, heavily-stripped
+build (33 strings, BURN 2.3.51, `MtdLib_Base_1.0.8` banner). The MT-shaped
+:class:`ProducerProfile` (two dispatchers + a cmd-ctx global + a flat OS/HAL NAND vtable at
+`+0x20..+0x38` + the 6 metadata magics) **does not fit it**. Concretely (all Proven):
+
+* **One** ring dispatcher `0x08003664` (jump table `0x080036c4`, 29 entries), **no** burn/media
+  split and **no** command-context global — the command is `packet[0..3]` of a 12-byte packet in a
+  ring (write-idx `0x08015610`, read-idx `0x08015614`, base `0x08024fa0`); commands are `1..0x1d`,
+  there is **no cmd 0x22**. Entry `0x08000000`→ main `0x08003430`; USB loop (harness stop)
+  `0x080034a4`; `printf 0x080003dc`, `malloc 0x080004d4`, `free 0x080004e0`; `gb_RAMBuffer`
+  `0x08015710`.
+* **No flat NAND vtable.** NAND read/write/erase are dispatched **indirectly** through the
+  MtdLib/medium object method pointers (`ldr pc,[ip,#0x48]` at `0x080125cc`), so the MT vtable hook
+  seam does not transfer and the exact NAND leaves were **not statically pinnable** — they need
+  **dynamic tracing** (bands: nandmtd `0x0800e078..0x08010848`, nandflash `0x08012670+`).
+* Command→worker edges (Proven): cmd 5 init `0x08002da0`/`0x08002eb4`; cmd 7 **and** cmd 10 →
+  the central **format worker `0x0800849c`** (iterates the full chip from geometry global
+  `0x0801569c`); cmd 9 `0x0800a1bc` (asa config). Only **two** metadata magics exist
+  (`0x11235813` blank, `0x12345678` boot) — the map/bin-info/zone-table scheme is **absent**.
+
+Consequence: the reusable :mod:`tt_emu.nand_provision` seam (validated byte-exact on MT) needs a
+**ZC3201 harness variant** — a ring/single-dispatch driver plus NAND hooks placed at the nandmtd
+/nandflash bands, with the exact leaves recovered by dynamic tracing (a
+`scripts/zc3201_prod_trace.py`-style run: startup → cmd 5 → cmd 7, logging the PCs that touch the
+`0x0404xxxx`/`0x04010000` NAND-DMA MMIO). The current `ProducerProfile` fields are MT-shaped; a
+ZC3201 variant should carry `dispatch`, `ring_*`, `usb_loop`, `format_worker`, and the traced
+NAND-leaf addresses instead of the MT vtable slots.
