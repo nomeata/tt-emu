@@ -460,3 +460,90 @@ to a `WritableNand`, captures the full-chip erase, logs the leaf calling convent
 and reports the (empty) file-records table. It is the ZC3201 ring-dispatch analogue
 of `firmware-re/tools/ttrun_producer.py`; once the file-upload command is reversed it
 becomes the `run_producer_zc3201` seam for `tt_emu.nand_provision`.
+
+---
+
+## 12. Leg 9 — the FULL command map + the write-path model is CORRECTED (Proven)
+
+Leg 8 (§11) hypothesised that seeding the file-records table + driving cmd 7
+`transc_data` would stream file content to NAND via "medium object `0x08027060`
+(write via `[+8]`)". **Both halves of that model are wrong**, proven by running
+`scripts/zc3201_seed_experiment.py` (which seeds the records table AND drives the
+full sequence cmd 2→3→5→4→7→26→6):
+
+### 12.1 The complete 29-command dispatch map (Proven — jump table + worker `bl` + `+++name+++` string owner)
+
+Every command name comes from the `+++<name>+++` string its worker `printf`s;
+each string's literal-pool owner pins it to the worker range. (Corrects §4/§11,
+which had cmd 6/10/11 mislabelled.)
+
+| cmd | worker | name | | cmd | worker | name |
+|---|---|---|---|---|---|---|
+| 1 | 0x080010b0 | `transc_test` | | 13 | 0x08000f08 | `transc_set_infor` |
+| 2 | 0x08001260 | `transc_get_chip_id` | | 14 | 0x08001010 | `transc_reset_usb` |
+| 3 | 0x08001430 | `transc_set_chip_param` | | 16 | 0x08000f8c | `transc_get_fs_addr` |
+| 4 | 0x080015f8 | `transc_erase` | | 19 | 0x08001d70 | `transc_restart` |
+| **5** | 0x08001660 | `transc_format` | | 20 | 0x08001df0 | `transc_get_chip_count` |
+| **6** | 0x08001a38 | **`transc_nandboot`** | | 21 | 0x08001e54 | (asa/param) |
+| **7** | 0x08001aa8 | `transc_data` | | 22 | 0x08002110 | (mtd/config) |
+| 9 | 0x08001ca4 | `transc_compare` | | 24 | 0x080021e0 | `transc_set_infor`(var) |
+| 10 | 0x08001c30 | `transc_update_self` | | 25 | 0x08002174 | `transc_write_config` |
+| **11** | 0x08001b5c | **`transc_mtd`** | | **26** | 0x08002320 | **`download_end_data`** |
+| 12 | 0x080020dc | `transc_write_config` | | 28 | 0x08002428 | `download_end_compare` |
+| | | | | 29 | 0x080023b0 | `download_end_data`(var) |
+
+So the two commands that actually put bytes on NAND are **cmd 6 `transc_nandboot`**
+(PROG.bin → NAND boot area, the BurnTool `PROG.bin→0x0`) and the file-content
+stream (below) — NOT cmd 7.
+
+### 12.2 `transc_data` (cmd 7) only DECLARES a file — it never writes NAND (Proven)
+With the records table seeded (`count@0x0802088c = 1`, one 0x24-byte record whose
+`name[16]@+0x14 = "PROG"`), cmd 7:
+* prints `file:PROG`, `dataLen: 256`, `+++Ack Command: 1+++`, returns `r0=1` (the
+  lookup now SUCCEEDS — the strcmp iterator `0x08007bc8` finds the seeded record);
+* fires the write leaf `0x08005b14` (desc+0x2c) **0 times** and every other static
+  gNand leaf 0 times (histogram unchanged from the 2043 erases). It only calls the
+  library-services vtable (malloc/memset/memcpy/printf).
+
+**`0x08027060` is the library-services vtable, NOT a NAND medium** (Proven — dumped
+after cmd 5): `[+0]=malloc 0x080004d4, [+4]=free 0x080004e0, [+8]=memset 0x08013378,
+[+0xc]=memcpy 0x08013204, [+0x10]=0x08013184, [+0x14]=printf 0x080003dc,
+[+0x18]=0x08005e48, [+0x1c]=0x08005f10`. §11.4's "write via `[0x08027060+8]`" was
+memset. The record layout is confirmed: **0x24 bytes, `name[16]` at `+0x14`**, the
+20 bytes at `+0..+0x13` are FAT bookkeeping (size/cluster) fields.
+
+### 12.3 The real write seam is the USB-bulk STREAMING consumer (Proven)
+Driving cmd 26 `download_end_data` (the assumed "flush") after cmd 7 prints
+`DataLen=256`, **`Lost packet: 0 the length: 256`**, `+++Ack Command: 0+++`, r0=**0**
+(FAIL) and fires 0 write leaves. Its worker `0x08002320` calls `0x08000a74`, which
+merely **resets the packet counters** at `0x080155e8+4/+8` and `0x080155d8` — it is a
+finalize/lost-packet check, not a content flush. cmd 6 `transc_nandboot` likewise
+Ack'd 1 but fired 0 write leaves (no boot data staged).
+
+The content path is a **producer/consumer DMA ring**, not a command:
+* **Receive-setup `0x080009b8`** (called by `transc_data`/`transc_nandboot` with
+  `r0=expected_len, r1=mode`): stores `expected@0x080155e8[0]`, zeroes the received
+  counters `[+4]/[+8]`, `mode@0x080155d8`, and configures the transfer object.
+* **Transfer ring `0x08023b20`** — a ring of **0x1000-byte** buffers with a state
+  word at `[ring+0xc]` (0=free, 2=filled, 3=drained). The USB bulk-OUT endpoint DMA
+  fills a buffer, the consumer (`0x08000928`/`0x08000934`, which `memset`s and
+  advances via `0x08013378`) drains it through the FatLib medium → the gNand **write
+  leaf `0x08005b14`**. `0x080155e8[8]` accumulates the received length; when it
+  reaches `expected`, `download_end_data`'s lost-packet check passes.
+
+**Conclusion / corrected shortcut.** Seeding the file-records table is necessary
+(cmd 7's lookup) but **not sufficient** — no NAND write fires from cmd 4/5/6/7/26.
+To capture a real file write with the hook-free-firmware principle intact (the
+producer is a tool), the next leg must drive the **streaming consumer directly**:
+after cmd 7 declares `{name,len}`, place the file bytes into the `0x08023b20` ring
+buffers, mark each buffer `state=2`, bump `0x080155e8[8]`, and run the consumer
+`0x08000928`/`0x08000934` (or the USB-IRQ path that calls it) until the write leaf
+`0x08005b14` fires — then `download_end_data` (cmd 26) Acks 1. For the boot image,
+drive cmd 6 `transc_nandboot` with PROG.bin staged the same way. `WritableNand`
+already captures leaf writes; the missing piece is the ring-buffer feed, which is
+`scripts/zc3201_seed_experiment.py`'s open end.
+
+`scripts/zc3201_seed_experiment.py` is the Leg-9 probe (seed records + full
+sequence + leaf/vtable histograms). `scripts/zc_dis.py` / `scripts/zc_lit.py` are
+the capstone disassembly helpers (literal-pool resolution) used to pin all of the
+above.

@@ -507,3 +507,43 @@ The success criterion — *all gme-based tests passing on both firmwares* — re
 met**: MT is green (150 passed), ZC3201 has no gme test yet (blocked on mount, which is
 blocked on the producer write above). No product code changed this leg (only the capture
 script + these docs), so MT is unregressed.
+
+### Leg 9 — the producer write-path model is corrected: cmd 7 does not write; the seam is the USB streaming ring
+
+Leg 8's plan (seed the file-records table + drive cmd 4/7 → capture the file write)
+was tested directly with `scripts/zc3201_seed_experiment.py` and the underlying model
+proved **wrong**. Full byte/disasm/live-run detail is in
+`docs/zc3201-producer-addresses.md` §12. Load-bearing corrections (all Proven):
+
+* **Seeding works for the lookup, not the write.** With `count@0x0802088c=1` and one
+  0x24-byte record (`name[16]@+0x14="PROG"`), cmd 7 `transc_data`'s strcmp iterator
+  `0x08007bc8` now finds the record and cmd 7 Acks `r0=1` — but fires the gNand write
+  leaf `0x08005b14` **0 times** (and every static leaf 0×). cmd 7 only *declares* a
+  file; it never puts content on NAND.
+* **`0x08027060` is the library-services vtable** (malloc/free/memset/memcpy/…/printf),
+  **not a NAND medium** — §11.4's "write via `[0x08027060+8]`" was `memset`.
+* **cmd 26 `download_end_data` is a lost-packet finalize, not a flush** (worker
+  `0x08002320`→`0x08000a74` just resets the packet counters); driven after cmd 7 it
+  prints `Lost packet: 0 the length: 256` and Acks **0** (fail), 0 write leaves.
+* **The full 29-command map is now pinned** (§12.1): the two commands that write NAND
+  are **cmd 6 `transc_nandboot`** (PROG.bin→boot area) and the **file-content stream**.
+* **The real write seam is a producer/consumer DMA ring**: receive-setup `0x080009b8`
+  arms `expected@0x080155e8[0]` + the transfer object; the ring `0x08023b20` holds
+  0x1000-byte buffers (state word `[+0xc]`: 0 free / 2 filled / 3 drained) that the USB
+  bulk-OUT DMA fills and the consumer (`0x08000928`/`0x08000934`) drains through the
+  FatLib medium → write leaf `0x08005b14`; `0x080155e8[8]` accumulates received length.
+
+**Leg 9 resume pointer.** The corrected shortcut: seed the file-records table (needed
+for cmd 7's lookup) **and** feed the streaming ring directly. After cmd 7 declares
+`{name,len}`, write the file bytes into the `0x08023b20` ring buffers, mark each
+`state=2`, bump `0x080155e8[8]` to `len`, and run the consumer `0x08000928`/`0x08000934`
+(or the USB-IRQ handler that calls it) until write leaf `0x08005b14` fires; then cmd 26
+Acks 1. For the boot image, drive cmd 6 `transc_nandboot` with PROG.bin staged the same
+way. Capture into `WritableNand` (leaf hooks already in place) and promote to
+`run_producer_zc3201` in `tt_emu.nand_provision`. THEN the downstream chain is unchanged:
+convert with 512 B page + 16 B spare fidelity, serve through `NfcController`
+(`sram_window=0x08005800`, K9F5608 read-ID), mount A:/B: at `fs_storage_mount_init`
+`0x0802d0e0`, drive pump → OID tap → book → GME play, parametrise `tests/test_scripting.py`
+over both firmwares. Probes/helpers this leg: `scripts/zc3201_seed_experiment.py` (open
+end = feed the ring), `scripts/zc_dis.py`, `scripts/zc_lit.py`. MT green (150 passed);
+no product code changed (scripts + docs only).
