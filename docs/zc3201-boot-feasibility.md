@@ -245,7 +245,70 @@ faults (invalid instruction at `0x08006960`). Two coupled next steps:
    pump → standby → (product-OID tap) → book and serve the `.gme` (re-point the MT `OidSensor`),
    and parametrise `tests/test_scripting.py` over both firmwares.
 
-**Address convention going forward:** all ZC3201 runtime addresses are the `tt-firmware-reveng`
-value **+ `0x8000`** until that repo is re-based (loader_base `0x08008000`, names.csv shifted).
-Where this doc cites a bare reveng address for a *code* location, the runtime address is
-`+0x8000`.
+**Address convention going forward:** the `tt-firmware-reveng` ZC3201 DB is now **re-based to
+`0x08008000`** (`names.csv`/`correspondences.tsv`/`firmware.json loader_base` all at the true
+base), so its addresses are **runtime addresses directly**. The `firmware_profile.ZC3201.symbols`
+values were entered as the *old* (`0x08000000`-base) reveng values lifted with `_z()` (+`0x8000`);
+they equal the re-based names.csv runtime addresses, and are the source of truth here.
+
+## Leg 4 — the data-global fix, the NAND-staging SRAM window, and the FS chip-ID gate
+
+Three coupled corrections, each verified against the image, took the from-entry boot from
+"reaches the NFC sequencer then crashes on a blank NAND" to **3224 distinct PROG PCs, deep into
+the FAT directory layer** — clearing every seed/signature wall between clock setup and the point
+where real filesystem *content* is first needed.
+
+1. **Data globals are absolute literals — do NOT `+0x8000` them.** Leg 3's `_z()` lift is correct
+   for *code* pointers (PC-relative code linked at `0x08008000`) but wrong for **data** globals,
+   which are baked as absolute literal words already encoding the final RAM address. Verified by
+   counting 4-aligned literal occurrences in `ZC3201/data/PROG.bin`: `gb_app_context 0x0800779c`
+   (106×; the shifted `0x0800f79c`: 0×), `p_pMeGame_slot 0x081d8854` (2×; shifted 0×),
+   `gme_file_handle_ptr 0x080d20a0` (74×), `chomp_handle_ptr 0x080d28fc` (1×). All four are now
+   unshifted in `firmware_profile.ZC3201.symbols`. (Also fixed a nibble typo in `fs_open/read/seek`
+   — they were `0x080480ec/81c4/81d4`; the re-based `names.csv` gives `0x0800c0ec/c1c4/c1d4`.)
+
+2. **The NAND data-staging SRAM window is `0x08005800`, not the MT `0x08006800`.** The L2 buffer
+   block is fixed hardware SRAM at a *generation-specific* base; MT stages into buffer-4
+   `0x08006800`, but ZC3201's nandboot alias code extends to `~0x08006fe4`, so depositing read
+   data at `0x08006800` clobbered a HAL leaf → fault at `0x08006960`. Disassembling the ZC3201
+   nandboot NAND data-transfer leaf (three functions at `0x08002320/0x08002a00/0x08002cd8`, each
+   pairing the ECC-engine literal with a `memcpy(dst, 0x08005800, 512)`) recovers **buffer-4 =
+   `0x08005800`** (buffer-0 base `0x08005000` + 4·`0x200`, same stride as MT). `NfcController`'s
+   window is now a per-instance parameter (`profile.nand_sram_window`); MT keeps `0x08006800`.
+   This alone advanced the boot ~800 → **2307 PCs**, past the crash, through `fs_storage_mount_init`
+   into `fs_open`.
+
+3. **The FS library version gate reads the SoC chip-ID — ZC3201 answers "1923", not MT's "1090".**
+   With the SRAM window fixed, the mount reached `fw_version_ref` (`0x0802c880`) / its twin
+   `mtd_helper_eb24` (`0x080b6b24`): each copies a library vtable into a fixed descriptor
+   (FAT lib at `0x08007c14`, MtdLib at `0x081d9ad8`), then gates on a **chip signature** — case 4
+   of the switch reads `*0x04000000` (SysCon REG_CHIP_ID) and compares it to `0x33323931` ("1923").
+   tt-emu's `SysCon` returned the MT constant `0x30393031` ("1090"), so the gate **failed and
+   memset the descriptor to zero**, nulling its allocator vtable; a later FAT tagged-malloc
+   (`string_fn_e674` `0x080b6674`, `(**(code**)(desc+0x18))(...)`) then called the null pointer and
+   ran off into the zero page (fault at `0x00010000`). `SysCon.chip_id` is now per-instance
+   (`profile.soc_chip_id`; ZC3201 = `0x33323931`). This is authentic hardware modeling (the real
+   ZC3201 SoC returns "1923" there), not a hook. Boot advanced **2307 → 3224 PCs**;
+   `mtd_extra_bitmap` now runs 45× and `fs_open` 3×.
+
+### Leg 4 resume pointer
+
+The from-entry ZC3201 boot now runs `boot_task_main` → `app_init_main` → clock → **MTD init →
+FAT mount → the FAT directory layer**, with `SysCon(chip_id=0x33323931)`, the storage trio at MT
+addresses, and `NfcController(sram_window=0x08005800)`. Next wall: an out-of-bounds byte read at
+`0x0844000c` (past the 4-MiB RAM top `0x08400000`) from the nandboot **strcmp** leaf
+(`0x0800320c`; the fault is its `ldrbne r3,[r1,r2]` at `0x08003228`). One of the two strcmp
+operands is a garbage pointer (`~0x08440000`) — the FAT layer is comparing a path/filename against
+**uninitialized blank-NAND metadata**. This is the first point that needs real filesystem
+*content*, so the remaining step is unchanged and now unblocked:
+
+* **Build a valid `MtdLib_Base_1_0_10` NAND image** so the mount reads real map-table + FAT +
+  directory data instead of `0xFF`. Trace `fs_storage_mount_init` `0x0802d0e0` → `mtd_helper59`
+  `0x0802d408` (returns the fixed MTD device object; sets its op vtable at +0x28..+0x44) →
+  the map-table read `(*(dev+0x2c))(dev,0,0,num_blocks-1,buf,…)` which expects `==1` for a valid
+  map (blank NAND returns ≠1 → mount silently returns 0 "empty" and the later directory scan walks
+  garbage). ZC3201's MtdLib layout differs from the MT `NFTL_V1_2_11`; cross-check geometry against
+  the MT `NandImage`/`build_nand_image` template and the reveng `mtd_open_maptbl` `0x0802ff50` /
+  `nand_disk_mount` `0x0803345c`. Then drive the pump → standby → (product-OID tap) → book, serve
+  the `.gme`, add a ZC3201 branch of the `firmware.mt` debugger, and parametrise
+  `tests/test_scripting.py` over both firmwares.

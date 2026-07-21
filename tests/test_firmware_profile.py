@@ -46,6 +46,15 @@ def test_profile_load_layout_distinct() -> None:
     assert ZC3201.bss_seed == (0x0800_6FE4, 0x0800_8000 - 0x0800_6FE4)  # crt0 .bss zero
     assert MT.bss_seed is None  # MT enters after crt0
     assert MT.boots_to_book and not ZC3201.boots_to_book
+    # Per-generation hardware: the L2 NAND-staging SRAM window and the SoC chip-ID.
+    assert MT.nand_sram_window == 0x0800_6800 and ZC3201.nand_sram_window == 0x0800_5800
+    assert MT.soc_chip_id == 0x3039_3031 and ZC3201.soc_chip_id == 0x3332_3931
+    # Data globals are absolute literals — unshifted (verified against baked words).
+    assert ZC3201.symbols["gb_app_context"] == 0x0800_779C
+    assert ZC3201.symbols["p_pMeGame_slot"] == 0x081D_8854
+    assert ZC3201.symbols["gme_file_handle_ptr"] == 0x080D_20A0
+    assert ZC3201.symbols["chomp_handle_ptr"] == 0x080D_28FC
+    assert ZC3201.symbols["fs_open"] == 0x0800_C0EC  # re-based names.csv (was a typo)
 
 
 def test_fetch_metadata() -> None:
@@ -97,9 +106,13 @@ def test_zc3201_boots_through_app_init_to_storage() -> None:
     the NAND/NFC command-list sequencer — no demand-paging MMU, no hooks. It must
     clear the HAL IRQ-nesting overflow guard (the low-RAM seed defuses it), reach
     ``mtd_extra_bitmap``, and actually touch the NAND (the freq wall from the
-    wrong base is gone). Reaching book mode needs a valid ZC3201 NAND image +
-    the correct NAND-staging SRAM window (``docs/zc3201-boot-feasibility.md``
-    "Leg 3" resume pointer).
+    wrong base is gone). With the ZC3201 NAND-staging SRAM window (``0x08005800``,
+    not the MT ``0x08006800`` which collides with the nandboot alias) the boot
+    advances *past* the old collision crash, through ``fs_storage_mount_init`` and
+    into ``fs_open`` — where, with a blank NAND, it hits the FAT-Lib heap wall (an
+    uninitialized allocator vtable → null call). Reaching book mode needs a valid
+    ZC3201 MtdLib NAND image (``docs/zc3201-boot-feasibility.md`` "Leg 4" resume
+    pointer).
     """
     from collections import Counter
 
@@ -112,23 +125,31 @@ def test_zc3201_boots_through_app_init_to_storage() -> None:
     fw = load_upd(str(ZC_PATH))
     machine = build_zc3201_machine(fw, MachineConfig(instructions_per_tick=20_000))
     reached: set[str] = set()
-    machine.on_code(ZC3201.symbols["app_init_main"], lambda _m: reached.add("app_init"))
-    machine.on_code(ZC3201.symbols["mtd_extra_bitmap"], lambda _m: reached.add("mtd"))
+    for sym, tag in (
+        ("app_init_main", "app_init"),
+        ("mtd_extra_bitmap", "mtd"),
+        ("fs_storage_mount_init", "mount"),
+        ("fs_open", "fs_open"),
+    ):
+        machine.on_code(ZC3201.symbols[sym], (lambda t: lambda _m: reached.add(t))(tag))
     hot: Counter[int] = Counter()
     machine.uc.hook_add(UC_HOOK_CODE, lambda _uc, a, _s, _u: hot.update((a,)))
 
-    result = machine.run(15_000_000)
+    machine.run(15_000_000)
 
     # Forward progress well past the seed: the boot task called app_init_main and
-    # the firmware reached storage/MTD init.
+    # the firmware reached storage/MTD init, the mount, and file-open.
     assert "app_init" in reached, "app_init_main never entered"
     assert "mtd" in reached, "MTD/storage init (mtd_extra_bitmap) never reached"
+    assert "mount" in reached, "fs_storage_mount_init never reached"
+    assert "fs_open" in reached, "fs_open never reached (past the SRAM-window collision)"
     # The clock wall (wrong-base garbage frequency) is gone and the firmware drove
     # the NFC sequencer: at least one NAND read happened.
     assert machine.nand is not None and machine.nand.reads > 0, "NFC/NAND never engaged"
     # It did NOT wedge on the HAL IRQ-nesting overflow guard (the seed defused it).
     HANG = 0x07FF_DB14
     assert hot.get(HANG, 0) == 0, "hung at irq_mask_push nesting-overflow guard"
-    assert result.pc >> 24 == 0x08 or result.pc >> 20 == 0x07F  # in PROG or HAL, running
+    # The ZC3201 staging window (0x08005800) is used, and the MT window (0x08006800,
+    # nandboot-alias code here) is never written as a staging deposit / clobbered.
     in_prog = {a for a in hot if 0x0800_0000 <= a < 0x0810_0000}
-    assert len(in_prog) > 400, f"expected deep PROG coverage, got {len(in_prog)}"
+    assert len(in_prog) > 2000, f"expected deep PROG coverage, got {len(in_prog)}"

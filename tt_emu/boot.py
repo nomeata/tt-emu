@@ -287,7 +287,7 @@ def build_zc3201_machine(
     machine = Machine(config)
     gpio = GpioBlock()
     intc = IntcTimer(gpio)
-    machine.add_peripheral(SysCon())
+    machine.add_peripheral(SysCon(chip_id=profile.soc_chip_id))
     machine.add_peripheral(intc)
     machine.add_peripheral(gpio)
     machine.add_peripheral(BatteryAdc())
@@ -296,7 +296,7 @@ def build_zc3201_machine(
     # Storage trio, re-pointed verbatim from MT (same Anyka NFC/ECC/L2 registers).
     nand = nand_image if nand_image is not None else NandImage()
     ecc = EccEngine()
-    nfc = NfcController(nand, ecc)
+    nfc = NfcController(nand, ecc, sram_window=profile.nand_sram_window)
     machine.add_peripheral(nfc)
     machine.add_peripheral(ecc)
     machine.add_peripheral(L2NandBuffer(nfc))

@@ -81,6 +81,21 @@ class FirmwareProfile:
     #: Verified no PROG code executes in this window (pure scratch/bss).
     bss_seed: tuple[int, int] | None = None
 
+    #: Fixed hardware address of the L2 NAND data-staging SRAM window (buffer 4).
+    #: The L2 buffer block sits at a generation-specific SRAM base: 2N-MT stages
+    #: into ``0x08006800``; ZC3201 into ``0x08005800`` (recovered from its nandboot
+    #: data-transfer leaf — see :class:`tt_emu.peripherals.nand.NfcController`).
+    #: For ZC3201 the MT window would collide with the nandboot-alias code (which
+    #: extends to ``~0x08006fe4``), clobbering a HAL leaf.
+    nand_sram_window: int = 0x0800_6800
+
+    #: SoC chip-ID constant read at ``0x04000000`` (SysCon REG_CHIP_ID). Per-
+    #: generation: 2N-MT ``0x30393031`` ("1090"), ZC3201 ``0x33323931`` ("1923").
+    #: The firmware's FAT/MtdLib version gate (``fw_version_ref`` 0x0802c880 /
+    #: ``mtd_helper_eb24`` 0x080b6b24) reads this and zeroes its library descriptor
+    #: on mismatch — a wrong value silently corrupts the FS heap during mount.
+    soc_chip_id: int = 0x3039_3031
+
     #: Whether tt-emu can boot this firmware to book mode authentically today.
     #: MT: yes (the whole §5 recipe). ZC3201: not yet — the from-entry boot RE
     #: (seed state, SoC MMIO map, NAND geometry, OID/audio register addresses)
@@ -186,12 +201,14 @@ ZC3201 = FirmwareProfile(
     # from-entry boot reproduces it. (With the correct base PROG no longer clobbers
     # this window, so it is small; the HAL IRQ-nesting depth byte lives here.)
     bss_seed=(0x0800_6FE4, 0x0800_8000 - 0x0800_6FE4),
+    nand_sram_window=0x0800_5800,  # L2 buffer 4 (base 0x08005000 + 4·0x200)
+    soc_chip_id=0x3332_3931,  # "1923" — the ZC3201 SoC chip-ID (FS version gate)
     boots_to_book=False,
     symbols={
         # HAL / FSLib (names.csv, lab hook points) — reveng PROG addrs + 0x8000
-        "fs_open": _z(0x0804_00EC),
-        "fs_read": _z(0x0804_01C4),
-        "fs_seek": _z(0x0804_01D4),
+        "fs_open": _z(0x0800_40EC),  # runtime 0x0800c0ec (names.csv, re-based DB)
+        "fs_read": _z(0x0800_41C4),  # runtime 0x0800c1c4
+        "fs_seek": _z(0x0800_41D4),  # runtime 0x0800c1d4
         "voice_play_sample": _z(0x0809_7068),
         "voice_load_and_play": _z(0x0809_716C),
         "play_chomp_voice": _z(0x0809_7374),
@@ -222,11 +239,16 @@ ZC3201 = FirmwareProfile(
         "gme_parse_media_offsets": _z(0x0804_4D38),
         "gme_exec_command": _z(0x0804_46E4),
         "gme_oid_tap_handler": _z(0x0804_3358),
-        # App-context globals (RAM) — reveng addrs + 0x8000
-        "gb_app_context": _z(0x0800_779C),
-        "p_pMeGame_slot": _z(0x081D_8854),
-        "gme_file_handle_ptr": _z(0x080D_20A0),
-        "chomp_handle_ptr": _z(0x080D_28FC),
+        # App-context globals (RAM) — ABSOLUTE baked literals, NOT shifted. Verified
+        # against the image: each value appears as a 4-aligned literal word in
+        # ZC3201/data/PROG.bin (gb_app_context 106x, p_pMeGame_slot 2x,
+        # gme_file_handle_ptr 74x, chomp_handle_ptr 1x); the +0x8000 candidates
+        # appear 0x. Data literals are absolute and already encode the final RAM
+        # address, so the PROG_BASE_FIX that lifts *code* addresses does not apply.
+        "gb_app_context": 0x0800_779C,
+        "p_pMeGame_slot": 0x081D_8854,
+        "gme_file_handle_ptr": 0x080D_20A0,
+        "chomp_handle_ptr": 0x080D_28FC,
     },
 )
 

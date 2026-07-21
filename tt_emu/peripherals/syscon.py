@@ -23,8 +23,11 @@ REG_CHIP_ID = 0x00
 REG_CLK_DIV = 0x04
 REG_ANALOG_PD = 0x10
 
-#: The chip-ID constant ("1090") the boot gates on (§2).
+#: The 2N-MT chip-ID constant ("1090") the boot gates on (§2).
 CHIP_ID = 0x30393031
+#: The 1st-gen ZC3201 chip-ID ("1923") — its FAT/MtdLib version gate compares the
+#: REG_CHIP_ID read against this and zeroes its FS library descriptor on mismatch.
+CHIP_ID_ZC3201 = 0x33323931
 #: Faithful REG_CLK_DIV seed: M=13, A=1, B=0 -> PLL 232 MHz, sysclk 116 MHz (§3.3).
 CLK_DIV_SEED = 0x0000_004D
 #: Self-clearing latch/busy bits of REG_CLK_DIV. The doc §3.1/§3.3 names bits
@@ -43,8 +46,14 @@ class SysCon(WordRegisterPeripheral):
     name = "syscon"
     base = 0x0400_0000
 
-    def __init__(self) -> None:
+    def __init__(self, chip_id: int = CHIP_ID) -> None:
         super().__init__()
+        #: SoC chip-ID constant read at REG_CHIP_ID. Per-generation: the 2N-MT
+        #: SoC answers ``0x30393031`` ("1090"), the 1st-gen ZC3201 answers
+        #: ``0x33323931`` ("1923"). The firmware's FAT/MtdLib version gate reads
+        #: this register (``0x04000000``) and zeroes its library descriptor when it
+        #: mismatches — so a wrong chip-ID silently corrupts the FS heap.
+        self.chip_id = chip_id
         self.reset()
 
     @property
@@ -72,7 +81,7 @@ class SysCon(WordRegisterPeripheral):
 
     def read_reg(self, offset: int) -> int:
         if offset == REG_CHIP_ID:
-            return CHIP_ID
+            return self.chip_id
         value = super().read_reg(offset)
         if offset == REG_CLK_DIV:
             return value & ~CLK_DIV_SELF_CLEARING

@@ -136,7 +136,12 @@ NAND_READ_ID = 0x9551_D3EC
 #: STATUS byte: bit7 not-write-protected + bit6 ready (§8.4).
 NAND_STATUS_BYTE = 0xC0
 
-#: The 512-byte circular L2 SRAM window, buffer 4 (§7) — plain RAM.
+#: The 512-byte circular L2 SRAM window, buffer 4 (§7) — plain RAM. This is the
+#: default (2N-MT) address; the L2 buffer block sits at a *fixed hardware* SRAM
+#: location that differs per pen generation, so :class:`NfcController` takes it as
+#: a per-instance parameter. ZC3201 stages into ``0x08005800`` (buffer-0 base
+#: ``0x08005000`` + 4·``0x200``), recovered from its nandboot NAND data-transfer
+#: leaf which memcpys 512 bytes from that address paired with the ECC engine.
 SRAM_WINDOW = 0x0800_6800
 SRAM_WINDOW_SIZE = 512
 
@@ -167,10 +172,14 @@ class NfcController(WordRegisterPeripheral):
     name = "nfc"
     base = 0x0404_A000
 
-    def __init__(self, flash: NandImage, ecc: EccEngine) -> None:
+    def __init__(
+        self, flash: NandImage, ecc: EccEngine, sram_window: int = SRAM_WINDOW
+    ) -> None:
         super().__init__()
         self.flash = flash
         self.ecc = ecc
+        #: L2 buffer-4 SRAM staging address (per-generation; see SRAM_WINDOW).
+        self.sram_window = sram_window
         self._datard = [0, 0]
         self._addr: list[int] = []
         self._pending_cmd: int | None = None
@@ -333,7 +342,7 @@ class NfcController(WordRegisterPeripheral):
         # before every 64-byte chunk it copies (§7/§8.1) — 16 polls for the
         # boot loader's 1024-byte records, wrapping the window twice.
         assert self.machine is not None
-        self.machine.write_bytes(SRAM_WINDOW, data[:SRAM_WINDOW_SIZE])
+        self.machine.write_bytes(self.sram_window, data[:SRAM_WINDOW_SIZE])
         self._stream = data if len(data) > SRAM_WINDOW_SIZE else None
         self._stream_polls = 0
         self.l2_level = 8
@@ -374,7 +383,7 @@ class NfcController(WordRegisterPeripheral):
             if remaining > 0:
                 assert self.machine is not None
                 chunk = min(remaining, SRAM_WINDOW_SIZE)
-                self._prog_staged += self.machine.read_bytes(SRAM_WINDOW, chunk)
+                self._prog_staged += self.machine.read_bytes(self.sram_window, chunk)
             return
         if self._stream is None:
             return
@@ -384,7 +393,7 @@ class NfcController(WordRegisterPeripheral):
         if chunk >= SRAM_WINDOW_SIZE // 64:
             assert self.machine is not None
             self.machine.write_bytes(
-                SRAM_WINDOW + (off & (SRAM_WINDOW_SIZE - 1)),
+                self.sram_window + (off & (SRAM_WINDOW_SIZE - 1)),
                 self._stream[off : off + 64],
             )
         if off + 64 >= len(self._stream):
@@ -410,7 +419,7 @@ class NfcController(WordRegisterPeripheral):
         self._prog_staged = bytearray()
         while len(data) < payload:  # un-polled tail (a slab per iteration)
             data += self.machine.read_bytes(
-                SRAM_WINDOW, min(payload - len(data), SRAM_WINDOW_SIZE)
+                self.sram_window, min(payload - len(data), SRAM_WINDOW_SIZE)
             )
         if payload >= SECTOR_SIZE:
             offset = decode_byte_offset(self._row, self._col, self._pend_prog_eccsize)

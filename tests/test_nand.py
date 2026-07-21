@@ -287,6 +287,27 @@ class _Rig:
         self._go()
 
 
+def test_nfc_sram_window_is_per_instance() -> None:
+    # The L2 buffer-4 staging address is fixed hardware SRAM that differs per pen
+    # generation; ZC3201 stages into 0x08005800 (the MT 0x08006800 collides with
+    # its nandboot-alias code). A read must deposit at the configured window.
+    from tt_emu.peripherals.nand import SRAM_WINDOW
+
+    assert NfcController(NandImage(), EccEngine()).sram_window == SRAM_WINDOW
+    img = NandImage()
+    au = bytes((i * 3 + 1) & 0xFF for i in range(AU_SIZE))
+    img.program(36 * BLOCK_SIZE, au)
+    rig = _Rig(img)
+    rig.nfc.sram_window = 0x0800_5800  # ZC3201 window
+    rig.ecc.write(0, 4, (512 << 7) | (2 << 21) | 0xC100012 | 8)
+    rig._stage([0x64, *rig._addr_cycles(0, 36 << 8), 0x18464, 0x201])
+    rig._go()
+    rig.ecc.write(0, 4, (512 << 7) | (2 << 21) | 0xC100012 | 8)
+    rig._stage([((512 + 21 - 1) << 11) | 0x119])
+    rig._go()
+    assert bytes(rig.m.read_bytes(0x0800_5800, 512)) == au[:512]
+
+
 def test_nfc_read_id_and_status() -> None:
     rig = _Rig(NandImage())
     rig._stage([0x48064, 0x62, 0x3859 | 1])  # cmd 0x90, addr 0x00, read 8 -> DATA_RD

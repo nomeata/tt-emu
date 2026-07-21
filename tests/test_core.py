@@ -49,6 +49,17 @@ def test_syscon_chip_id_constant_and_write_ignored() -> None:
     assert s.read_reg(0x00) == CHIP_ID
 
 
+def test_syscon_chip_id_is_per_instance() -> None:
+    # The chip-ID is per-SoC-generation: the firmware's FS version gate reads it
+    # and corrupts its library descriptor on mismatch (ZC3201 answers "1923").
+    from tt_emu.peripherals.syscon import CHIP_ID_ZC3201
+
+    s = SysCon(chip_id=CHIP_ID_ZC3201)
+    assert s.read_reg(0x00) == CHIP_ID_ZC3201 == 0x3332_3931
+    s.write_reg(0x00, 0xDEADBEEF)  # still constant
+    assert s.read_reg(0x00) == CHIP_ID_ZC3201
+
+
 @pytest.mark.parametrize("bit", [12, 13, 14, 21])
 def test_syscon_clk_latch_bits_read_zero(bit: int) -> None:
     s = SysCon()
