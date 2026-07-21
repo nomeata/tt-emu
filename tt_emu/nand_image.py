@@ -202,11 +202,14 @@ class NandImage:
     # --- tags -----------------------------------------------------------------------
 
     def get_tag(self, row: int) -> bytes:
-        """The 8-byte spare tag of ``row`` = ``block<<8 | unit`` (blank = erased)."""
+        """The spare tag of ``row`` (blank = erased). 8 bytes for MT's NFTL tags,
+        up to 16 for ZC3201's small-page OOB — the caller slices what it needs."""
         return self._tags.get(row, BLANK_TAG)
 
     def set_tag(self, row: int, tag: bytes) -> None:
-        self._tags[row] = bytes(tag[:8].ljust(8, b"\xff"))
+        # Keep up to 16 bytes (ZC3201 OOB); pad short tags to 8 (MT's NFTL tag).
+        t = bytes(tag[:16])
+        self._tags[row] = t if len(t) >= 8 else t.ljust(8, b"\xff")
 
     def tag_count(self) -> int:
         return len(self._tags)

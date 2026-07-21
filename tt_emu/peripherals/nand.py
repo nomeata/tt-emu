@@ -26,7 +26,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from ..nand_image import AU_SIZE, NandImage, SECTOR_SIZE
+from ..nand_image import AU_SIZE, BLANK_TAG, NandImage, SECTOR_SIZE
 from ..peripheral import MmioRegion, WordRegisterPeripheral
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle guard
@@ -34,7 +34,14 @@ if TYPE_CHECKING:  # pragma: no cover - import cycle guard
 
 log = logging.getLogger(__name__)
 
-__all__ = ["NfcController", "EccEngine", "L2NandBuffer", "decode_byte_offset", "tag_key"]
+__all__ = [
+    "NfcController",
+    "EccEngine",
+    "L2NandBuffer",
+    "decode_byte_offset",
+    "decode_byte_offset_smallpage",
+    "tag_key",
+]
 
 # --- Address decode (nand-and-nfc-controller.md §4.2) --------------------------------
 
@@ -58,6 +65,24 @@ def decode_byte_offset(row: int, col: int, eccsize: int) -> int:
     au = row & 0xFF
     sub = min(col // eccsize, AU_SECS - 1) if eccsize > 0 and col > 0 else 0
     return (ROW_STRIDE * block + AU_SECS * au + sub) * SECTOR_SIZE
+
+
+def decode_byte_offset_smallpage(row: int, col: int, page_size: int = 512) -> int:
+    """Small-page (ZC3201) decode: the NFC ``row`` **is the absolute page number**.
+
+    ZC3201's Samsung K9F5608 is a 512-byte-page + 16-byte-spare chip (1 column
+    address cycle + 2 row cycles — ``update.upd`` ``flash_ic`` row, and the
+    nandboot read primitive ``0x080028b0``'s ``cmp columnaddrcycle,#1`` branch).
+    The firmware's low-level NAND leaf emits ``abs_page = block·pages_per_block +
+    page`` as the 2-byte row (``docs/zc3201-producer-addresses.md`` §11.3
+    "abs_page = block · [dev+0x14]"), so the flat data-image offset is simply
+    ``abs_page · page_size + col`` — no allocation-unit indirection (contrast the
+    MT large-page decode above). Spare/OOB tags are keyed by the same ``row``
+    (the absolute page). ``col`` addresses within the page (0 for a whole-page
+    read; the sequencer auto-advances the column pointer across the 512-byte
+    page, so a full page moves in one data record).
+    """
+    return row * page_size + (col if 0 < col < page_size else 0)
 
 
 def tag_key(row: int) -> int:
@@ -178,12 +203,23 @@ class NfcController(WordRegisterPeripheral):
         ecc: EccEngine,
         sram_window: int = SRAM_WINDOW,
         read_id: int = NAND_READ_ID,
+        *,
+        small_page: bool = False,
+        page_size: int = 512,
     ) -> None:
         super().__init__()
         self.flash = flash
         self.ecc = ecc
         #: L2 buffer-4 SRAM staging address (per-generation; see SRAM_WINDOW).
         self.sram_window = sram_window
+        #: Small-page (ZC3201 K9F5608) geometry: the NFC ``row`` is the absolute
+        #: page number, the flat offset is ``row·page_size + col``, and the
+        #: address phase carries **1** column cycle (vs MT's 2). ``False`` keeps
+        #: the MT large-page allocation-unit decode byte-for-byte.
+        self.small_page = small_page
+        self.page_size = page_size
+        #: Pages per erase block (ZC3201 K9F5608: 32 → 16 KiB block).
+        self.pages_per_block = 32
         #: READ-ID answer this pen's boot probe expects. Per-generation: 2N-MT
         #: Samsung K9GAG08U0M (``NAND_READ_ID`` 0x9551D3EC, 4-KiB page); ZC3201
         #: Samsung K9F5608 (0xBDA575EC, bytes EC 75 A5 BD, 512-byte page). Driven
@@ -304,7 +340,18 @@ class NfcController(WordRegisterPeripheral):
         elif cmd == _CMD_ERASE_CONFIRM:  # 0xD0: erase (§8.3)
             if self._pending_cmd == _CMD_ERASE_SETUP:
                 self._latch_addr(has_col=False)  # erase emits row cycles only (§5.2)
-                self.flash.erase_block(self._row >> 8)
+                if self.small_page:
+                    # Erase row = block·pages_per_block (page 0), so block = row>>5
+                    # (32 pages/block). Drop the block's 16 KiB of data and its 32
+                    # per-page OOB tags.
+                    block = self._row >> 5
+                    base = block * self.pages_per_block
+                    self.flash.program(base * self.page_size,
+                                       b"\xff" * (self.pages_per_block * self.page_size))
+                    for pg in range(self.pages_per_block):
+                        self.flash.set_tag(tag_key(base + pg), BLANK_TAG)
+                else:
+                    self.flash.erase_block(self._row >> 8)
             self._pending_cmd = None
         elif cmd in _NOOP_CMDS:
             pass
@@ -325,7 +372,39 @@ class NfcController(WordRegisterPeripheral):
 
     # --- data phases (§8.1/§8.2, §10) ----------------------------------------------------
 
+    #: Small-page OOB size carried in the combined 528-byte transfer.
+    SMALLPAGE_OOB = 16
+
     def _data_read(self, nbytes: int) -> None:
+        if self.small_page:
+            return self._data_read_smallpage()
+        return self._data_read_largepage(nbytes)
+
+    def _data_read_smallpage(self) -> None:
+        """ZC3201 combined 512+16 read: one data op moves a whole page + its OOB.
+
+        The K9F5608 read primitive (``nandboot 0x080028b0``) issues a single
+        528-byte transfer — 512 main bytes then 16 OOB bytes — into the staging
+        window; the firmware ``memcpy``s the 512 main bytes to its buffer and
+        reads its NFTL/MtdLib tag from the trailing 16 OOB. So deposit the page
+        data at the window and the row's 16-byte spare tag right after it, and
+        advance the sequential cursor by the 512-byte page stride (not by the
+        528 on-bus byte count). No circular streaming (the 512 fits the window).
+        """
+        assert self.machine is not None
+        offset = decode_byte_offset_smallpage(self._row, self._col, self.page_size)
+        data = self.flash.read(offset + self._bytes_done, self.page_size)
+        oob = (self.flash.get_tag(tag_key(self._row)) + b"\xff" * self.SMALLPAGE_OOB)[
+            : self.SMALLPAGE_OOB
+        ]
+        self._bytes_done += self.page_size
+        self.machine.write_bytes(self.sram_window, data)
+        self.machine.write_bytes(self.sram_window + self.page_size, oob)
+        self._stream = None
+        self._stream_polls = 0
+        self.l2_level = 8
+
+    def _data_read_largepage(self, nbytes: int) -> None:
         """0x119: deposit one record into the SRAM window (§8.1 / §10).
 
         ``payload`` (the bytes that cross the window) comes from the ECC config
@@ -357,6 +436,17 @@ class NfcController(WordRegisterPeripheral):
         self.l2_level = 8
 
     def _data_program(self, nbytes: int) -> None:
+        if self.small_page:
+            # ZC3201 stages a whole 512-byte page + 16 OOB into the window, then
+            # the L2 flush strobe commits it. Mark a page-sized pending program;
+            # :meth:`l2_strobe` reads the 512 main + 16 OOB back from the window.
+            self._pend_prog = self.page_size
+            self._prog_staged = bytearray()
+            self.l2_level = 0
+            return
+        return self._data_program_largepage(nbytes)
+
+    def _data_program_largepage(self, nbytes: int) -> None:
         """0x129: arm a program record.
 
         The CPU stages the record through the circular window in <=512-B
@@ -422,6 +512,15 @@ class NfcController(WordRegisterPeripheral):
         if op != 1 or not self._pend_prog:
             return
         assert self.machine is not None
+        if self.small_page:
+            main = self.machine.read_bytes(self.sram_window, self.page_size)
+            oob = self.machine.read_bytes(self.sram_window + self.page_size, self.SMALLPAGE_OOB)
+            self._pend_prog = 0
+            offset = decode_byte_offset_smallpage(self._row, self._col, self.page_size)
+            self.flash.program(offset + self._bytes_done, bytes(main))
+            self.flash.set_tag(tag_key(self._row), bytes(oob))
+            self._bytes_done += self.page_size
+            return
         payload = self._pend_prog
         self._pend_prog = 0
         data = bytes(self._prog_staged[:payload])

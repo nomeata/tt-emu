@@ -505,3 +505,113 @@ def test_boot_mounts_storage() -> None:
     assert report.nand_erases == 0, report.format_log()     # no bins recycled
     names = {name for _, _, name in report.checkpoints_hit}
     assert any("event-pump" in n for n in names), report.format_log()
+
+
+# --- Small-page (ZC3201 K9F5608) geometry -----------------------------------------------
+
+
+def test_smallpage_decode_is_absolute_page() -> None:
+    """ZC3201 decode: row == absolute page, flat offset == row*512 + col."""
+    from tt_emu.peripherals.nand import decode_byte_offset_smallpage
+
+    # block 3 page 5 -> abs page 3*32+5 = 101 -> offset 101*512
+    assert decode_byte_offset_smallpage(101, 0) == 101 * 512
+    assert decode_byte_offset_smallpage(101, 7) == 101 * 512 + 7
+    # col past the page (a spare-region column) folds to 0 (whole-page read)
+    assert decode_byte_offset_smallpage(101, 512) == 101 * 512
+
+
+def test_smallpage_nfc_reads_page_and_oob_together() -> None:
+    """A small-page 528-byte data op deposits 512 main at the window and the
+    row's 16-byte OOB right after it, keyed by the absolute page."""
+    img = NandImage()
+    row = 101
+    page = bytes((i * 5 + 1) & 0xFF for i in range(512))
+    oob = bytes(range(16))
+    img.program(row * 512, page)
+    img.set_tag(row, oob)
+
+    m = Machine(MachineConfig())
+    ecc = EccEngine()
+    nfc = NfcController(img, ecc, sram_window=0x0800_5800, small_page=True, page_size=512)
+    m.add_peripheral(nfc)
+    m.add_peripheral(ecc)
+    nfc.ecc.config = 516 << 7  # payload 516 = 512 data + 4 parity
+    nfc._row, nfc._col, nfc._bytes_done = row, 0, 0
+    nfc._data_read(528)
+
+    assert bytes(m.read_bytes(0x0800_5800, 512)) == page
+    assert bytes(m.read_bytes(0x0800_5800 + 512, 16)) == oob
+
+
+def test_smallpage_nfc_program_round_trip() -> None:
+    """A small-page program stages 512 main + 16 OOB into the window; the flush
+    strobe commits both (data at row*512, OOB keyed by row)."""
+    img = NandImage()
+    m = Machine(MachineConfig())
+    ecc = EccEngine()
+    nfc = NfcController(img, ecc, sram_window=0x0800_5800, small_page=True, page_size=512)
+    l2 = L2NandBuffer(nfc)
+    for p in (nfc, ecc, l2):
+        m.add_peripheral(p)
+
+    row = 2048  # block 64 page 0 (first mapped page)
+    page = bytes((i ^ 0x5A) & 0xFF for i in range(512))
+    oob = struct.pack("<I", 0x1256_0000) + b"\xff" * 12
+    m.write_bytes(0x0800_5800, page)
+    m.write_bytes(0x0800_5800 + 512, oob)
+    nfc._row, nfc._col, nfc._bytes_done = row, 0, 0
+    nfc._data_program(528)
+    nfc.l2_strobe(1)  # flush/commit
+
+    assert img.read(row * 512, 512) == page
+    assert img.get_tag(row) == oob
+
+
+def test_smallpage_erase_uses_row_shift_5() -> None:
+    """Small-page erase targets block = row>>5 (32 pages/block), dropping its
+    16 KiB of data and its 32 per-page OOB tags."""
+    img = NandImage()
+    block = 100
+    base = block * 32
+    img.program(base * 512, b"\xa5" * (32 * 512))
+    for pg in range(32):
+        img.set_tag(base + pg, b"\x11" * 16)
+
+    ecc = EccEngine()
+    nfc = NfcController(img, ecc, small_page=True, page_size=512)
+    nfc.machine = Machine(MachineConfig())
+    nfc._pending_cmd = 0x60  # ERASE_SETUP
+    # Erase emits row = block*32 as address cycles (LSB first); _latch_addr decodes it.
+    row = block << 5
+    nfc._addr = [row & 0xFF, (row >> 8) & 0xFF]
+    nfc._on_command(0xD0)    # ERASE_CONFIRM
+
+    assert img.read(base * 512, 32 * 512) == b"\xff" * (32 * 512)
+    assert img.get_tag(base) == b"\xff" * 8
+
+
+def test_build_zc3201_nand_image_superblock_and_fat() -> None:
+    """The hand-built ZC3201 image has a valid FS-info superblock (block 0 page
+    31: reserve 64, shift 9, two partitions) and valid FAT16 A:/B: boot sectors
+    with the map-magic OOB tag on the first mapped page."""
+    from tt_emu.nand_image_zc3201 import (
+        MAP_OOB_MAGIC,
+        ZC_PAGE,
+        ZC_PAGES_PER_BLOCK,
+        ZC_RESERVE_BLOCKS,
+        build_zc3201_nand_image,
+    )
+
+    img = build_zc3201_nand_image(None, b_files={"game.gme": b"GME!" * 64})
+    sb = img.read(31 * ZC_PAGE, ZC_PAGE)
+    assert struct.unpack_from("<I", sb, 4)[0] == ZC_RESERVE_BLOCKS  # reserve blocks
+    assert struct.unpack_from("<H", sb, 8)[0] == 9                  # shift (512 = 1<<9)
+    assert sb[0x0A] == 2                                            # partition count
+    assert sb[0x10 + 0x0B] == 0 and sb[0x20 + 0x0B] == 1            # ids A:=0 B:=1
+
+    base = ZC_RESERVE_BLOCKS * ZC_PAGES_PER_BLOCK  # A: logical 0 physical page
+    boot = img.read(base * ZC_PAGE, ZC_PAGE)
+    assert boot[0x1FE:0x200] == b"\x55\xaa"
+    assert boot[0x36:0x3E] == b"FAT16   "
+    assert struct.unpack_from("<I", img.get_tag(base), 0)[0] == (MAP_OOB_MAGIC | 0)

@@ -241,6 +241,8 @@ def build_zc3201_machine(
     *,
     profile: FirmwareProfile = ZC3201,
     nand_image: NandImage | None = None,
+    a_files: dict[str, bytes] | None = None,
+    b_files: dict[str, bytes] | None = None,
     provision: bool = False,
 ) -> Machine:
     """Assemble a ZC3201 machine and seed it to its real boot-task entry.
@@ -304,11 +306,18 @@ def build_zc3201_machine(
         from .nand_provision import provision_nand_image
 
         nand = provision_nand_image(firmware, profile)
+    elif profile.nand_small_page:
+        # Hand-built small-page MtdLib + FAT16 A:/B: image (the ZC3201 twin of
+        # MT's build_nand_image) — the default so fs_storage_mount_init mounts.
+        from .nand_image_zc3201 import build_zc3201_nand_image
+
+        nand = build_zc3201_nand_image(firmware, a_files=a_files, b_files=b_files)
     else:
         nand = NandImage()
     ecc = EccEngine()
     nfc = NfcController(
-        nand, ecc, sram_window=profile.nand_sram_window, read_id=profile.nand_read_id
+        nand, ecc, sram_window=profile.nand_sram_window, read_id=profile.nand_read_id,
+        small_page=profile.nand_small_page, page_size=profile.nand_page_size,
     )
     machine.add_peripheral(nfc)
     machine.add_peripheral(ecc)
@@ -321,6 +330,16 @@ def build_zc3201_machine(
     if profile.bss_seed is not None:
         addr, size = profile.bss_seed
         machine.write_bytes(addr, b"\x00" * size)
+
+    if profile.nand_dev_geometry is not None:
+        # Seed the MtdLib device-geometry struct the skipped nandboot chip-detect
+        # (READ-ID -> flash_ic decode) would have written — the ZC3201 analogue of
+        # MT's §5.6 NAND_GEOMETRY seed. It lives at 0x08007d94, *inside* the
+        # bss_seed window that was just zeroed, so it must be written AFTER. Without
+        # it the mount's dev+0x14/dev+0x1c (page geometry) read 0 and
+        # fs_storage_mount_init bails before the map read (FUN_0800c208).
+        dev_addr, geom = profile.nand_dev_geometry
+        machine.write_bytes(dev_addr, geom)
 
     machine.set_entry_state(profile.prog_entry, SVC_STACK_TOP, CPSR_SVC_IRQS_ON)
     machine.nand = nand

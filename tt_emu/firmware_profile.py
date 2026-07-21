@@ -22,6 +22,7 @@ never silently accepted.
 
 from __future__ import annotations
 
+import struct
 from dataclasses import dataclass, field
 
 __all__ = [
@@ -153,6 +154,13 @@ class FirmwareProfile:
     #: aborts the format (docs/zc3201-producer-addresses.md §10).
     soc_chip_id: int = 0x3039_3031
 
+    #: Small-page NAND geometry (ZC3201 Samsung K9F5608: 512-B page + 16-B OOB,
+    #: 32 pages/block). Selects :class:`NfcController`'s small-page decode (the NFC
+    #: ``row`` is the absolute page, offset = ``row·page_size + col``, one combined
+    #: 512+16 transfer). ``False`` keeps MT's large-page allocation-unit decode.
+    nand_small_page: bool = False
+    nand_page_size: int = 512
+
     #: NAND READ-ID dword the pen's boot probe expects (``NfcController.read_id``).
     #: 2N-MT: Samsung K9GAG08U0M ``0x9551D3EC`` (bytes EC D3 51 95, 4-KiB page).
     #: ZC3201: Samsung K9F5608 ``0xBDA575EC`` (bytes EC 75 A5 BD, 512-byte page) —
@@ -175,6 +183,12 @@ class FirmwareProfile:
     #: ZC3201 from the ``firmware-re`` lab + ``tt-firmware-reveng`` so the future
     #: bring-up has them in one place. Not wired into any hardware model.
     symbols: dict[str, int] = field(default_factory=dict)
+
+    #: ``(addr, bytes)`` of the MtdLib device-geometry struct the skipped nandboot
+    #: chip-detect would have written (the ZC3201 analogue of MT's §5.6
+    #: ``NAND_GEOMETRY`` seed). ``None`` for firmwares whose real boot populates it
+    #: itself. Seeded *after* :attr:`bss_seed` (it lives inside that window).
+    nand_dev_geometry: tuple[int, bytes] | None = None
 
     #: Addresses to drive this generation's ``producer.bin`` to format a NAND
     #: image (:mod:`tt_emu.nand_provision`); ``None`` until reverse-engineered.
@@ -304,6 +318,18 @@ ZC3201 = FirmwareProfile(
     bss_seed=(0x0800_6FE4, 0x0800_8000 - 0x0800_6FE4),
     nand_sram_window=0x0800_5800,  # L2 buffer 4 (base 0x08005000 + 4·0x200)
     soc_chip_id=0x3332_3931,  # "1923" — the ZC3201 SoC chip-ID (FS version gate)
+    nand_small_page=True,     # Samsung K9F5608: 512-B page + 16-B OOB, 32 pages/block
+    nand_page_size=512,
+    # MtdLib device-geometry struct at dev=0x08007d94, decoded from the K9F5608
+    # flash_ic row (update.upd[0x200]) the way the producer's descriptor builder
+    # 0x080056d4 does (docs/zc3201-producer-addresses.md §10): u32 fields
+    # +0=custom(1) +4=flag(0x10000000) +8=chips*planes(2) +0xc=planes(2)
+    # +0x10=planeblocks(1024) +0x14=pages/block(32) +0x18=1 +0x1c=page bytes(512).
+    # dev+8*dev+0x10 = 2048 total blocks; dev+0x14/dev+0x1c drive the mount.
+    nand_dev_geometry=(
+        0x0800_7D94,
+        struct.pack("<8I", 1, 0x1000_0000, 2, 2, 1024, 32, 1, 512),
+    ),
     nand_read_id=0xBDA5_75EC,  # Samsung K9F5608 (bytes EC 75 A5 BD, 512-byte page)
     boots_to_book=False,
     symbols={

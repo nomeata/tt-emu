@@ -547,3 +547,84 @@ convert with 512 B page + 16 B spare fidelity, serve through `NfcController`
 over both firmwares. Probes/helpers this leg: `scripts/zc3201_seed_experiment.py` (open
 end = feed the ring), `scripts/zc_dis.py`, `scripts/zc_lit.py`. MT green (150 passed);
 no product code changed (scripts + docs only).
+
+## Leg 10 — THE PIVOT: hand-build the NAND image; the mount is unblocked into the map-table build
+
+Legs 5-9 chased the factory `producer.bin` to *write* a mountable image; §12 proved that path
+ends in a USB-DMA streaming ring (no static write seam). This leg **pivots**: hand-build the
+ZC3201 NAND image the same way MT's tt-emu feeds its gme tests (`build_nand_image`), driven by
+the firmware's own mount path as the acceptance spec. Two RE sweeps (NFC bus protocol + MtdLib
+mount format) plus instrumented iteration took the mount from "bails before the map read" (the
+4-leg wall) to **deep inside the map-table build**.
+
+### What landed (all MT-unregressed; 150 MT + new small-page tests green)
+
+* **Small-page `NfcController` (`tt_emu/peripherals/nand.py`, profile-driven).** ZC3201's Samsung
+  **K9F5608** is 512-B page + 16-B OOB, 32 pages/block, 2048 blocks (16-KiB erase block, 32 MiB).
+  The NFC framing is byte-identical to MT (cmd `0x00`/`0x30`, 2 col + 2 row cycles), but a read is
+  a **single 528-byte transfer** (512 main + 16 OOB together). Recovered from the nandboot read
+  primitive `0x080028b0` + spare primitive `0x08002bac` + `update.upd[0x200]` `flash_ic`:
+  * `decode_byte_offset_smallpage`: NFC **row = absolute page = 32·block + page**, flat offset =
+    `row·512 + col`, spare/OOB tag keyed by `row`;
+  * `_data_read_smallpage` deposits 512 data at the L2 window + the 16-B OOB right after it
+    (`window+512`); `_data_program`/`l2_strobe` commit both; erase block = **`row>>5`** (not `>>8`).
+  * Selected by `FirmwareProfile.nand_small_page` (+ `nand_page_size`); MT's large-page decode is
+    byte-for-byte untouched. Tests: `tests/test_nand.py::test_smallpage_*`.
+* **Device-geometry seed (the key unblock).** `dev = 0x08007d94` (`DAT_0802d480`) holds the MtdLib
+  geometry the mount reads (`+0x14`=32 pages/block, `+0x1c`=512 page bytes, `+8·+0x10`=2048 blocks,
+  `+0xc`=2 planes, `+0x10`=1024 planeblocks, `+8`=2, `+4`=`0x10000000`, `+0`=1). It is populated by
+  the **skipped nandboot chip-detect** (READ-ID → `flash_ic` decode, the producer's `0x080056d4`
+  twin) — and it sits **inside** the `bss_seed` window that gets zeroed, so it read all-zero and the
+  mount bailed before the map read. `FirmwareProfile.nand_dev_geometry` now seeds it *after*
+  `bss_seed` (the ZC3201 analogue of MT's §5.6 `NAND_GEOMETRY`), in `boot.build_zc3201_machine`.
+* **`tt_emu/nand_image_zc3201.py::build_zc3201_nand_image`** — the small-page MtdLib image: the
+  FS-info **superblock** at block 0 page 31 (`+4`=reserve 64, `+8`=shift 9, `+0xa`=2 partitions,
+  entries id 0=A: id 1=B:), FAT16 A:(SYSTEM)/B:(tiptoi) volumes (`build_fat16`, spc=1), placed
+  identity-mapped in the map region `[reserve,2048)` with per-page OOB tags `0x12560000 | logical`.
+  Wired as the **default** NAND for `build_zc3201_machine(profile.nand_small_page)`.
+
+### Where the mount is now (`scripts/zc3201_mount_probe.py`)
+
+The unmodified firmware runs `boot_task_main → app_init_main → fs_storage_mount_init 0x0802d0e0`:
+`map_read` (`FUN_0800c208`, reads the superblock at block 0 page 31 → **reserve=64 ✓**) →
+`whole_disk_map_build` (`FUN_0802f0c0`) → `map_table_build` (`FUN_0802cbd8`) → **960 spare-tag
+scans** (`FUN_0802edb8`), then **hangs at `0x0802d208`** — the infinite loop taken when
+`FUN_0802cbd8` returns NULL (the map-table build fails).
+
+### Leg 10 resume pointer — the precise remaining wall
+
+`FUN_0802cbd8 → FUN_0802ea54` returns NULL. Instrumentation shows **the readspare wrapper
+`dev+0x34` (`0x08030224`) is never entered** across all 960 `FUN_0802edb8` scans: the classifier
+gates the readspare loop on `dev+0x40` (`FUN_08030108`, the per-block **bad-block bitmap** check),
+which returns *nonzero* (block "bad") for every page — so no OOB tag is ever read and the map stays
+empty. Root cause candidates, in priority order:
+
+1. **Bad-block bitmap index vs geometry.** `FUN_08030108` indexes the 257-byte (2048-bit, per-block)
+   bitmap with `uVar3 = dev+0xc·dev+0x10·block + page = 2048·block + page` — which overflows the
+   bitmap for any block ≥ 1 (and even block 0's bits must read "good"). Either the seeded `dev+0xc`/
+   `dev+0x10` are wrong for this code path, or the bitmap must be **populated** first: on the first
+   call `FUN_08030108` runs `func_0x080006fc(0, bitmap, 2048)` (a nandboot leaf that fills the
+   bad-block bitmap from NAND) then sets its state byte to 2. Trace `func_0x080006fc` — it likely
+   reads each block's factory bad-block marker (spare byte) through the same small-page path and, on
+   the blank/mis-served OOB, marks blocks bad. **Fix so `FUN_08030108` returns 0 (good)** and the
+   readspare runs.
+2. **The OOB "surface" for the spare read.** Once the readspare runs: `func_0x08002bac` reads the
+   4-byte tag from **`window[0]`** *after* a strobe (`0x080030d8` → set **GPIO_OUT0 bit 3** via
+   `0x08006954`) that surfaces the OOB into the window head — but the emulator deposits the OOB at
+   `window+512`. Model the surface: on the GPIO-pin-3 rising edge, copy the last-read 16-B OOB to
+   `window[0]` (a `gpio.watch_output(3, …) → nfc.surface_spare()` hook was prototyped and reverted
+   pending #1; the mechanism is proven). The classifier wants `tag & 0xFFFF0000 == 0x12560000`
+   (low 16 = logical page) for live pages, `0x12345678` for system, `0xFFFFFFFF`→blank.
+3. **Reserve-zone map metadata.** The map scan reads the reserve zone (blocks 0-63); the hand-built
+   image has only the superblock there. It may need the persistent logical→physical **map-table**
+   chain (0x12345678-tagged pages) the producer writes.
+
+**Fastest disambiguation (agent-recommended):** capture ONE producer-formatted image
+(`scripts/zc3201_producer_capture.py`, Legs 8/9 — feed the USB ring per §12) and diff block 0 page
+31 + a data page's OOB + the reserve zone against this spec to pin the exact `dev` field values, the
+OOB byte offset of the `0x1256` tag, and the reserve-zone map format. Then: mount A:/B: → drive
+pump → standby → product/cover-OID tap → book → GME play (re-point `OidSensor`, add a ZC3201
+`firmware.mt`-style debugger), and parametrise `tests/test_scripting.py` over both firmwares.
+
+**Not yet met:** the success criterion (all gme tests on both firmwares) needs the mount to
+complete first. This leg unblocked the 4-leg geometry wall and pinned the exact next failure.

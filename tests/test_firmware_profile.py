@@ -125,24 +125,32 @@ def test_zc3201_boots_through_app_init_to_storage() -> None:
     fw = load_upd(str(ZC_PATH))
     machine = build_zc3201_machine(fw, MachineConfig(instructions_per_tick=20_000))
     reached: set[str] = set()
-    for sym, tag in (
-        ("app_init_main", "app_init"),
-        ("mtd_extra_bitmap", "mtd"),
-        ("fs_storage_mount_init", "mount"),
-        ("fs_open", "fs_open"),
-    ):
-        machine.on_code(ZC3201.symbols[sym], (lambda t: lambda _m: reached.add(t))(tag))
+    milestones = {
+        ZC3201.symbols["app_init_main"]: "app_init",
+        ZC3201.symbols["mtd_extra_bitmap"]: "mtd",
+        ZC3201.symbols["fs_storage_mount_init"]: "mount",
+        0x0800_C208: "map_read",       # FUN_0800c208 — reads the superblock (block 0 pg31)
+        0x0802_F0C0: "map_build",      # whole-disk map object build
+        0x0802_CBD8: "map_table_build",  # map-table (spare-scan) build
+    }
+    for addr, tag in milestones.items():
+        machine.on_code(addr, (lambda t: lambda _m: reached.add(t))(tag))
     hot: Counter[int] = Counter()
     machine.uc.hook_add(UC_HOOK_CODE, lambda _uc, a, _s, _u: hot.update((a,)))
 
-    machine.run(15_000_000)
+    machine.run(20_000_000)
 
     # Forward progress well past the seed: the boot task called app_init_main and
-    # the firmware reached storage/MTD init, the mount, and file-open.
+    # the firmware reached storage/MTD init and the mount, then — with the hand-built
+    # small-page MtdLib image + seeded device geometry — got *into* the map-read and
+    # map-table build (the old blank-NAND path bailed before the map read). The
+    # remaining wall is the reserve-zone map metadata / spare-read OOB fidelity
+    # (docs/zc3201-boot-feasibility.md "Leg 11" resume pointer).
     assert "app_init" in reached, "app_init_main never entered"
     assert "mtd" in reached, "MTD/storage init (mtd_extra_bitmap) never reached"
     assert "mount" in reached, "fs_storage_mount_init never reached"
-    assert "fs_open" in reached, "fs_open never reached (past the SRAM-window collision)"
+    assert "map_read" in reached, "map read (FUN_0800c208) never reached — geometry seed?"
+    assert "map_table_build" in reached, "map-table build never reached"
     # The clock wall (wrong-base garbage frequency) is gone and the firmware drove
     # the NFC sequencer: at least one NAND read happened.
     assert machine.nand is not None and machine.nand.reads > 0, "NFC/NAND never engaged"
