@@ -1268,3 +1268,93 @@ unregressed. Product change this leg: `FirmwareProfile.gpio_in_idle` (+ ZC3201 `
 `Zc3201Debugger`. Tests: `test_zc3201_standby_descends_past_gpio_pin0_wait` + the `gpio_in_idle`
 assertions in `test_profile_load_layout_distinct`. Probes: `scripts/zc3201_init_precond.py`,
 `scripts/zc3201_descend_probe.py`, `scripts/zc3201_audio_mmio.py`.
+
+## Leg 19 — the DAC-completion premise is CORRECTED: the pen reaches book-mode ENTRY; the real wall is the un-wired ZC3201 OID sensor
+
+Leg 18's resume pointer said the pen "blocks in the voice-player AO waiting for the ZC3201
+audio-DAC completion" and framed the next step as modelling the DAC. **Re-measured at HEAD
+(probes `scripts/zc3201_audio_block.py`, `scripts/zc3201_chomp_open.py` + session traces,
+all live-instrumented), this premise is wrong.** The DAC completion is **not** on the
+critical path to book/GME play. Load-bearing findings (all Proven — disasm + live run):
+
+* **`play_chomp_voice(0x13)` is a fire-and-forget power-on chime inside the book/game-mode
+  ENTRY.** Its caller (LR `0x0804c3c0`) is **`FUN_0804c164`** — the book/game entry action
+  (huge state-reset of the app context `iVar11+0x40`, then `play_chomp_voice(0x13)`). Its
+  **tail does NOT wait for the voice**: it sets the app-mode byte `+0x1b = 2`, a ready flag
+  `+0x18 = 1`, arms the **100 ms HAL software timer** `func_0x08006b64(0, 100000, 1,
+  cb=0x080065ec)` (the same periodic driver Leg 17 identified — `cb` posts event `0x30`) and
+  **returns**. So book entry **completes**; the pen runs the event-pump AO-poll idle (parks at
+  `sm_dispatch` `0x080096a8`, returns to the pump `0x0800368c`), with the periodic tick armed.
+
+* **The power-on chime never actually plays — and that is incidental.** `play_chomp_voice`
+  opens `A:/VOIMG/Chomp_Voice.bin` via a **UTF-16 path** built by `FUN_080a4c48` →
+  `FUN_0802675c` → `FUN_080265ec`. That converter takes its **table-conversion branch**
+  because the **codepage-type flag `*0x08007c4c == 1`** (`FUN_08025df4` returns it; the flag is
+  set by the **partial codepage load**, Leg 16's open contradiction), and with the partial
+  codepage table it produces an **empty path** → `fs_open` returns `-1` → **`voice_play_sample`
+  is never entered** (Proven: `voice_play_sample` `0x0809f068` 0 hits; the chomp `fs_open`
+  returns `0xffffffff`). Forcing the simple-widening branch (`*0x08007c4c = 0`) **and** planting
+  a synthetic `A:/VOIMG/Chomp_Voice.bin` makes `voice_play_sample` run to its tail and set the
+  "done" bit — **but book does not "advance", because the pen is already in book entry**; there
+  is nothing to advance *to*. ZC3201's **real** `Chomp_Voice.bin` is **unavailable** (the lab
+  `firmware-re/tools/ttemu/content/A/VOIMG/` is empty; only the *MT* voice image exists), so the
+  authentic chime cannot be reproduced — and since it is fire-and-forget, it **does not need to
+  be** for the GME/OID-tap tests.
+
+* **The "done-flag" `*(DAT_0809ecec+1) & 4` is the AMP-state bit, not a DAC-completion
+  signal.** It is set **synchronously** by `FUN_0809efa4` at `voice_play_sample`'s tail (gated
+  on the amp-on bit0 that `FUN_0809ed54` sets two calls earlier) — it drives GPIO9 (amp) /
+  GPIO8 (mute), not playback progress. The voice-player AO (`Fwl_pfVoice_fn` `0x0809eda4`; its
+  poll method `0x0809eb7c` returns `*(DAT_0809ecec+8)` = the medialib player) only *releases* on
+  the medialib decoder **EOF** — `FUN_080ae5fc` returning the decoder state byte `*(dec+0x30)`
+  nonzero. With no voice playing the player is `0`, the poll returns `0`, and the AO is **idle,
+  not blocking**. So neither the amp bit nor the decoder EOF gates book entry.
+
+* **The DAC MMIO is real but downstream.** After book entry the firmware does program the DAC
+  (`0x04010000` control `0x00520424` ×96, `0x04080000` `|=1`→`=0x13` ×60, status `0x04010010`
+  ×48 reads; completion via the `0x4c`/`0xcc` IRQ latches), currently routed to the
+  `L2NandBuffer` with no audio completion. This only matters **once a voice actually plays**
+  (which needs real ZC3201 voice data we do not have), and is **not** on the path to the
+  OID-tap/GME tests. (So the Leg-18 "model the DAC completion" step is deferred/optional, not
+  the wall.)
+
+### The real wall — the ZC3201 OID sensor is not wired
+
+`build_zc3201_machine` adds **no `OidSensor`** (unlike MT's `build_machine`). The pen sits in
+book-mode idle **polling for input** (`GPIO_IN 0x040000bc` read ~1250×/run in the idle tail).
+The tap event **`0x1060`** — consumed by the standby/book handlers `FUN_0803deac` /
+`FUN_0803b710` and, in the reading state, by **`game_reading_sm_dispatch` `0x0805cbd4`** →
+**`game_play_oid_voice` `0x0805c730`** (correspondences.tsv twin of MT `0x0806a0dc`) →
+`gme_oid_to_playscript` `0x0804d358` — is never posted because nothing drives the sensor. MT's
+`OidSensor` (clock GPIO2 / **data GPIO9**, `bit_count 0x08008c09`) **cannot be reused verbatim**:
+on ZC3201 **GPIO9 is the audio amp** (`FUN_0809efa4`/`FUN_0809f538` bit-bang pin 9), so the OID
+data/attention pin differs. This is a genuine ZC3201 hardware delta needing RE.
+
+### Leg 19 resume pointer — wire the ZC3201 OID sensor → tap → GME play
+
+1. **RE the ZC3201 OID sensor read.** Find the sensor-capture function that reads the physical
+   sensor and posts event `0x1060` (the producer; the consumers `0x0803deac`/`0x0805cbd4` are
+   known). It is GPIO-based (idle polls `GPIO_IN 0x040000bc`); recover its clock/data GPIO pins
+   (≠ MT's GPIO2/GPIO9 — GPIO9 is the amp here), the ZC3201 `bit_count`/capture-state address
+   (MT `0x08008c09` twin), and the frame format. `akoid_*` has **no** ZC3201 twin in
+   correspondences.tsv, so the 1st-gen sensor path is distinct — trace it fresh (start from
+   `game_reading_sm_dispatch 0x0805cbd4` backward, and from the book-idle GPIO_IN poll).
+2. **Model + wire a ZC3201 `OidSensor` variant** (profile-driven pins/`bit_count`) into
+   `build_zc3201_machine`, add `BootedMachine.tap`-style injection.
+3. **Drive:** boot → book idle → `tap(product/cover OID)` → confirm `0x1060` posts →
+   `game_reading_sm_dispatch` → `game_play_oid_voice` / `gme_oid_to_playscript` fire → GME
+   interpreter plays the tapped OID's audio. Capture the play at `voice_play_sample`
+   `0x0809f068` entry (the same observable the lab `zc3201_emu.py` uses — `{handle, off, size}`),
+   which does **not** require the DAC/codec to run. The `.gme` is on `B:/`
+   (`firmware-re/tools/ttemu/content/B/example.gme`).
+4. **Parametrise `tests/test_scripting.py`** (+ other gme-based tests) over both firmwares.
+   (Optional, only if a system voice must actually be heard: solve Leg 16's codepage size-unit
+   contradiction for the full codepage load — which also fixes the chime path — and, if a real
+   ZC3201 voice image is obtained, model the DAC completion per the Leg-18 MMIO map.)
+
+**State now:** the unmodified firmware boots through the complete mount + codepage, descends
+past standby, and **reaches book/game-mode ENTRY (`FUN_0804c164`), which completes and arms the
+100 ms tick** — the pen is in book-mode idle, not blocked on any audio-DAC completion (Leg 18's
+premise is corrected). The un-wired ZC3201 OID sensor is the sole remaining wall to a GME OID-tap
+play. **No product code changed this leg** (analysis + probes only): `scripts/zc3201_audio_block.py`,
+`scripts/zc3201_chomp_open.py`. MT unregressed.
