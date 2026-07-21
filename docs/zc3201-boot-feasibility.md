@@ -803,3 +803,83 @@ read-back surfaces the stale pre-placed OOB sentinel; `MtdLib31 Read:0x12345678`
 `test_build_zc3201_nand_image_map_tags`. Probes: `scripts/zc3201_mtdlog.py` (firmware's own MtdLib
 diagnostics via logf `0x08008a48`), `scripts/zc3201_scan_struct.py`, `scripts/zc3201_oob_offset.py`,
 `scripts/zc3201_scan_trace.py`.
+
+## Leg 13 — the small-page WRITE round-trips, BOTH partitions MtdLib-mount; wall is now a FatLib divide-by-zero (disk-map `+0x2c` = 0)
+
+Two independent fixes cracked the last two storage walls; the mount now clears the entire
+**MtdLib** layer (both partitions `InitPlane succeed`) and dies one layer up, inside **FatLib**.
+All Proven against the firmware's own diagnostics (`scripts/zc3201_mtdlog.py`) + register-level
+probes (scratch `scripts/…` under the session scratchpad).
+
+### Fix 1 — the small-page NAND WRITE round-trip (`NfcController.l2_strobe`, small-page)
+
+`mtd_MapTblInit 0x08035318` writes its paged map table to a free spare and verifies it by
+read-back (`nandmtd_fn 0x080350ac` → `dev+0x2c` readpage). The nandboot write leaf
+`func_0x08002228` (via `dev+0x30` `FUN_080301b8`, and `dev+0x28` `FUN_08030310` which *also*
+writes) streams a page as a **window FIFO**: memcpy the 512 main bytes into the window
+(`0x08005800`), poll the drain (`L2 BUF_STATUS`), then push a **single 4-byte spare word** (the OOB
+map tag, `DAT_080351e0 = 0x12345678`) to the **window head** — the same FIFO port the 512 main just
+drained through — then flush buffer 4. The emulator read `window[0:512]` at flush, so the spare word
+clobbered `main[0:4]` (`MtdLib31 Read:0x12345678 ≠ Wrt:0x10000`) and the OOB (`window[512:528]`) was
+never written. Fix: take the main data from the **poll-captured `_prog_staged`** (captured before the
+spare clobber, exactly like the large-page capture-at-poll) and read the 4-byte OOB tag from the
+window head. `SMALLPAGE_OOB_TAG = 4`. With this the verify passes and `mtd_MapTblInit` returns 1.
+(The pre-placed `0x12345678` free-spare tags are the pool it writes into — no hand-built paged map
+needed, as predicted.)
+
+### Fix 2 — the two-partition physical-block map (`nand_image_zc3201._phys_block`, partition-aware)
+
+With the write fixed, plane 0 built its map but plane 1 scanned every block blank. The plane is a
+pure **even/odd block interleave of one chip** (probed: the readspare `plane` arg is always 0, the GO
+word `0x0800209c` always sets plane bit 10 — `0x40000200 | (1<<(plane+10))` — there is no second
+die/chip-select). The firmware's own scan (`FUN_0802edb8` → readspare `page = 32·blk + 28`) reads,
+per **partition** (`FUN_0802e5e0` param_2, not a hardware plane):
+
+* **partition 0 (A:)**: logical `L` at physical block **`128 + 2·L`** (even, reserve 64 withheld);
+  `hi = 960`, `lo = 951` valid (+9 free spares).
+* **partition 1 (B:)**: logical `L` at physical block **`1 + 2·L`** (odd, *no* reserve);
+  `hi = 1024`, `lo = 1015` valid (+9 free spares).
+
+(`hi`/`lo` read live from `arg2[0x14]`/`[0x16]`.) `_phys_block`/`_lay_map_tags`/`_place_volume` are
+now partition-aware; volumes are clamped to `lo`. Result: **`InitPlane succeed: P=0,V=951` and
+`P=1,V=1015`** — the full MtdLib mount, both partitions, is consistent. A:'s FAT16 boot sector reads
+back correctly at logical 0 (`row 4096`, `eb 3c 90 "TEMU1.0" … 512 B/sector`).
+
+### Leg 14 resume pointer — FatLib disk-map `+0x2c = 0` → divide-by-zero abort
+
+Past the MtdLib mount, `fs_storage_mount_init` builds the FatLib volumes and immediately aborts.
+The abort is the **ARM semihosting SWI** `svc 0x123456` (the ARM-state semihosting number; the
+emulator only special-cases the Thumb `0xAB`, so it logs "ignored" and wrongly falls through — the
+downstream `0x034d034c` deref in the `FUN_080b193c` cleanup is just the fallout of not honouring the
+abort). `FUN_080c9b20` issues it with **R0 = 0x18 = SYS_EXIT** — a fatal abort, *not* a catchable
+throw (it returns cleanly). Origin (Proven): `FUN_0800cec4` (the FatLib disk read) →
+`FUN_0800c974` (global-block → (partition, block) translation) hits a **compiler divide-by-zero
+guard**: it divides by `param_1[0xb]` (**disk-map object `0x80fa420`, offset `0x2c`**) which is
+**0** (also `[0x24] = 0`). So the whole-disk map object's geometry field at `+0x2c` was never
+populated during mount.
+
+**Next steps, precise:**
+1. Find what sets disk-map `+0x2c` (the divisor in `FUN_0800c974`'s block translation) and why it is
+   0 on our image — start at the disk-map constructor `FUN_0802f0c0` and `mtd_helper59 0x0802d408`
+   (installs the dev vtable + `+0x2c` = readpage `0x0800c208`; the *disk-map* `+0x2c` is a different
+   struct — the whole-disk object built over the two partitions). It is almost certainly a
+   superblock-derived geometry (sectors/cluster, or total logical blocks) that our
+   `_superblock_payload` leaves 0. Capture it live: hook `FUN_0800c974 0x0800c974`, dump `param_1`
+   (`0x80fa420`) fields `[0..0x30]`, and back-trace which mount function should store `+0x2c`.
+2. Optionally make the emulator honour ARM-state semihosting `svc 0x123456` (at minimum SYS_EXIT
+   0x18 → stop with a clear "firmware SYS_EXIT/abort" reason instead of "ignored" + fall-through), so
+   future FatLib aborts surface cleanly rather than as a garbage deref. Keep it generation-agnostic
+   (MT never hits it during boot — 158 green).
+3. Then the FAT mount should complete → confirm the firmware opens the test `.gme` on `B:/`, then
+   drive pump → standby → OID tap → book → GME play, mirroring the MT `firmware.mt` debugger path
+   via the FirmwareProfile (correspondences.tsv), and parametrise `tests/test_scripting.py` over both
+   firmwares.
+
+**State now:** the unmodified firmware boots through the **complete MtdLib mount** — both partitions
+`InitPlane succeed` (A: 951 valid, B: 1015 valid, 0 bad), the small-page write round-trips, A:'s FAT16
+boot sector reads back — and dies in **FatLib** at a disk-map divide-by-zero (`disk_map[+0x2c] = 0`,
+surfaced as semihosting `SYS_EXIT`). MT unregressed (158 passed). Product changes this leg:
+`NfcController.l2_strobe` small-page main-from-`_prog_staged` + `SMALLPAGE_OOB_TAG`; partition-aware
+`_phys_block`/`_partition_geom`/`_lay_map_tags`/`_place_volume` + volume clamp in
+`nand_image_zc3201.py`. Tests updated: `test_smallpage_nfc_program_round_trip` (real FIFO protocol),
+`test_build_zc3201_nand_image_map_tags` (both partitions' geometry).

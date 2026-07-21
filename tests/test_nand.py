@@ -569,8 +569,13 @@ def test_smallpage_surface_spare_puts_oob_at_window_head() -> None:
 
 
 def test_smallpage_nfc_program_round_trip() -> None:
-    """A small-page program stages 512 main + 16 OOB into the window; the flush
-    strobe commits both (data at row*512, OOB keyed by row)."""
+    """A small-page program round-trips through the window FIFO exactly as the
+    nandboot write leaf ``func_0x08002228`` drives it: memcpy the 512 main bytes
+    into the window, poll the drain (captures them), then push a single 4-byte
+    spare word to the **window head** (the FIFO port the main just drained
+    through), then flush buffer 4. The commit must take main from the poll-captured
+    slab — reading the window at flush would splice the spare word over main[0:4].
+    """
     img = NandImage()
     m = Machine(MachineConfig())
     ecc = EccEngine()
@@ -581,15 +586,19 @@ def test_smallpage_nfc_program_round_trip() -> None:
 
     row = 2048  # block 64 page 0 (first mapped page)
     page = bytes((i ^ 0x5A) & 0xFF for i in range(512))
-    oob = struct.pack("<I", 0x1256_0000) + b"\xff" * 12
-    m.write_bytes(0x0800_5800, page)
-    m.write_bytes(0x0800_5800 + 512, oob)
+    spare = 0x1234_5678
     nfc._row, nfc._col, nfc._bytes_done = row, 0, 0
-    nfc._data_program(528)
-    nfc.l2_strobe(1)  # flush/commit
+    nfc._data_program(528)                     # arm the page program
+    m.write_bytes(0x0800_5800, page)           # CPU memcpys the 512 main bytes
+    nfc.on_level_poll()                         # drain poll captures them
+    m.write_u32(0x0800_5800, spare)            # then the spare word clobbers window[0]
+    nfc.l2_strobe(1)                            # flush/commit
 
+    # Main data survives (the clobbered window[0:4] does not reach the flash);
+    # the OOB tag is the 4-byte spare word (get_tag pads the 4 bytes to 8 with 0xFF).
     assert img.read(row * 512, 512) == page
-    assert img.get_tag(row) == oob
+    assert struct.unpack_from("<I", img.get_tag(row), 0)[0] == spare
+    assert img.get_tag(row) == struct.pack("<I", spare) + b"\xff" * 4
 
 
 def test_smallpage_erase_uses_row_shift_5() -> None:
@@ -654,29 +663,30 @@ def test_build_zc3201_nand_image_map_tags() -> None:
     ``0x12560000 | logical`` for live blocks, ``0x12345678`` for the free spares.
 
     Verified against the firmware's own MtdLib scan (``FUN_0802edb8``): with this
-    layout the map-table build's scan is fully consistent (fe2c=1, 951 valid, 9
-    free spares) — the readspare storm collapses from 50144 to 960 reads.
-    (docs/zc3201-boot-feasibility.md Leg 12.)
+    layout both partitions' map-table builds are fully consistent — partition 0
+    (A:, even blocks from 128): 960 usable, 951 valid, 9 free; partition 1 (B:,
+    odd blocks from 1): 1024 usable, 1015 valid, 9 free (``InitPlane succeed``).
+    (docs/zc3201-boot-feasibility.md Leg 13.)
     """
     from tt_emu.nand_image_zc3201 import (
         MAP_FREE_SENTINEL,
         MAP_OOB_MAGIC,
         MAP_TAG_PAGE,
-        ZC_BLOCKS_PER_PLANE,
         ZC_PAGES_PER_BLOCK,
-        ZC_RESERVE_BLOCKS,
-        ZC_SPARE_BLOCKS,
+        _partition_geom,
         _phys_block,
         build_zc3201_nand_image,
     )
 
     img = build_zc3201_nand_image(None)
-    hi = ZC_BLOCKS_PER_PLANE - ZC_RESERVE_BLOCKS   # 960 usable / plane
-    lo = hi - ZC_SPARE_BLOCKS                       # 951 valid logical
-    for plane in (0, 1):
-        def tag_of(logical: int) -> int:
-            row = _phys_block(logical, plane) * ZC_PAGES_PER_BLOCK + MAP_TAG_PAGE
+    for partition in (0, 1):
+        hi, lo = _partition_geom(partition)
+        assert (hi, lo) == ((960, 951) if partition == 0 else (1024, 1015))
+
+        def tag_of(logical: int, _p: int = partition) -> int:
+            row = _phys_block(logical, _p) * ZC_PAGES_PER_BLOCK + MAP_TAG_PAGE
             return struct.unpack_from("<I", img.get_tag(row), 0)[0]
+
         assert tag_of(0) == (MAP_OOB_MAGIC | 0)
         assert tag_of(lo - 1) == (MAP_OOB_MAGIC | (lo - 1))
         assert tag_of(lo) == MAP_FREE_SENTINEL       # first spare

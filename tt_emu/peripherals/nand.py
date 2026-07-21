@@ -381,6 +381,11 @@ class NfcController(WordRegisterPeripheral):
 
     #: Small-page OOB size carried in the combined 528-byte transfer.
     SMALLPAGE_OOB = 16
+    #: Bytes of OOB the small-page **program** leaf actually writes: a single
+    #: 4-byte spare word (the MtdLib map tag) pushed to the window head after the
+    #: 512 main bytes drain (nandboot write leaf ``func_0x08002228``); the rest of
+    #: the 16-byte OOB stays erased (``0xFF``).
+    SMALLPAGE_OOB_TAG = 4
 
     def _data_read(self, nbytes: int) -> None:
         if self.small_page:
@@ -535,11 +540,25 @@ class NfcController(WordRegisterPeripheral):
             return
         assert self.machine is not None
         if self.small_page:
-            main = self.machine.read_bytes(self.sram_window, self.page_size)
-            oob = self.machine.read_bytes(self.sram_window + self.page_size, self.SMALLPAGE_OOB)
+            # ZC3201 small-page program (nandboot write leaf ``func_0x08002228``):
+            # the CPU memcpys the 512 main bytes into the window, polls the drain
+            # (``on_level_poll`` captures them into ``_prog_staged``), then pushes a
+            # single 4-byte **spare word** (the OOB map tag) to the **window head**
+            # ``[window]`` — the FIFO port the 512 main just drained through — and
+            # only then flushes buffer 4. So the main data must come from the
+            # poll-captured ``_prog_staged`` (the window head now holds the spare,
+            # not main[0:4]); the OOB tag is the 4-byte word sitting at the window
+            # head. (Reading the window for main here would splice the spare word
+            # over main[0:4] — the ``MtdLib31 Read≠Wrt`` verify failure.)
+            main = bytes(self._prog_staged[: self.page_size])
+            while len(main) < self.page_size:  # any un-polled tail still in the window
+                main += self.machine.read_bytes(self.sram_window + len(main),
+                                                self.page_size - len(main))
+            oob = self.machine.read_bytes(self.sram_window, self.SMALLPAGE_OOB_TAG)
             self._pend_prog = 0
+            self._prog_staged = bytearray()
             offset = decode_byte_offset_smallpage(self._row, self._col, self.page_size)
-            self.flash.program(offset + self._bytes_done, bytes(main))
+            self.flash.program(offset + self._bytes_done, main)
             self.flash.set_tag(tag_key(self._row), bytes(oob))
             self._bytes_done += self.page_size
             return
