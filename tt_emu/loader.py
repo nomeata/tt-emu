@@ -32,21 +32,25 @@ import struct
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .firmware_profile import MT, FirmwareProfile, detect as detect_profile
+
 #: Container magic (``memory-map-and-boot.md`` §3).
 UPD_MAGIC = b"ANYKA106"
 #: Expected header size in bytes.
 UPD_HEADER_SIZE = 0xA4
 #: Codepage size; not present in the container header (see module docstring).
-CODEPAGE_SIZE = 0xD6CCC
+#: The same for both supported builds — used as a fallback when the profile is
+#: unrecognized (:data:`FirmwareProfile.codepage_size` is the authority).
+CODEPAGE_SIZE = MT.codepage_size
 
-#: PROG load address (``memory-map-and-boot.md`` §2/§5.1).
-PROG_LOAD_ADDR = 0x08009000
-#: Resident boot-blob load address (also the vector table base).
-NANDBOOT_LOAD_ADDR = 0x08000000
-#: The HAL alias: the same nandboot bytes mapped a second time (§2 note).
-NANDBOOT_ALIAS_ADDR = 0x07FF8000
-#: PROG entry point (§5.2).
-PROG_ENTRY = 0x08039100
+#: The MT load layout, re-exported for the modules that hard-target the 2N-MT
+#: boot recipe (:mod:`tt_emu.boot`, :mod:`tt_emu.mmu_boot`). A firmware's own
+#: layout is on its :attr:`Firmware.profile`; these stay the MT defaults.
+assert MT.nandboot_alias is not None  # the MT layout always has the HAL alias
+PROG_LOAD_ADDR: int = MT.prog_load  #: PROG load address (``memory-map-and-boot.md`` §2/§5.1).
+NANDBOOT_LOAD_ADDR: int = MT.nandboot_load  #: resident boot-blob load address (vector base).
+NANDBOOT_ALIAS_ADDR: int = MT.nandboot_alias  #: the HAL alias (§2 note).
+PROG_ENTRY: int = MT.prog_entry  #: PROG entry point (§5.2).
 
 
 @dataclass(frozen=True)
@@ -85,6 +89,16 @@ class Firmware:
     def boot_generation(self) -> str:
         """The nandboot generation magic at blob offset +0x20 (e.g. ``ANYKANB1``)."""
         return self.nandboot.data[0x20:0x28].decode("ascii", "replace")
+
+    @property
+    def profile(self) -> FirmwareProfile | None:
+        """The recognized firmware target (MT / ZC3201), or ``None`` if unknown.
+
+        Detected from the PROG build fingerprint + the nandboot generation magic
+        (:func:`tt_emu.firmware_profile.detect`). Carries the load layout,
+        download metadata, and reference addresses for this build.
+        """
+        return detect_profile(self.prog.data, self.boot_generation)
 
 
 class UpdFormatError(ValueError):
@@ -189,8 +203,13 @@ def load_upd(path: str | Path | None = None) -> Firmware:
     producer = artifact("producer", _u32(raw, 0x18), _u32(raw, 0x1C))
     nandboot = artifact("nandboot", _u32(raw, 0x20), _u32(raw, 0x24))
     prog = artifact("PROG", _u32(raw, 0x48), _u32(raw, 0x4C))
-    # Codepage: directly after PROG; size is a documented constant (module docstring).
-    codepage = artifact("codepage", prog.offset + prog.size, CODEPAGE_SIZE)
+    # Codepage: directly after PROG; size is not in the header (module docstring),
+    # so it comes from the recognized firmware profile (both builds: 0xD6CCC),
+    # falling back to the constant for an unrecognized image.
+    generation = nandboot.data[0x20:0x28].decode("ascii", "replace")
+    profile = detect_profile(prog.data, generation)
+    codepage_size = profile.codepage_size if profile is not None else CODEPAGE_SIZE
+    codepage = artifact("codepage", prog.offset + prog.size, codepage_size)
 
     fw = Firmware(
         path=path,

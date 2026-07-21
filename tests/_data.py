@@ -20,6 +20,8 @@ from pathlib import Path
 #: Legacy local paths on the original author's machine.
 _LEGACY_FIRMWARE = Path("/home/jojo/tiptoi/update3202MT.upd")
 _LEGACY_GAME_DIR = Path("/home/jojo/tiptoi/tiptoi-taschenrechner")
+#: Legacy local path to the 1st-gen ZC3201 firmware container.
+_LEGACY_FIRMWARE_ZC3201 = Path("/home/jojo/tiptoi/update.upd")
 
 
 def firmware_path() -> Path | None:
@@ -43,6 +45,29 @@ def firmware_path() -> Path | None:
 
         try:
             return Path(ensure_firmware(None))
+        except Exception:
+            return None
+    return None
+
+
+def firmware_path_zc3201() -> Path | None:
+    """Resolve the 1st-gen ZC3201 firmware ``.upd``, or ``None`` if unavailable.
+
+    ``$TT_EMU_FIRMWARE_ZC3201`` if set (verbatim), else the legacy local path if
+    it exists, else a fresh SHA-verified download via :func:`ensure_firmware`
+    (ZC3201 profile) — **only** when ``$TT_EMU_DOWNLOAD_FIRMWARE`` is set.
+    """
+    env = os.environ.get("TT_EMU_FIRMWARE_ZC3201")
+    if env:
+        return Path(env)
+    if _LEGACY_FIRMWARE_ZC3201.exists():
+        return _LEGACY_FIRMWARE_ZC3201
+    if os.environ.get("TT_EMU_DOWNLOAD_FIRMWARE"):
+        from tt_emu.firmware_fetch import ensure_firmware
+        from tt_emu.firmware_profile import ZC3201
+
+        try:
+            return Path(ensure_firmware(None, profile=ZC3201))
         except Exception:
             return None
     return None

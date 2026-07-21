@@ -70,10 +70,93 @@ The pieces, in dependency order:
    targets. Tests for MT-only features (recording, audio player) stay MT-only, marked with a
    reason.
 
-## Status
+## What the lab reference does and does **not** give us (key correction)
 
-Not yet a working boot: this branch adds the probe and this plan, and confirms the loader
-already handles ZC3201 and that no MMU is required. The success criterion — *all gme-based
-tests passing on both firmwares* — depends on steps 2–5 above, which is a focused bring-up
-effort rather than a quick change. The `firmware-re` ZC3201 analysis and the lab hook-harness
-are the reference for the seed state and peripheral addresses.
+The `firmware-re` lab's ZC3201 support (`tools/ttemu/zc3201_emu.py`, `gme_engine_zc3201.py`,
+`gme_test.py`, 15/15 on both firmwares) is **not a boot-from-reset model**. It is a
+**direct-call + VFS-hook harness**: it loads the images flat, stubs *every* MMIO register to
+`0`, hooks `fs_open`/`fs_read`/`fs_seek` (fixed handle 1 over one host file) and the two
+voice-play functions, then **calls identified firmware functions directly** with pre-seeded
+globals. It never runs the mask ROM, never runs the event pump, never models NAND / IRQ /
+timer / OID sensor / audio DMA. `FINDINGS.md` is explicit that ZC3201 boot-from-reset has the
+**same** mask-ROM + runtime-registered-dispatch-table dependency as the 2N and is *"not
+easier."*
+
+So the reference is an excellent **behavioural spec** for the parts it exercises — and it
+hands us, byte-exact, the addresses tt-emu will eventually need for those parts (recorded on
+`FirmwareProfile.symbols` for ZC3201):
+
+* the **GME-interpreter twins** (`gme_parse_header` `0x0804572c`, `gme_oid_to_playscript`
+  `0x08045358`, `gme_parse_actions` `0x08044ec8`, `gme_exec_command` `0x080446e4`, …) — the
+  shared scripted-GME engine, the same interpreter the 2N runs;
+* the **HAL entry points** (`fs_open` `0x080040ec`, `fs_read` `0x080041c4`, `fs_seek`
+  `0x080041d4`, `voice_play_sample` `0x08097068`, `voice_load_and_play` `0x0809716c`,
+  `play_chomp_voice` `0x08097374`, `game_play_oid_voice` `0x08054730`);
+* the **app-context globals** (`gb_app_context` `0x0800779c`, `p_pMeGame_slot` `0x081d8854`,
+  the gme file-handle pointer `0x080d20a0`, chomp handle `0x080d28fc`);
+* statechart landmarks by name only (`state_init_power_on` `0x08030e48`, `state_stdb_standby`
+  `0x08036454`, `akoid_open_check` `0x080219a0`, `event_post` `0x08001544`).
+
+What it does **not** give us — and what an authentic tt-emu boot needs — has no reference yet:
+
+* the **pre-init boot entry** MT uses (`app_init_main`-equivalent) and the exact **seed state**
+  the mask ROM / early boot would leave (the ZC3201 QHsm frame base, the AO descriptor-table
+  registration, the NAND geometry struct location, driver-state bytes);
+* the **SoC MMIO register map** for this pen (SysCon/clock, IntC/timer, GPIO, battery ADC) —
+  the lab stubs all of it to `0`, so none of the concrete addresses/semantics exist;
+* the **NAND/NFC controller** registers + geometry (the lab serves a VFS, never NAND);
+* the **OID sensor** capture-state address (the MT `bit_count` `0x08008c09` equivalent) and the
+  GPIO pin wiring; the **audio DAC/DMA** registers.
+
+## Status (this branch)
+
+Landed as reusable, MT-unregressed infrastructure — the dependency-ordered plan's **step 1**,
+plus the fetch and the substrate:
+
+* **Firmware-target abstraction** — `tt_emu/firmware_profile.py`: a `FirmwareProfile` selects
+  the load layout (PROG/nandboot addresses, entry), the download URL + pinned SHA-256, the boot
+  generation, and (for ZC3201) the reference addresses above. `loader.py` detects it
+  (`Firmware.profile`) byte-exact from the PROG fingerprint + nandboot generation magic; the MT
+  module constants are now thin aliases of the MT profile, so `boot.py` / `mmu_boot.py` are
+  unchanged.
+* **ZC3201 firmware fetch** — `firmware_fetch.ensure_firmware(..., profile=ZC3201)` fetches and
+  SHA-verifies the ZC3201 container into its own cache file, exactly like the MT one
+  (`03c12f41…a4a6`, `update%20encrypt%20normal%20freq.upd`).
+* **From-entry substrate** — `boot.build_bare_machine(fw, profile=ZC3201)` loads PROG identity
+  at `0x08000000` + nandboot at `0x07ff8000` and seeds the CPU at `state_init_power_on` through
+  tt-emu's **real** `Machine` (no peripherals, no MMU → every MMIO read is `0`, matching the lab
+  model). It is **hook-free**: it only loads + runs. Reproduces the probe exactly — 131 distinct
+  PCs, span `0x08000a04..0x0809886c`, returns to the entry sentinel with no unmapped access.
+* **Tests** — `tests/test_firmware_profile.py` (registry, byte-exact detection, real-image
+  detection, the from-entry init-leaf run) and ZC3201 fetch coverage in
+  `tests/test_firmware_fetch.py`. `tests/_data.py` resolves the ZC3201 container
+  (`$TT_EMU_FIRMWARE_ZC3201` / local / SHA-verified download).
+
+The success criterion — *all gme-based tests passing on both firmwares* — is **not met**: those
+tests require booting to book mode and running the interpreter through the unmodified firmware
+(taps via the OID sensor, the `.gme` served through NAND, audio via the DAC DMA), which is
+blocked on the missing boot RE above. This is the same multi-stage bring-up the 2N boot was, and
+the reference material for the ZC3201 half of it does not exist yet.
+
+## Resume pointer
+
+Next actionable step is **step 2 (from-entry seed state)** — but first the true blocker,
+**identifying the ZC3201 pre-init boot entry and driving the event pump**:
+
+1. Start from `build_bare_machine` (proven). Find the ZC3201 `app_init_main` equivalent (MT
+   `0x08038f5c`; not `state_init_power_on`, which just returns) by tracing what calls
+   `state_init_power_on` / `event_post` `0x08001544` / `state_stdb_standby` `0x08036454`, and
+   what registers the QHsm dispatch table — the ghidra project is at
+   `tt-firmware-reveng/ZC3201/`.
+2. Reverse the **SoC MMIO map** for this pen (the lab's all-zero stub is enough to *reach* the
+   init leaf but not to pass the boot self-tests — clock/battery calibration, timer tick). This
+   is the bulk of the new RE. Re-point tt-emu's `syscon`/`intc`/`gpio`/`battery` models once the
+   addresses are known (they are currently all `0x040000xx`, MT-specific).
+3. Reverse the **NAND geometry + NFC registers** to serve the `.gme` authentically, and the
+   **OID capture-state address** + GPIO pins, and the **DAC/DMA registers** for real PCM.
+4. Add a ZC3201 branch of the `firmware.mt` debugger (statechart frame base, product-id addr,
+   register-file addr `0x081d8328`, the `gme_exec_command`/`voice_*` watchpoints from
+   `FirmwareProfile.symbols`) so `Emulator` / `runner` can observe book mode, taps and plays —
+   then parametrise `tests/test_scripting.py` etc. over both firmwares.
+
+Everything up to the `build_bare_machine` return is done and green; the work resumes at item 1.

@@ -128,6 +128,41 @@ def test_url_env_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     assert calls == ["https://mirror.test/fw.upd"]
 
 
+def test_profile_selects_filename_url_and_sha(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fetching a non-MT profile uses that profile's cache filename, pinned URL
+    and SHA-256 — the machinery the ZC3201 image plugs into."""
+    from tt_emu.firmware_profile import ZC3201
+
+    payload = b"ANYKA106zc3201 payload"
+    sha = hashlib.sha256(payload).hexdigest()
+    calls: list[str] = []
+    monkeypatch.setattr(ff, "urlopen", fake_urlopen(payload, calls))
+    # Override the SHA (the pinned real hash won't match our fake payload) but
+    # let the profile choose the filename and default URL.
+    got = ff.ensure_firmware(None, profile=ZC3201, cache_dir=tmp_path, sha256=sha, quiet=True)
+    assert got == tmp_path / ZC3201.fetch.filename
+    assert got.name != ff.FIRMWARE_FILENAME  # distinct from the MT cache file
+    assert calls == [ZC3201.fetch.urls[0]]
+
+
+def test_env_url_override_is_mt_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``TT_EMU_FIRMWARE_URL`` names "the firmware" (the MT default) and must not
+    hijack another profile's download."""
+    from tt_emu.firmware_profile import ZC3201
+
+    payload = b"ANYKA106zc"
+    sha = hashlib.sha256(payload).hexdigest()
+    calls: list[str] = []
+    monkeypatch.setattr(ff, "urlopen", fake_urlopen(payload, calls))
+    monkeypatch.setenv("TT_EMU_FIRMWARE_URL", "https://mirror.test/mt.upd")
+    ff.ensure_firmware(None, profile=ZC3201, cache_dir=tmp_path, sha256=sha, quiet=True)
+    assert calls == [ZC3201.fetch.urls[0]]  # the env override did not apply
+
+
 def test_default_cache_dir_respects_xdg(monkeypatch: pytest.MonkeyPatch) -> None:
     if not ff.sys.platform.startswith(("linux", "freebsd")):
         pytest.skip("XDG semantics are the non-macOS/Windows branch")

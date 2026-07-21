@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 import struct
 
+from .firmware_profile import ZC3201, FirmwareProfile
 from .loader import (
     Firmware,
     NANDBOOT_ALIAS_ADDR,
@@ -96,6 +97,10 @@ NAND_ROW_CYCLES = 3
 #: ~0x081E0000, so the top of real RAM is free for the stack.
 SVC_STACK_TOP = 0x0840_0000
 CPSR_SVC_IRQS_ON = 0x13  # SVC mode (0x13), ARM state, I = 0
+
+#: Bare-probe return trap (``build_bare_machine``): a mapped low-page address the
+#: entry leaf's ``bx lr`` lands on. Matches ``scripts/zc3201_boot_probe.py``.
+BARE_LR_SENTINEL = 0x0000_2000
 
 #: A small ARM stub returning 1 (`mov r0,#1; bx lr`), planted at HAL_LEAF_TIMER
 #: so the calibration probe reads a non-zero "timer busy/expired" (§5.4 item 2).
@@ -228,3 +233,47 @@ def build_machine(
         firmware.nandboot.size,
     )
     return BootedMachine(machine, firmware, zc90b, nand, oid, audio, gpio, mmu)
+
+
+def build_bare_machine(
+    firmware: Firmware,
+    config: MachineConfig | None = None,
+    *,
+    profile: FirmwareProfile = ZC3201,
+) -> Machine:
+    """A minimal machine for a from-entry boot probe of a non-MT firmware.
+
+    This is the substrate for the ZC3201 bring-up (``docs/zc3201-boot-feasibility.md``):
+    it loads PROG + nandboot at the *profile's* addresses (ZC3201: PROG identity
+    at ``0x08000000``, nandboot at ``0x07ff8000``) and seeds the CPU at the
+    profile's entry (``state_init_power_on``), but registers **no** peripherals
+    and **no** MMU — so every MMIO read returns 0, exactly the model the
+    ``firmware-re`` lab uses for this build (it has no SoC register map,
+    NAND geometry, or OID/audio addresses yet). It is deliberately hook-free:
+    it only *loads and runs*, so a caller can observe how far the unmodified
+    firmware executes from entry.
+
+    Reaching book mode from here needs the ZC3201 boot RE that does not exist
+    yet (seed state, the SoC MMIO map, NAND geometry, the OID/audio registers);
+    until then this proves the profile-driven load path end-to-end and the
+    :func:`tt_emu.firmware_profile.detect` result on the real image.
+    """
+    from unicorn.arm_const import UC_ARM_REG_LR
+
+    machine = Machine(config)
+    machine.write_bytes(profile.prog_load, firmware.prog.data)
+    machine.write_bytes(profile.nandboot_load, firmware.nandboot.data)
+    if profile.nandboot_alias is not None:
+        machine.write_bytes(profile.nandboot_alias, firmware.nandboot.data)
+    machine.set_entry_state(profile.prog_entry, SVC_STACK_TOP, CPSR_SVC_IRQS_ON)
+    # Return-trap: the entry leaf ends with ``bx lr``; land it on a mapped
+    # sentinel in the low (zero) page and stop there, so a probe observes the
+    # clean return rather than running off into the zero page. (The MT recipe
+    # never returns — it runs the event pump — so this is bare-probe-only.)
+    machine.uc.reg_write(UC_ARM_REG_LR, BARE_LR_SENTINEL)
+    machine.on_code(BARE_LR_SENTINEL, lambda m: m.request_stop("returned to entry sentinel"))
+    log.info(
+        "bare machine for %s (%s): PROG @ %#010x, entry %#010x",
+        profile.label, firmware.boot_generation, profile.prog_load, profile.prog_entry,
+    )
+    return machine

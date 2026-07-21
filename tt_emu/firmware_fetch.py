@@ -32,19 +32,23 @@ from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
+from .firmware_profile import MT, FirmwareProfile
+
 #: Official download URL for the 2N "MT" firmware update container. This is
 #: the Ravensburger CDN path the tiptoi Manager fetches firmware from
 #: (verified live 2026-07: 11,303,276 bytes, last-modified 2018-08-01, and the
 #: payload hashes to :data:`FIRMWARE_SHA256`). Override with the
 #: ``TT_EMU_FIRMWARE_URL`` environment variable if it ever moves — the SHA-256
-#: check below still gates whatever comes back.
-DEFAULT_FIRMWARE_URL = "https://cdn.ravensburger.de/db/Firmware-Files/de/38/REV3/update3202MT.upd"
+#: check below still gates whatever comes back. Other pens' download metadata
+#: live on their :class:`~tt_emu.firmware_profile.FirmwareProfile`; these names
+#: stay the MT defaults for backward compatibility.
+DEFAULT_FIRMWARE_URL = MT.fetch.urls[0]
 
 #: Pinned SHA-256 of the authentic ``update3202MT.upd`` (build N0038MT).
-FIRMWARE_SHA256 = "8e37af0a3d3c126189447964784fd84ccf0356cb7425b5ab478e86b3352741f9"
+FIRMWARE_SHA256 = MT.fetch.sha256
 
 #: File name used inside the cache directory.
-FIRMWARE_FILENAME = "update3202MT.upd"
+FIRMWARE_FILENAME = MT.fetch.filename
 
 #: Download chunk size (64 KiB keeps progress updates smooth).
 _CHUNK = 64 * 1024
@@ -100,8 +104,9 @@ class _Progress:
     stays readable.
     """
 
-    def __init__(self, quiet: bool) -> None:
+    def __init__(self, quiet: bool, filename: str = FIRMWARE_FILENAME) -> None:
         self.quiet = quiet
+        self.filename = filename
         self.tty = sys.stderr.isatty()
         self.last = -1  # last reported percent (or MiB when total is unknown)
 
@@ -111,12 +116,12 @@ class _Progress:
         if total:
             step = 100 * done // total if self.tty else 10 * (10 * done // total)
             line = (
-                f"tt-emu: downloading {FIRMWARE_FILENAME}: "
+                f"tt-emu: downloading {self.filename}: "
                 f"{100 * done // total:3d}% ({done / 2**20:.1f}/{total / 2**20:.1f} MiB)"
             )
         else:
             step = done // 2**16 if self.tty else done // 2**20
-            line = f"tt-emu: downloading {FIRMWARE_FILENAME}: {done / 2**20:.1f} MiB"
+            line = f"tt-emu: downloading {self.filename}: {done / 2**20:.1f} MiB"
         if step == self.last and (not end or not self.tty):
             return  # unchanged; on a tty the end call still adds the newline
         self.last = step
@@ -127,10 +132,10 @@ class _Progress:
         sys.stderr.flush()
 
 
-def _download(url: str, dest: Path, *, quiet: bool) -> None:
+def _download(url: str, dest: Path, *, quiet: bool, filename: str = FIRMWARE_FILENAME) -> None:
     """Stream ``url`` to ``dest`` with a simple stderr progress line."""
     req = Request(url, headers={"User-Agent": "tt-emu"})
-    progress = _Progress(quiet)
+    progress = _Progress(quiet, filename)
     try:
         with urlopen(req) as resp, dest.open("wb") as out:
             length = resp.headers.get("Content-Length")
@@ -155,20 +160,26 @@ def _download(url: str, dest: Path, *, quiet: bool) -> None:
 def ensure_firmware(
     path: str | Path | None,
     *,
+    profile: FirmwareProfile = MT,
     cache_dir: str | Path | None = None,
     url: str | None = None,
-    sha256: str = FIRMWARE_SHA256,
+    sha256: str | None = None,
     quiet: bool = False,
 ) -> Path:
     """Resolve the firmware to use: an explicit path, or the cached download.
 
     * ``path`` given → returned as-is (the pre-existing explicit-path
       behaviour; no hash check, so any compatible ``.upd`` still works).
-    * ``path`` is None → ``<cache dir>/update3202MT.upd``. A cached copy whose
-      SHA-256 matches is used without any network access; otherwise the file
-      is downloaded from ``url`` (default :data:`DEFAULT_FIRMWARE_URL`, or the
-      ``TT_EMU_FIRMWARE_URL`` environment variable), verified against
-      ``sha256`` and moved into place atomically.
+    * ``path`` is None → ``<cache dir>/<profile filename>``. A cached copy whose
+      SHA-256 matches is used without any network access; otherwise the file is
+      downloaded from ``url`` (default the profile's pinned URL, or the
+      ``TT_EMU_FIRMWARE_URL`` environment variable — honoured for MT only, to
+      preserve its meaning), verified against ``sha256`` (default the profile's
+      pinned hash) and moved into place atomically.
+
+    ``profile`` selects which pen's firmware to fetch (default the 2N "MT"). Its
+    filename / URL / SHA-256 are used unless the explicit ``url`` / ``sha256``
+    arguments override them.
 
     Raises :class:`FirmwareIntegrityError` on a hash mismatch (expected vs.
     got, and the URL) and :class:`FirmwareDownloadError` on network failure.
@@ -176,21 +187,26 @@ def ensure_firmware(
     if path is not None:
         return Path(path)
 
+    sha256 = sha256 or profile.fetch.sha256
+    filename = profile.fetch.filename
     cache = Path(cache_dir) if cache_dir is not None else default_cache_dir()
-    cached = cache / FIRMWARE_FILENAME
+    cached = cache / filename
     if cached.is_file():
         if _sha256_file(cached) == sha256:
             return cached
         # Stale or corrupt cache (e.g. an interrupted earlier download):
         # fall through and re-download once; the hash check below decides.
 
-    resolved_url = url or os.environ.get("TT_EMU_FIRMWARE_URL") or DEFAULT_FIRMWARE_URL
+    # TT_EMU_FIRMWARE_URL overrides the MT default only (it predates profiles and
+    # names "the firmware"); other profiles use their own pinned URL.
+    env_url = os.environ.get("TT_EMU_FIRMWARE_URL") if profile is MT else None
+    resolved_url = url or env_url or profile.fetch.urls[0]
     cache.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=FIRMWARE_FILENAME + ".", suffix=".part", dir=cache)
+    fd, tmp_name = tempfile.mkstemp(prefix=filename + ".", suffix=".part", dir=cache)
     os.close(fd)
     tmp = Path(tmp_name)
     try:
-        _download(resolved_url, tmp, quiet=quiet)
+        _download(resolved_url, tmp, quiet=quiet, filename=filename)
         got = _sha256_file(tmp)
         if got != sha256:
             raise FirmwareIntegrityError(resolved_url, sha256, got)
