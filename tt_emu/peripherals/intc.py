@@ -54,9 +54,20 @@ class IntcTimer(WordRegisterPeripheral):
     name = "intc"
     base = 0x0400_0000
 
-    def __init__(self, gpio: GpioBlock) -> None:
+    def __init__(self, gpio: GpioBlock, *, zc3201_timer_ack: bool = False) -> None:
         super().__init__()
         self._gpio = gpio
+        # ZC3201's timer ISR (nandboot 0x08003d6c) acks the interrupt in TWO
+        # steps: it first clears the top-level line-10 status (0xCC), then reads
+        # the second-level timer-fired bit (0x4C bit17) to decide whether to tick
+        # the HAL software timers. On real HW the top-level line is a computed
+        # level of the second-level source, so clearing 0xCC must NOT clear the
+        # 0x4C timer-fired latch — otherwise the ISR reads 0x4C as clear and never
+        # ticks the software timers (the statechart's periodic driver dies). MT's
+        # ISR instead acks via the TIMER1_CTRL bit28 path and its teardown writes
+        # 0 to 0xCC expecting the latch to drop, so this decoupling is ZC3201-only
+        # (flag off ⇒ byte-identical MT behaviour).
+        self._zc3201_timer_ack = zc3201_timer_ack
         self._lines: set[int] = set()  # externally asserted lines (0 audio, 6 USB)
         self._timer_latched = False
         self._timer_deadline: int | None = None
@@ -164,9 +175,22 @@ class IntcTimer(WordRegisterPeripheral):
             # Only written 0 on reset/teardown paths ("everything off/clear", §2.2).
             if value == 0:
                 self._lines.clear()
-                self._timer_latched = False
+                # ZC3201's timer ISR clears 0xCC (line-10) *before* it acks the
+                # second-level 0x4C timer-fired bit; keep the latch so 0x4C still
+                # reads "fired" and the software-timer tick runs (§ decoupling
+                # note above). MT clears it here (its teardown relies on it).
+                if not self._zc3201_timer_ack:
+                    self._timer_latched = False
             return
         if offset == TIMER_STAT_CTRL:
+            # ZC3201: writing 0x4C with the timer-fired bit cleared is the ISR's
+            # ack of the second-level latch — drop _timer_latched here instead.
+            if (
+                self._zc3201_timer_ack
+                and self._timer_latched
+                and not (value & STAT_TIMER_FIRED)
+            ):
+                self._timer_latched = False
             # Store the firmware's config bits; hardware status bits are computed.
             super().write_reg(offset, value & ~(STAT_TIMER_FIRED | STAT_GPIO_CAUSE))
             return

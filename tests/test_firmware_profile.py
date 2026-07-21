@@ -270,3 +270,48 @@ def test_zc3201_codepage_index_reaches_statechart() -> None:
     assert not hit["spin"], "nandboot codepage lookup spun — the system-bin index is missing/wrong"
     assert hit["init"] >= 1, "app_init did not reach state_init_power_on (statechart INIT leaf)"
     assert hit["dispatch"] >= 1, "event pump did not dispatch (gme_oid_dispatch never reached)"
+
+
+@pytest.mark.skipif(ZC_PATH is None, reason="ZC3201 firmware .upd not available")
+def test_zc3201_statechart_advances_init_to_standby() -> None:
+    """The HAL software-timer tick drives the statechart from INIT into standby (Leg 17).
+
+    ZC3201's periodic statechart driver is a HAL software timer the INIT leaf arms
+    (100 ms, callback nandboot ``0x080065ec``). That timer is ticked by the timer
+    IRQ's two-step ack: the ISR (``0x08003d6c``) clears the top-level line-10 status
+    at ``0x040000cc`` *before* it reads the second-level timer-fired bit at
+    ``0x0400004c`` bit17 that gates the software-timer tick (``0x08006d38``). The
+    :class:`IntcTimer` therefore decouples those two latches for ZC3201
+    (``zc3201_timer_ack=True``) — otherwise clearing ``0xCC`` also cleared the
+    ``0x4C`` latch, the tick never ran, and the statechart stalled at INIT with the
+    tick events piling up undrained.
+
+    With the decoupling, the software timer ticks, the callback posts tick events,
+    the pump drains them, and the statechart advances ``state_init_power_on``
+    ``0x08038e48`` → the standby state machine ``FUN_0803ef7c`` ``0x0803ef7c`` (the
+    twin of MT's ``standby_handler`` per ``correspondences.tsv``). Observed hook-free
+    via :class:`tt_emu.firmware.zc3201.Zc3201Debugger`.
+    """
+    from tt_emu.boot import build_zc3201_machine
+    from tt_emu.firmware import zc3201 as fw_zc
+    from tt_emu.loader import load_upd
+    from tt_emu.machine import MachineConfig
+
+    fw = load_upd(str(ZC_PATH))
+    assert fw_zc.recognize(fw.prog.data), "ZC3201 firmware recognition failed"
+    machine = build_zc3201_machine(fw, MachineConfig(instructions_per_tick=20_000))
+    dbg = fw_zc.Zc3201Debugger(machine)
+    dbg.attach_watches()
+    machine.run(40_000_000)
+
+    snap = dbg.snapshot()
+    assert snap.timer_ticks > 100, (
+        f"HAL software-timer tick never ran ({snap.timer_ticks}) — the timer-status "
+        "decouple regressed; the statechart's periodic driver is dead"
+    )
+    visited = [pc for _clock, pc in dbg.leaves]
+    assert 0x0803_8E48 in visited, "statechart never entered the INIT leaf"
+    assert 0x0803_EF7C in visited, (
+        "statechart did not advance from INIT into the standby state machine "
+        "(FUN_0803ef7c) — the timer tick is not driving the pump"
+    )

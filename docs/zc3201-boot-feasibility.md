@@ -1089,3 +1089,100 @@ page 31 only). Tests: `test_profile_load_layout_distinct` (the new seed field) +
 `test_zc3201_codepage_index_reaches_statechart` (no spin; INIT leaf + pump reached). The
 open blocker is the codepage size-unit/block-unit contradiction (does not block the pump;
 may block book-mode rendering).
+
+## Leg 17 — the statechart's periodic driver was dead (timer-status coupling); INIT → standby now fires; new wall = the pen powers off
+
+Leg 16's "the event pump is live (`gme_oid_dispatch` `0x0803629c` dispatched)" was a
+**misattribution**: `0x0803629c` is a basic block *inside* the MtdLib map-table paged-lookup
+helper `FUN_08036204` (it calls `mtd_helper_d244`), which runs 951× **at mount** — so the
+Leg-16 test's "dispatch ≥ 1" was satisfied by the mount, not by any event pump. Instrumenting
+the *real* pump (`sm_dispatch_hierarchy` `0x080096a8`) showed it ran only **twice** in 300 M
+insns; the statechart never left INIT. All findings below are Proven (disasm + live-run
+instrumented; probes `scripts/zc3201_statechart_probe.py` + session scratchpad traces).
+
+### The stall — the HAL software-timer tick never ran
+
+* **The pump is a QF event ring drained by nandboot `FUN 0x08003a84`** (a tight
+  `while(true){ sm_dispatch_hierarchy(); drain ring[head..tail] }`): a 32-entry ring of
+  12-byte records at the fixed HAL scheduler object `0x080075cc`, `head` u16 `+0x180`,
+  `tail` `+0x182`, both masked `& 0x1f` (confirms Leg 2). The **INIT leaf arms a 100 ms HAL
+  software timer** (`state_init_power_on` → nandboot `func_0x08006b64(0, 100000, 1, cb=0x080065ec)`);
+  the callback `0x080065ec` posts event **`0x30` (sw-timer tick)** via the ring-post
+  `0x08003c44`. That periodic tick is what drives INIT → standby.
+* **The 100 ms callback never fired** (0 hits) because the **HAL software-timer tick
+  `0x08006d38` never ran** (0 hits) — even though the hardware timer IRQ fired 5722×. Root
+  cause, register-exact: the ZC3201 timer ISR `0x08003d6c` acks in **two steps** — it first
+  clears the **top-level line-10 status** at `0x040000cc` (writing `[0xCC] & ~0x400`, i.e. 0),
+  then reads the **second-level timer-fired bit** at `0x0400004c` bit17 (`0x20000`) that gates
+  the software-timer tick. But `tt_emu.peripherals.intc.IntcTimer` drove **both** `0xCC` bit10
+  and `0x4C` bit17 from the single `_timer_latched`, and its `0xCC`-write-0 path cleared
+  `_timer_latched` — so by the time the ISR read `0x4C`, bit17 was already 0 → the tick was
+  skipped every IRQ (live: `[0xCC]=0x400`, `[0x4C]=0x12`, bit17 absent). MT is unaffected: its
+  ISR acks via the `TIMER1_CTRL` bit28 path and its teardown writes 0 to `0xCC` *expecting* the
+  latch to drop.
+
+### Fix (landed, product; MT byte-identical via a flag)
+
+* **`IntcTimer(zc3201_timer_ack=True)`** decouples the two latches: the `0xCC`-write-0 no longer
+  clears `_timer_latched`; instead the ISR's ack **write to `0x4C` with bit17 cleared** drops it.
+  `build_zc3201_machine` passes the flag; MT constructs `IntcTimer(gpio)` unchanged (flag off ⇒
+  the write paths are bit-for-bit as before). This is authentic hardware modelling — the ZC3201
+  top-level line 10 is a computed *level* of the second-level timer source, so clearing the
+  top-level status must not clear the source latch.
+
+**Verified** (`test_zc3201_statechart_advances_init_to_standby`, `tt_emu/firmware/zc3201.py`
+`Zc3201Debugger`): the software timer now ticks (1674× / 40 M), the 100 ms callback fires, the
+pump drains the tick events, and the statechart advances **`state_init_power_on` `0x08038e48`
+(≈6 M) → the standby state machine `FUN_0803ef7c` `0x0803ef7c` (≈15.6 M)** — the twin of MT's
+`standby_handler` (`correspondences.tsv`). MT unregressed.
+
+### New infrastructure
+
+* **`tt_emu/firmware/zc3201.py`** — the ZC3201 twin of `firmware/mt.py`: `recognize`, the event
+  ring readers (`ring_state`/`ring_events` at `0x080075cc+0x180`), and `Zc3201Debugger` with
+  read-only PC watches on the statechart leaves (`STATE_HANDLERS`: INIT `0x08038e48`, standby
+  `0x0803ef7c`, `SetRefresh` `0x0803e454`), `sm_dispatch_hierarchy`, and the software-timer
+  tick. Hook-free observation, profile-recognized like the MT debugger.
+
+### Leg 17 resume pointer — the pen enters the power-off path instead of book
+
+Past standby, the standby SM `FUN_0803ef7c` receives event **`0x1015`** and takes its
+**app-mode-byte `+0x1b == 8`** branch (set by `FUN_0803e384`, which also OR-sets
+`*DAT_0803e448 |= 0x200000`), an **infinite power-off / shutdown loop**: it bit-bangs GPIO
+outputs 6 and 1 low, `func_0x08006e28(0x14)` delay, and polls **GPIO input pin 0**
+(`func_0x08006978(0)` = `[0x040000bc]` bit0) for release, 50× then `wfi` — i.e. the pen has
+**decided to power off**. This is the authentic behaviour of a real pen that powers on with no
+resume condition held; MT avoids it because the GPIO model presents the **power button held**
+through the app-init sample (`nand-image-layout.md` §7.3.1a, GpioBlock `_boot_power_button` /
+GPIO11+GPIO15). `tt_emu.peripherals.gpio.GpioBlock` is **MT-specific** (GPIO11 button / GPIO15
+power-hold at MT's offsets); ZC3201's power-hold/OID GPIO wiring differs and is not yet modelled.
+
+**Next steps, precise:**
+1. **Find why the pen chooses power-off (mode 8) instead of descending to book.** Event `0x1015`
+   is the correct INIT→**standby** transition (`FUN_0803b480` maps `0x1015` → target state 3 =
+   standby); the power-off happens *inside* standby because **app-mode byte `+0x1b` was already 8
+   on standby entry** (`FUN_0803ef7c` only takes the mode-8 spin when `+0x1b == 8`). Two coupled
+   clues to chase: **(a)** the INIT leaf `state_init_power_on` **bailed on its precondition** —
+   `FUN_08008a04` (a pointer-range check `addr ∈ [0x08000000,0x08200000)`) returned 0, so INIT
+   skipped its real work (no `play_chomp_voice(0x19)`, mode never set to 2) and returned via
+   `FUN_080a086c(2000,10)`; the checked pointer is the `FUN_0802b350(4)` allocation stored at
+   `*(DAT_08039094+8)` — find why it is out of range (allocator/seed gap). **(b)** `FUN_0803e384`
+   sets mode 8 + `*DAT_0803e448 |= 0x200000` (the power-off enter); trace its caller and the
+   predicate that routes there vs the book descent — it is the ZC3201 analogue of MT's `+0x24`
+   resume latch (recover the exact GPIO pin/register ZC3201 samples for "power button still held"
+   and present it — a ZC3201 GpioBlock variant or a profile-driven boot-held pin). The app object
+   is `DAT_0803eefc`/`DAT_0802b9b8`.
+2. Then re-point the **OID sensor** (the ZC3201 capture-state address + GPIO wiring — MT's
+   `bit_count 0x08008c09` equivalent) and the **audio DAC/DMA** so a product/cover-OID tap
+   mounts the `.gme` on B: and the shared GME interpreter plays (twins in `symbols` /
+   `correspondences.tsv`: `game_play_oid_voice 0x0805c730`, `gme_exec_command 0x0804c6e4`, …).
+3. Then parametrise `tests/test_scripting.py` (+ the other gme-based tests) over both firmwares.
+
+**State now:** the unmodified firmware boots through the complete MtdLib + FatLib mount, loads
+the `codepage` system bin, reaches the statechart INIT leaf, and — with the timer-status
+decouple — the HAL software timer now ticks and drives the statechart **INIT → standby state
+machine** (`FUN_0803ef7c`). It then enters the authentic **power-off path** (mode 8) because the
+ZC3201 power-hold GPIO condition is not yet presented. MT unregressed. Product changes this leg:
+`IntcTimer.zc3201_timer_ack` (+ the two-latch decouple) and the `build_zc3201_machine` wiring;
+new `tt_emu/firmware/zc3201.py` (statechart debugger). Tests:
+`test_zc3201_statechart_advances_init_to_standby`. Probe: `scripts/zc3201_statechart_probe.py`.

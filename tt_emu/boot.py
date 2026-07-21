@@ -289,7 +289,11 @@ def build_zc3201_machine(
     """
     machine = Machine(config)
     gpio = GpioBlock()
-    intc = IntcTimer(gpio)
+    # ZC3201's timer ISR (nandboot 0x08003d6c) acks the top-level line-10 status
+    # (0xCC) before reading the second-level timer-fired bit (0x4C bit17) that
+    # gates the HAL software-timer tick; decouple the two latches so the tick —
+    # and thus the statechart's periodic event driver — actually runs.
+    intc = IntcTimer(gpio, zc3201_timer_ack=True)
     machine.add_peripheral(SysCon(chip_id=profile.soc_chip_id))
     machine.add_peripheral(intc)
     machine.add_peripheral(gpio)
