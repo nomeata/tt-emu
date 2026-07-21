@@ -177,29 +177,75 @@ plan. Concretely:
   (`mtd_extra_bitmap` `0x08022a8c`), ~800 distinct PROG PCs, span `0x08000070..0x080c2af8`,
   **no hang**. MT suite unregressed.
 
+## Leg 3 — the load base was wrong (0x08008000, not 0x08000000), + the NFC re-point
+
+The stall in "storage-probe delays" was a symptom, not the wall. Tracing the actual spin
+(HAL udelay `0x07ffb1a4`, which busy-loops `((clock>>20)·µs>>4)·3` iterations) showed the
+CPU-frequency global `0x08006fac` holding a **garbage 3.75 GHz** value, which then made the
+clock-set helper (`0x080000e8`) spin forever in its shift-search. The garbage came from a
+CPU-frequency `.rodata` **table** the clock code reads through a **baked absolute pointer
+`0x080251b8`** — and at load base `0x08000000` that pointer lands inside
+`fs_storage_mount_init`'s **code**, not on the table (whose bytes are at file offset
+`0x1d1b8`).
+
+**Root cause: the ZC3201 PROG runtime link base is `0x08008000`, not `0x08000000`.** This is
+the *same wrong-base mistake the 2N-MT project made* before it was corrected to `0x08009000`.
+At `0x08000000` the **code** runs (it is PC-relative, hence the earlier "clean 800-PC boot"),
+but every absolute **data** pointer is `0x8000` too low, so dispatches quietly misfire. Proof
+(the reveng project's own "does this pointer resolve to a function prologue?" metric, extended
+to include `0x08008000` as a candidate): absolute code-pointer tables in the image resolve to
+valid ARM prologues **423 : 40** for `0x08008000` over `0x08000000` (the MT base `0x08009000`
+gets 3). Independently reproduced by the coordinator: a sharp peak at `0x08008000` (28.8%) vs
+`0x08000000` (2.3%), the same method recovering MT's known-correct `0x08009000` (19.1%). The
+`0x080251b8` pointer + the table's file offset `0x1d1b8` force `base = 0x080251b8 − 0x1d1b8 =
+0x08008000` exactly; there and only there do the freq table (`0x080251b8`) and
+`fs_storage_mount_init`'s code (`0x0802d0e0`) stop overlapping. **This is not scatter-loading**
+— there is no copy-table; it is purely the flat load address, exactly like MT's `0x08009000`.
+
+Implemented (this leg), all built on the settled from-entry + reused-MT-peripheral substrate:
+
+* **Load base fixed to `0x08008000`.** `firmware_profile.ZC3201`: `prog_load = 0x08008000`,
+  `nandboot_alias = 0x08000000` (the nandboot HAL is mapped at `0x07ff8000` *and* aliased at
+  `0x08000000` exactly like MT, so PROG's `bl 0x0800xxxx` HAL veneers — `= 0x07ffxxxx+0x8000`
+  — resolve), `prog_entry = 0x0802b8bc` (`boot_task_main`, reveng `0x080238bc` + `0x8000`).
+  Every PROG address in `symbols` is now the reveng value **+ `0x8000`** via the `_z()` helper;
+  HAL/nandboot `0x07ffxxxx` targets are unshifted. `bss_seed = (0x08006fe4, 0x101c)` — the
+  low-RAM HAL globals *below* PROG (with the correct base PROG no longer clobbers this window;
+  the HAL IRQ-nesting depth byte lives here). `boot.build_zc3201_machine` maps the alias and
+  applies the seed.
+* **Clock wall cleared.** At the correct base the freq table reads `0x00b71b00` (12 MHz) for
+  its domain, the CPU-frequency global settles at 96 MHz, udelay is short, and the boot runs
+  through clock setup into MTD/storage init and **the NAND/NFC command-list sequencer**.
+* **MT storage trio re-pointed verbatim.** ZC3201's NFC (`0x0404a000`) and ECC (`0x0405b000`)
+  are at the *identical* MT addresses (same Anyka family): the HAL NAND-ready poll reads NFC
+  `+0x158` bit31 and stages command-list micro-ops at `+0x100`, exactly the sequencer the MT
+  `NfcController` implements. `build_zc3201_machine` now adds `NfcController` + `EccEngine` +
+  `L2NandBuffer` serving a `NandImage` (blank by default). The firmware drives it (READ-ID,
+  status, page reads — 32 NAND reads observed).
+
 ## Resume pointer
 
-The firmware now boots authentically to **storage/MTD init and there spins in calibrated
-storage-probe delay loops** (HAL udelay `0x07ffb1c0`) waiting on flash hardware that is not
-modelled — it has **not** yet reached `fs_storage_mount_init`'s success path, the event pump,
-standby, or book mode. Next actionable step is **step 3 (NAND/NFC + image)**:
+The unmodified firmware now boots at the **correct base `0x08008000`** through clock setup and
+into the **NFC sequencer**, then hits the next wall: with a **blank NAND** the mount reads
+`0xFF` pages and the MT NFC model **deposits them into its SRAM staging window `0x08006800`,
+which for ZC3201 collides with the nandboot alias's *code*** (the HAL lives up to offset
+`~0x6fe4`; the GPIO leaf is at `0x07ffe954` = alias `0x08006954`). The clobbered code then
+faults (invalid instruction at `0x08006960`). Two coupled next steps:
 
-1. **Model the ZC3201 NAND/NFC controller and provide a NAND image** so `fs_storage_mount_init`
-   `0x080250e0` mounts instead of spinning/hanging. Start from `build_zc3201_machine`; trace the
-   storage init from `app_init_main` `0x080236c0` → the MTD/NFTL layer (`mtd_*` names in
-   `ZC3201/input/names.csv`: `mtd_extra_bitmap` `0x08022a8c`, `mtd_open_maptbl` `0x08027f50`,
-   `nand_disk_mount` `0x0802b45c`) and find which MMIO register block + status/ready bit the
-   probe delay loop polls (disassemble the caller of udelay `0x07ffb1a4`). Cross-check the NAND
-   geometry against the MT `NandImage`/`NfcController` — likely re-pointable, as the core
-   peripherals were. This unblocks `app_init_main` returning and the event pump starting.
-2. Once the pump runs: drive the descent power-on → standby → (cover/product-OID tap) → book via
-   the modelled OID sensor + GPIO (re-point the MT `OidSensor`), and serve the `.gme` through the
-   NAND/FS. The generic scripted-GME interpreter is a proven twin (`ZC3201.symbols` gme_* + the
-   `firmware-re` lab), so once book mode is reached the interpreter path should run.
-3. Add a ZC3201 branch of the `firmware.mt` debugger (the ZC3201 AO struct / event-ring geometry
-   above, register-file `0x081d8328`, the `gme_exec_command`/`voice_*` watchpoints from
-   `FirmwareProfile.symbols`) so `Emulator`/`runner` observe book mode, taps and plays — then
-   parametrise `tests/test_scripting.py` etc. over both firmwares.
+1. **Find the ZC3201 NAND data-staging SRAM window** (the MT `SRAM_WINDOW = 0x08006800` is
+   wrong here — it is nandboot code) and make `NfcController`'s window a per-instance parameter.
+   Disassemble the ZC3201 nandboot NAND page-read leaf (the bulk-read path that memcpys from the
+   staging SRAM after a `0x119` data micro-op) to recover the address; candidate low-SRAM
+   literals in nandboot include `0x08005000/0x08005800/0x08005b00`. This removes the crash.
+2. **Build a valid ZC3201 NAND image** so `fs_storage_mount_init` `0x0802d0e0` mounts instead of
+   erroring. ZC3201 uses `MtdLib_Base_1_0_10` (older than MT's `NFTL_V1_2_11`) — trace the mount
+   from `app_init_main` `0x0802b6c0` → MTD/NFTL layer (`mtd_extra_bitmap` `0x0802aa8c`,
+   `mtd_open_maptbl` `0x0802ff50`, `nand_disk_mount` `0x0803345c` — all reveng + `0x8000`) and
+   cross-check geometry against the MT `NandImage`/`build_nand_image` template. Then drive the
+   pump → standby → (product-OID tap) → book and serve the `.gme` (re-point the MT `OidSensor`),
+   and parametrise `tests/test_scripting.py` over both firmwares.
 
-Everything up to `build_zc3201_machine` reaching storage init is done and green; work resumes at
-item 1 (the ZC3201 NAND/NFC model + image).
+**Address convention going forward:** all ZC3201 runtime addresses are the `tt-firmware-reveng`
+value **+ `0x8000`** until that repo is re-based (loader_base `0x08008000`, names.csv shifted).
+Where this doc cites a bare reveng address for a *code* location, the runtime address is
+`+0x8000`.

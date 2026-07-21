@@ -32,13 +32,18 @@ def test_registry_keys_unique_and_lookup() -> None:
 def test_profile_load_layout_distinct() -> None:
     # The layout difference that motivated the abstraction.
     assert MT.prog_load == 0x0800_9000 and MT.nandboot_alias == 0x07FF_8000
-    assert ZC3201.prog_load == 0x0800_0000 and ZC3201.nandboot_alias is None
+    # ZC3201 PROG links at 0x08008000 (NOT 0x08000000 — the reveng project's
+    # wrong base, the same mistake MT made before it moved to 0x08009000), with
+    # nandboot aliased at 0x08000000 like MT so the 0x0800xxxx HAL veneers resolve.
+    assert ZC3201.prog_load == 0x0800_8000 and ZC3201.nandboot_alias == 0x0800_0000
     # prog_entry is the pre-init boot task (ROM entry), NOT the INIT-state leaf
-    # handler 0x08030e48 (which is dispatched by the pump; recorded in symbols).
-    assert ZC3201.prog_entry == 0x0802_38BC  # boot_task_main
-    assert ZC3201.symbols["state_init_power_on"] == 0x0803_0E48  # the leaf handler
-    assert ZC3201.symbols["app_init_main"] == 0x0802_36C0
-    assert ZC3201.bss_seed == (0x0800_7000, 0x2000)  # crt0-equivalent .bss zero
+    # handler (which is dispatched by the pump; recorded in symbols). All PROG
+    # addresses are the reveng values + 0x8000 (the base fix).
+    assert ZC3201.prog_entry == 0x0802_B8BC  # boot_task_main (reveng 0x0802_38BC)
+    assert ZC3201.symbols["state_init_power_on"] == 0x0803_8E48  # leaf (0x0803_0E48)
+    assert ZC3201.symbols["app_init_main"] == 0x0802_B6C0  # (reveng 0x0802_36C0)
+    assert ZC3201.symbols["irq_mask_push"] == 0x07FF_DB00  # HAL/nandboot — unshifted
+    assert ZC3201.bss_seed == (0x0800_6FE4, 0x0800_8000 - 0x0800_6FE4)  # crt0 .bss zero
     assert MT.bss_seed is None  # MT enters after crt0
     assert MT.boots_to_book and not ZC3201.boots_to_book
 
@@ -86,12 +91,15 @@ def test_detect_real_zc3201() -> None:
 @pytest.mark.skipif(ZC_PATH is None, reason="ZC3201 firmware .upd not available")
 def test_zc3201_boots_through_app_init_to_storage() -> None:
     """The unmodified ZC3201 firmware, from its real boot-task entry
-    (``boot_task_main`` 0x080238bc) with the reused MT SoC core peripherals + the
-    crt0 ``.bss`` seed, runs ``app_init_main`` → subsystem inits → MTD/storage
-    init — no demand-paging MMU, no hooks. It must clear the HAL IRQ-nesting
-    overflow guard (which the crt0 seed defuses) and reach ``mtd_extra_bitmap``.
-    Reaching book mode from here needs the ZC3201 NAND/NFC controller + image
-    (``docs/zc3201-boot-feasibility.md`` step 3).
+    (``boot_task_main`` 0x0802b8bc) loaded at the **correct base 0x08008000** with
+    the reused MT SoC core peripherals + the MT NFC/ECC/L2 storage trio, runs
+    ``app_init_main`` → subsystem inits → clock setup → MTD/storage init and drives
+    the NAND/NFC command-list sequencer — no demand-paging MMU, no hooks. It must
+    clear the HAL IRQ-nesting overflow guard (the low-RAM seed defuses it), reach
+    ``mtd_extra_bitmap``, and actually touch the NAND (the freq wall from the
+    wrong base is gone). Reaching book mode needs a valid ZC3201 NAND image +
+    the correct NAND-staging SRAM window (``docs/zc3201-boot-feasibility.md``
+    "Leg 3" resume pointer).
     """
     from collections import Counter
 
@@ -115,6 +123,9 @@ def test_zc3201_boots_through_app_init_to_storage() -> None:
     # the firmware reached storage/MTD init.
     assert "app_init" in reached, "app_init_main never entered"
     assert "mtd" in reached, "MTD/storage init (mtd_extra_bitmap) never reached"
+    # The clock wall (wrong-base garbage frequency) is gone and the firmware drove
+    # the NFC sequencer: at least one NAND read happened.
+    assert machine.nand is not None and machine.nand.reads > 0, "NFC/NAND never engaged"
     # It did NOT wedge on the HAL IRQ-nesting overflow guard (the seed defused it).
     HANG = 0x07FF_DB14
     assert hot.get(HANG, 0) == 0, "hung at irq_mask_push nesting-overflow guard"

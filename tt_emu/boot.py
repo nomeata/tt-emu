@@ -41,7 +41,7 @@ from .peripherals.audio import AudioDma
 from .peripherals.battery import BatteryAdc
 from .peripherals.gpio import GpioBlock
 from .peripherals.intc import IntcTimer
-from .peripherals.nand import EccEngine, NfcController
+from .peripherals.nand import EccEngine, L2NandBuffer, NfcController
 from .peripherals.oid import OidSensor
 from .peripherals import stubs
 from .peripherals.syscon import SysCon
@@ -240,33 +240,49 @@ def build_zc3201_machine(
     config: MachineConfig | None = None,
     *,
     profile: FirmwareProfile = ZC3201,
+    nand_image: NandImage | None = None,
 ) -> Machine:
     """Assemble a ZC3201 machine and seed it to its real boot-task entry.
 
-    The 1st-gen bring-up substrate (``docs/zc3201-boot-feasibility.md`` step 2/3).
-    Unlike the MT recipe (:func:`build_machine`), ZC3201's PROG is **identity-mapped**
-    at ``0x08000000`` so **no demand-paging MMU** is needed — the whole
-    :mod:`tt_emu.mmu_boot` layer is absent here. The SoC is the same Anyka family, so
-    the MT **core-page peripheral models are reused verbatim at the identical
-    ``0x040000xx`` addresses**: :class:`SysCon` (chip-ID/clock gate), :class:`IntcTimer`
-    (top-level IRQ + timer1), :class:`GpioBlock` and :class:`BatteryAdc`.
+    The 1st-gen bring-up substrate (``docs/zc3201-boot-feasibility.md`` "Leg 3").
+    Unlike the MT recipe (:func:`build_machine`), ZC3201 needs **no demand-paging
+    MMU** — the whole :mod:`tt_emu.mmu_boot` layer is absent here; PROG is loaded
+    **flat at its true link base ``0x08008000``** (``profile.prog_load``) so every
+    absolute reference resolves as linked (``memory-map-and-boot.md`` §1.3.1). The
+    nandboot blob is mapped at ``0x07ff8000`` **and** aliased at ``0x08000000``
+    (``profile.nandboot_alias``) exactly like MT, because PROG's HAL veneers call
+    ``0x0800xxxx`` (``= 0x07ffxxxx + 0x8000``).
 
-    Two ZC3201-specific from-entry seeds, both authentic (they reproduce state the
-    skipped boot ROM / C-runtime would have left):
+    > The load base is ``0x08008000``, not ``0x08000000``. The reveng project and
+    > the lab both used ``0x08000000`` — the same wrong-base mistake MT made before
+    > it was corrected to ``0x08009000``. At ``0x08000000`` code executes (it is
+    > PC-relative) but every absolute *data* pointer is ``0x8000`` too low; e.g. the
+    > clock code reads its CPU-frequency ``.rodata`` table through a baked pointer
+    > ``0x080251b8`` that only lands on the real table (file offset ``0x1d1b8``) when
+    > PROG sits at ``0x08008000`` — at ``0x08000000`` it aliases into
+    > ``fs_storage_mount_init``'s code and the clock-set helper spins forever on a
+    > garbage frequency. (Absolute code-pointer tables in the image resolve to valid
+    > ARM prologues 423:40 for ``0x08008000`` over ``0x08000000``.)
 
-    * ``profile.bss_seed`` — zero the low working-RAM ``.bss`` window crt0 clears, so
-      the HAL IRQ-nesting depth (``0x08007d8c``) starts at 0 rather than the PROG
-      image's stale byte (otherwise ``irq_mask_push`` ``0x07ffdb00`` trips its
-      nesting-overflow guard and hangs on the first critical section);
-    * entry at ``profile.prog_entry`` (``boot_task_main`` ``0x080238bc``) — the address
-      the boot ROM hands PROG control at.
+    The SoC is the same Anyka family, so the MT peripheral models are **reused
+    verbatim at their MT addresses**: the core page (:class:`SysCon`,
+    :class:`IntcTimer`, :class:`GpioBlock`, :class:`BatteryAdc` at ``0x040000xx``)
+    and the **storage trio** (:class:`NfcController` ``0x0404a000`` + :class:`EccEngine`
+    ``0x0405b000`` + :class:`L2NandBuffer` ``0x04010000``) serving a
+    :class:`NandImage`. The HAL's NAND-ready poll reads NFC ``+0x158`` bit31 and
+    stages command-list micro-ops at ``+0x100`` — the identical sequencer the MT NFC
+    model implements.
 
-    From here the **unmodified** firmware runs ``boot_task_main`` → ``app_init_main``
-    (``0x080236c0``) → SoC/subsystem inits → MTD/storage init. It does **not** yet
-    reach book mode: mounting the ``.gme`` needs the ZC3201 NAND/NFC controller +
-    image (step 3), which is not modelled here — the firmware currently spins in
-    calibrated storage-probe delays waiting on that hardware. No hooks: this only
-    loads, seeds and runs.
+    One ZC3201-specific from-entry seed (authentic — it reproduces state the skipped
+    boot ROM / C-runtime would have left): ``profile.bss_seed`` zeroes the low
+    working-RAM window between the nandboot alias (ends ``0x08006fe4``) and PROG
+    (``0x08008000``), where the HAL IRQ-nesting depth byte lives — otherwise
+    ``irq_mask_push`` ``0x07ffdb00`` trips its nesting-overflow guard on the first
+    critical section. (With the correct base PROG no longer clobbers this window.)
+
+    ``nand_image`` supplies the NAND backing store; a blank image is used by default
+    (the ZC3201 NFTL/FAT image builder is the remaining step — see the doc). No
+    hooks: this only loads, seeds and runs the unmodified firmware.
     """
     machine = Machine(config)
     gpio = GpioBlock()
@@ -277,6 +293,14 @@ def build_zc3201_machine(
     machine.add_peripheral(BatteryAdc())
     machine.intc = intc
 
+    # Storage trio, re-pointed verbatim from MT (same Anyka NFC/ECC/L2 registers).
+    nand = nand_image if nand_image is not None else NandImage()
+    ecc = EccEngine()
+    nfc = NfcController(nand, ecc)
+    machine.add_peripheral(nfc)
+    machine.add_peripheral(ecc)
+    machine.add_peripheral(L2NandBuffer(nfc))
+
     machine.write_bytes(profile.prog_load, firmware.prog.data)
     machine.write_bytes(profile.nandboot_load, firmware.nandboot.data)
     if profile.nandboot_alias is not None:
@@ -286,6 +310,7 @@ def build_zc3201_machine(
         machine.write_bytes(addr, b"\x00" * size)
 
     machine.set_entry_state(profile.prog_entry, SVC_STACK_TOP, CPSR_SVC_IRQS_ON)
+    machine.nand = nand
     log.info(
         "zc3201 machine for %s (%s): PROG @ %#010x, boot-task entry %#010x",
         profile.label, firmware.boot_generation, profile.prog_load, profile.prog_entry,

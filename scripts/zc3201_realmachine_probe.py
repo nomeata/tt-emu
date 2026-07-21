@@ -25,17 +25,20 @@ from tt_emu.firmware_profile import ZC3201
 from tt_emu.loader import load_upd
 from tt_emu.machine import MachineConfig
 
-#: Boot-path milestones (firmware-absolute) to report if reached.
+#: Boot-path milestones to report if reached. Addresses come from
+#: ``ZC3201.symbols`` (runtime = reveng + 0x8000; the load base is 0x08008000 —
+#: see docs/zc3201-boot-feasibility.md "Leg 3").
+_S = ZC3201.symbols
 MILESTONES = {
-    0x080236C0: "app_init_main",
-    0x08022A8C: "mtd_extra_bitmap",
-    0x080250E0: "fs_storage_mount_init",
-    0x0802B45C: "nand_disk_mount",
-    0x080040EC: "fs_open",
-    0x08001544: "event_post",
-    0x080016A8: "sm_dispatch_hierarchy",
-    0x08030E48: "state_init_power_on(leaf)",
-    0x08036454: "state_stdb_standby",
+    _S["app_init_main"]: "app_init_main",
+    _S["mtd_extra_bitmap"]: "mtd_extra_bitmap",
+    _S["fs_storage_mount_init"]: "fs_storage_mount_init",
+    _S["nand_disk_mount"]: "nand_disk_mount",
+    _S["fs_open"]: "fs_open",
+    _S["event_post"]: "event_post",
+    _S["sm_dispatch_hierarchy"]: "sm_dispatch_hierarchy",
+    _S["state_init_power_on"]: "state_init_power_on(leaf)",
+    _S["state_stdb_standby"]: "state_stdb_standby",
 }
 
 

@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Callable, Protocol
 
 if TYPE_CHECKING:
     from .mmu_boot import MmuBoot
+    from .nand_image import NandImage
 
 __all__ = ["Machine", "MachineConfig", "RunResult"]
 
@@ -257,6 +258,8 @@ class Machine:
         #: the page table (the firmware maps many globals to non-identity frames); DMA and
         #: raw physical access use :meth:`read_phys` / :meth:`read_bytes` instead.
         self.mmu: MmuBoot | None = None
+        #: The NAND backing store (set by the machine builder, for inspection).
+        self.nand: NandImage | None = None
 
         self._peripherals: list[Peripheral] = []
         self._ticking: list[Peripheral] = []  # peripherals that override tick()
