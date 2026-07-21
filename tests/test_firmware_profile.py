@@ -51,6 +51,10 @@ def test_profile_load_layout_distinct() -> None:
     # (MT's 2-KiB large page). MT has no such seed (its real boot populates it).
     assert MT.nandboot_geom_seed is None
     assert ZC3201.nandboot_geom_seed == (0x0800_6FA0, bytes([2, 1, 0, 0]))
+    # The nandboot system-bin shift globals (skipped nandboot init): log2(512)=9,
+    # log2(32)=5, plane factor 2. MT's real boot populates them (Leg 16).
+    assert MT.nandboot_shift_seed is None
+    assert ZC3201.nandboot_shift_seed == (0x0800_75A2, bytes([9, 5, 2]))
     # Per-generation hardware: the L2 NAND-staging SRAM window and the SoC chip-ID.
     assert MT.nand_sram_window == 0x0800_6800 and ZC3201.nand_sram_window == 0x0800_5800
     assert MT.soc_chip_id == 0x3039_3031 and ZC3201.soc_chip_id == 0x3332_3931
@@ -220,3 +224,49 @@ def test_zc3201_fatlib_mount_completes() -> None:
     assert machine.stop_reason is not None and "SYS_EXIT" not in machine.stop_reason, (
         f"firmware aborted via SYS_EXIT: {machine.stop_reason!r}"
     )
+
+
+@pytest.mark.skipif(ZC_PATH is None, reason="ZC3201 firmware .upd not available")
+def test_zc3201_codepage_index_reaches_statechart() -> None:
+    """Past the mount, ``app_init`` loads the ``codepage`` bin through the nandboot
+    boot-file loader and reaches the statechart INIT leaf + the event pump (Leg 16).
+
+    The loader (``FUN_0x08000868``, via ``FUN_0x08000dcc``) ``strcmp``-searches an
+    on-media system-bin index for ``codepage``; an empty index is a fatal ``b .``
+    spin at ``0x08000944``. :func:`build_zc3201_nand_image` now lays that index
+    (header p30, records p29, block map + content) and :func:`build_zc3201_machine`
+    seeds the nandboot shift globals, so the load succeeds and ``app_init`` reaches
+    ``state_init_power_on`` ``0x08038e48`` (the statechart INIT leaf) and the OID/GME
+    event dispatch ``0x0803629c`` — the event pump is live.
+
+    Assert: (1) no not-found spin at ``0x08000944``; (2) ``state_init_power_on`` is
+    reached; (3) the event pump runs (``gme_oid_dispatch`` dispatched at least once).
+    """
+    from tt_emu.boot import build_zc3201_machine
+    from tt_emu.loader import load_upd
+    from tt_emu.machine import MachineConfig
+
+    fw = load_upd(str(ZC_PATH))
+    machine = build_zc3201_machine(fw, MachineConfig(instructions_per_tick=20_000))
+
+    hit = {"spin": False, "init": 0, "dispatch": 0}
+
+    def on_spin(m: object) -> None:
+        hit["spin"] = True
+        machine.request_stop("nandboot codepage not-found spin (index missing)")
+
+    def on_init(m: object) -> None:
+        hit["init"] += 1
+
+    def on_dispatch(m: object) -> None:
+        hit["dispatch"] += 1
+
+    machine.on_code(0x0800_0944, on_spin)   # loader not-found self-spin
+    machine.on_code(0x0803_8E48, on_init)   # state_init_power_on (statechart INIT leaf)
+    machine.on_code(0x0803_629C, on_dispatch)  # gme_oid_dispatch (event pump)
+
+    machine.run(300_000_000)
+
+    assert not hit["spin"], "nandboot codepage lookup spun — the system-bin index is missing/wrong"
+    assert hit["init"] >= 1, "app_init did not reach state_init_power_on (statechart INIT leaf)"
+    assert hit["dispatch"] >= 1, "event pump did not dispatch (gme_oid_dispatch never reached)"

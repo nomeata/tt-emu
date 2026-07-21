@@ -359,6 +359,15 @@ def build_zc3201_machine(
                 geom_bytes,
             )
 
+    if profile.nandboot_shift_seed is not None:
+        # Seed the nandboot system-bin shift globals (log2 page/block + plane
+        # factor) the skipped nandboot init would derive from the device geometry;
+        # the boot-file loader (FUN_0x08000868) needs them to walk a system file's
+        # block map (they read 0 from-entry). See FirmwareProfile.nandboot_shift_seed
+        # and docs/zc3201-boot-feasibility.md "Leg 16".
+        shift_addr, shift_bytes = profile.nandboot_shift_seed
+        machine.write_bytes(shift_addr, shift_bytes)
+
     if profile.nand_dev_geometry is not None:
         # Seed the MtdLib device-geometry struct the skipped nandboot chip-detect
         # (READ-ID -> flash_ic decode) would have written — the ZC3201 analogue of

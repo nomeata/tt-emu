@@ -71,12 +71,40 @@ ZC_TOTAL_PAGES = ZC_NBLOCKS * ZC_PAGES_PER_BLOCK
 #: "64 reserve blocks"). The whole-disk map spans blocks ``[ZC_RESERVE_BLOCKS, 2048)``.
 ZC_RESERVE_BLOCKS = 64
 
-#: The FS-info superblock lives at the **last page of block 0** (``dev+0x14-1`` = 31),
-#: with redundant copies at pages 29/30 (``disk_sector_io`` ``0x0802f694`` reads the
-#: last three pages of block 0).
+#: The FS-info superblock lives at the **last page of block 0** (``dev+0x14-1`` = 31).
+#: The mount only requires the superblock at page 31 (pages 29/30 are used by the
+#: nandboot system-bin index below — Leg 16).
 SUPERBLOCK_BLOCK = 0
-SUPERBLOCK_PAGES = (29, 30, 31)
+SUPERBLOCK_PAGES = (31,)
 SHIFT = 9  #: log2(512) — the page/sector shift the mount reads at ``buf+8``.
+
+#: The nandboot **system-bin file index** the boot-file loader (``FUN_0x08000868``,
+#: called by ``app_init``'s ``FUN_0x08000dcc``) reads raw from block 0 (Leg 16):
+#:
+#: * page **30** = the index **header**: ``+0x04`` = record count, ``+0x08`` = the
+#:   bin region's start block, ``+0x0c`` = its block count.
+#: * page **29** = the **records**, one ``0x24``-byte entry per bin: ``+0x00`` =
+#:   size in **512-B sectors** (like MT's ``_bin_entries_payload``), ``+0x08`` =
+#:   the abs-page of that bin's **block map**, ``+0x14`` = NUL-terminated name
+#:   (``strcmp``-matched; a miss is a fatal ``b .`` spin at ``0x08000944``).
+#: * each bin's **block map** (at ``record+0x08``) is a ``{u16 origin, u16 backup}``
+#:   array indexed by logical block; the loader reads content page ``phys·32 +
+#:   (pageidx & 31)`` from ``origin``.
+#:
+#: The loader needs the nandboot shift globals seeded (``nandboot_shift_seed``).
+#: ``codepage`` is placed; its load lets ``app_init`` reach the statechart INIT
+#: leaf ``state_init_power_on`` ``0x08038e48`` and the event pump. ``font_lib`` /
+#: ``ImageRes`` (requested later, in book mode) are not yet placed.
+SYS_INDEX_HEADER_PAGE = 30
+SYS_INDEX_RECORDS_PAGE = 29
+#: Block-map pages live in block 0's free pages (BBT is pages 0..3; 29/30/31 are
+#: the index/superblock), one per placed bin.
+SYS_MAPLIST_PAGE0 = 4
+#: The system bins' content lands in the **A: reserve** (even blocks ``[2, 128)``,
+#: which the MtdLib map never assigns — A: data starts at physical block 128), so
+#: it collides with neither FAT volume. Logical bin block ``L`` → physical block
+#: ``SYS_CONTENT_BLOCK0 + 2·L``.
+SYS_CONTENT_BLOCK0 = 2
 
 #: The on-media **bad-block table (BBT)**. The map-table build gates its OOB scan
 #: (``FUN_0802edb8`` ``0x0802edb8``) on a per-page bad-block check (``dev+0x40`` =
@@ -220,6 +248,43 @@ def _place_volume(img: NandImage, volume: bytes, partition: int) -> int:
     return nblocks
 
 
+def _lay_system_bin_index(img: NandImage, bins: list[tuple[str, bytes]]) -> None:
+    """Lay the nandboot system-bin file index (header p30, records p29, block maps
+    + content) so the boot-file loader finds and reads each ``(name, data)`` bin.
+
+    See :data:`SYS_INDEX_HEADER_PAGE`. Each bin's content is placed on the A:
+    reserve even blocks; the record's size is in 512-B sectors and its block map
+    lists the physical origin block per logical block.
+    """
+    base = SUPERBLOCK_BLOCK * ZC_PAGES_PER_BLOCK
+    recs = bytearray(ZC_PAGE)
+    maplist_page = SYS_MAPLIST_PAGE0
+    content_block = SYS_CONTENT_BLOCK0
+    for i, (name, data) in enumerate(bins):
+        nblocks = max(1, (len(data) + ZC_BLOCK - 1) // ZC_BLOCK)
+        rec = i * 0x24
+        struct.pack_into("<I", recs, rec + 0x00, len(data) // ZC_PAGE)  # size in sectors
+        struct.pack_into("<I", recs, rec + 0x08, maplist_page)          # abs-page of block map
+        enc = name.encode("ascii")
+        recs[rec + 0x14 : rec + 0x14 + len(enc)] = enc
+        # Block map: {u16 origin, u16 backup} per logical block, origin = physical.
+        ml = bytearray(ZC_PAGE)
+        for L in range(nblocks):
+            phys = content_block + 2 * L
+            struct.pack_into("<HH", ml, L * 4, phys, phys)
+            img.place(phys * ZC_BLOCK, data[L * ZC_BLOCK : (L + 1) * ZC_BLOCK])
+        _place_page(img, maplist_page, ml, struct.pack("<I", 0x1234_5678))
+        maplist_page += 1
+        content_block += 2 * nblocks
+    _place_page(img, base + SYS_INDEX_RECORDS_PAGE, recs, struct.pack("<I", 0x1234_5678))
+
+    hdr = bytearray(ZC_PAGE)
+    struct.pack_into("<I", hdr, 0x04, len(bins))                 # record count
+    struct.pack_into("<I", hdr, 0x08, SYS_CONTENT_BLOCK0)        # bin region start block
+    struct.pack_into("<I", hdr, 0x0C, content_block)             # region block span
+    _place_page(img, base + SYS_INDEX_HEADER_PAGE, hdr, struct.pack("<I", 0x1234_5678))
+
+
 def build_zc3201_nand_image(
     firmware: object,
     *,
@@ -279,5 +344,11 @@ def build_zc3201_nand_image(
     # FAT volumes on the mapped physical blocks (A: partition 0, B: partition 1).
     _place_volume(img, bytes(vol_a.data), partition=0)
     _place_volume(img, bytes(vol_b.data), partition=1)
+
+    # nandboot system-bin index: place ``codepage`` so app_init's boot-file loader
+    # finds it (else a fatal spin at 0x08000944) and reaches the statechart (Leg 16).
+    codepage = getattr(firmware, "codepage", None)
+    if codepage is not None:
+        _lay_system_bin_index(img, [("codepage", bytes(codepage.data))])
 
     return img

@@ -985,3 +985,107 @@ seed wiring, and the `machine._on_intr` ARM `SYS_EXIT` clean-stop. Tests:
 `test_profile_load_layout_distinct` (the seed field) + `test_zc3201_fatlib_mount_completes`
 (divisor never zero, boot past the mount into the post-mount lookup, no `SYS_EXIT`). Probe:
 `scripts/zc3201_heap_probe.py`.
+
+## Leg 16 — the nandboot system-bin index is cracked; `app_init` reaches the statechart INIT leaf + the event pump
+
+The Leg-15 wall (`codepage` boot-file lookup → fatal spin `0x08000944`) is **passed**.
+The unmodified firmware now loads the `codepage` bin through the nandboot boot-file
+loader and runs on into the statechart INIT leaf (`state_init_power_on` `0x08038e48`,
+reached once) **and the OID/GME event dispatch** (`gme_oid_dispatch` `0x0803629c`,
+dispatched repeatedly) — the event pump is live.
+
+### The nandboot boot-file loader, fully RE'd (all Proven, disasm + live-instrumented)
+
+`app_init` loads three named system bins via `FUN_0x08000dcc` → the loader
+`FUN_0x08000868`:
+
+* callers (in PROG): `0x0802ced8` **`codepage`** (`max=8` blocks), `0x0802cf78`
+  **`font_lib`** (`max=0x14`), `0x0802d030` **`ImageRes`** (`max=0x32`). Only
+  `codepage` is requested before the pump; the codepage-load function `0x0802ce94`'s
+  caller (`0x0802b870`) **ignores its result**, so a load failure is non-fatal — but a
+  **not-found `strcmp` miss is a fatal `b .` spin** at `0x08000944`, so every requested
+  name needs an index record.
+* **on-media index** (read *raw* via the nandboot bulk reader `func_0x080028b0`, same
+  addressing as `_place_page`): **block 0, page 30 = header** (`+0x04` record count,
+  `+0x08` bin-region start block, `+0x0c` block span); **page 29 = records**, one
+  `0x24`-byte entry per bin: `+0x00` = size in **512-B sectors** (exactly MT's
+  `_bin_entries_payload`), `+0x08` = the **abs-page of that bin's block map**, `+0x14` =
+  NUL-terminated name. This is the small-page twin of MT's `build_nand_image` bin index
+  (rows 253/254 there); it is **not** the FAT directory.
+* **block map** (at `record+0x08`): `{u16 origin, u16 backup}` per logical block;
+  `FUN_0x08000cd0` reads content page `origin·32 + (pageidx & 31)`.
+* **shift globals** `0x080075a2..a4` (nandboot descriptor `0x080070e0 + 0x4c2..4c4`):
+  `log2(page)=9`, `log2(pages/block)=5`, plane factor `dev+0xc=2`. The nandboot init
+  `FUN_0x08001160` derives these from the device geometry, but that init is **skipped**
+  from-entry, so they read **0** and the loader's per-page math collapses — the same
+  skipped-seed class as `nandboot_geom_seed`.
+
+### Fix (landed, product)
+
+* **`FirmwareProfile.nandboot_shift_seed = (0x080075a2, bytes([9,5,2]))`** (+ MT `None`);
+  `boot.build_zc3201_machine` writes it after loading nandboot (in the `bss_seed`
+  window, so after that zero).
+* **`build_zc3201_nand_image` lays the system-bin index** (`_lay_system_bin_index`):
+  header p30, records p29, one block map per bin in block 0's free pages, and the
+  `codepage` content on the **A: reserve even blocks `[2,128)`** (which the MtdLib map
+  never assigns, so no FAT collision). The superblock now sits at page **31 only**
+  (pages 29/30 are the index; the mount only needs 31 — verified).
+
+**Verified** (`test_zc3201_codepage_index_reaches_statechart`): no not-found spin;
+`state_init_power_on` reached; `gme_oid_dispatch` dispatched. MT unregressed.
+
+### OPEN — the size-unit / block-unit contradiction (record `codepage`)
+
+`codepage` is `0xd6ccc` B = **54** 16-KiB blocks, but its load site passes **`max=8`**
+blocks (`0x0802ced8`, `mov r2,#8`); the caller's `W1:` guard fails a bin whose
+`size >> log2(page·pages_per_block=16384)` exceeds `max`. So the record size **cannot**
+be in bytes (`54 > 8` → `W1` → return 0). Using **sectors** (`len//512`, MT's format)
+makes `W1` pass (`1719 >> 14 = 0`), which is what lets the boot proceed — **but** with
+the authentic shift `[0x4c2]=9` the content walk `FUN_0x08000cd0` then reads only
+`1+(1719-1)>>9 = 4` pages, i.e. the codepage load is **partial**. The two consumers want
+different units under the same geometry: `W1` wants ~128-KiB blocks (`max=8` ⇒ codepage
+≤ 8 blocks), the content walk wants bytes. This points at either (a) the nandboot loader
+expecting a **128-KiB block unit** (`dev+0x14`=256) distinct from MtdLib's 16-KiB view —
+needs the dev-geometry question resolved — or (b) ZC3201's real nandboot codepage being a
+**smaller file** than `Firmware.codepage` (the container's `+0x38/+0x3c` system-bin table
+declares only `PROG`+`codepage`, both at the full sizes; `font_lib`/`ImageRes` are **not**
+in the container — their content source is unknown, likely the producer format). Reaching
+the pump does not need the full codepage; **book-mode rendering / UTF-16 path conversion
+likely will** (cf. MT's "garbled codepage" symptom), so this is the first thing to nail in
+the next leg if book mode misbehaves.
+
+### Leg 16 resume pointer — drive the pump → standby → book → GME play
+
+The unmodified firmware boots through the complete mount **and** the codepage boot-file
+load into `state_init_power_on` `0x08038e48` and the live event pump (`gme_oid_dispatch`
+`0x0803629c`). **Standby was not yet observed** at the corresponded addresses
+(`state_stdb_standby` ZC `0x0803e454`; the real standby SM is `FUN_08036f7c` per
+`correspondences.tsv`) — the pump runs but the statechart did not visibly transition
+INIT → standby in a 300 M-insn window; the terminal PC parks in a nandboot leaf
+(`0x08000018`), likely a NAND/audio read in the pump.
+
+**Next steps, precise:**
+1. **Confirm/instrument standby.** Build a ZC3201 `firmware.mt`-style debugger (AO
+   struct + event ring + statechart leaf) via `FirmwareProfile` symbols +
+   `correspondences.tsv` (`state_init_power_on` ZC `0x08038e48`, `state_stdb_standby`
+   ZC `0x0803e454`/`0x08036f7c`, `gme_oid_dispatch` `0x0803629c`). Find why INIT→standby
+   does/does not fire (does the pump need a timer/OID event injected, as MT's driver
+   does?). **Lean on MT as the direct template** — the pump/OID/audio are shared.
+2. **OID tap → book mode → GME play.** Mirror how tt-emu drives MT from standby: the pump
+   loop, the OID-tap event injection (`BootedMachine.tap`/`OidSensor`), book mode, the GME
+   interpreter on a tapped OID. Re-point addresses via the profile; the `.gme` is on B:.
+3. If book-mode rendering breaks, **resolve the codepage size-unit/geometry contradiction**
+   above (and add `font_lib`/`ImageRes` records — a not-found on either spins).
+4. **Parametrise `tests/test_scripting.py`** (+ the other gme-based tests) over both
+   firmwares; core GME-interpreter/OID-tap/play tests must pass on both.
+
+**State now:** the unmodified firmware boots through the complete MtdLib + FatLib mount of
+both partitions, loads the `codepage` system bin via the nandboot boot-file loader, and
+reaches the statechart INIT leaf `state_init_power_on` `0x08038e48` and the live event pump
+(`gme_oid_dispatch` `0x0803629c`). Product changes this leg:
+`FirmwareProfile.nandboot_shift_seed` (+ ZC3201 value), the `boot.build_zc3201_machine`
+seed wiring, and `build_zc3201_nand_image`'s `_lay_system_bin_index` (superblock moved to
+page 31 only). Tests: `test_profile_load_layout_distinct` (the new seed field) +
+`test_zc3201_codepage_index_reaches_statechart` (no spin; INIT leaf + pump reached). The
+open blocker is the codepage size-unit/block-unit contradiction (does not block the pump;
+may block book-mode rendering).

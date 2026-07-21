@@ -216,6 +216,20 @@ class FirmwareProfile:
     #: real boot populates it (MT). Seeded after the nandboot image is loaded.
     nandboot_geom_seed: tuple[int, bytes] | None = None
 
+    #: ``(addr, bytes)`` of the nandboot **system-bin shift globals** the skipped
+    #: chip-detect (nandboot init ``FUN_0x08001160``) derives from the device
+    #: geometry — three consecutive bytes in the nandboot descriptor struct
+    #: (``0x080070e0 + 0x4c2``): ``+0x4c2`` = ``log2(page_size)``, ``+0x4c3`` =
+    #: ``log2(pages_per_block)``, ``+0x4c4`` = the plane/interleave factor
+    #: (``dev+0xc``). The nandboot **boot-file loader** (``FUN_0x08000868`` →
+    #: ``FUN_0x08000cd0``) uses these to walk a system file's block map. From-entry
+    #: they read **0** (the init that would set them is skipped), so the loader's
+    #: per-page arithmetic collapses. ZC3201's K9F5608 (512-B page, 32 pages/block,
+    #: 2 planes) → ``(9, 5, 2)``. ``None`` for firmwares whose real boot populates
+    #: them (MT). Seeded after the nandboot image is loaded — see
+    #: ``docs/zc3201-boot-feasibility.md`` "Leg 16".
+    nandboot_shift_seed: tuple[int, bytes] | None = None
+
     #: Addresses to drive this generation's ``producer.bin`` to format a NAND
     #: image (:mod:`tt_emu.nand_provision`); ``None`` until reverse-engineered.
     producer: ProducerProfile | None = None
@@ -363,6 +377,10 @@ ZC3201 = FirmwareProfile(
     # 512-byte-page K9F5608 reads 1 (byte +0 = 2 is already correct in the image
     # and is kept). See nandboot_geom_seed.
     nandboot_geom_seed=(0x0800_6FA0, bytes([2, 1, 0, 0])),
+    # nandboot system-bin shift globals 0x080075a2..a4: log2(512)=9, log2(32)=5,
+    # plane factor dev+0xc=2. The nandboot boot-file loader needs these to walk a
+    # system file's block map; from-entry they read 0. See nandboot_shift_seed.
+    nandboot_shift_seed=(0x0800_75A2, bytes([9, 5, 2])),
     boots_to_book=False,
     symbols={
         # HAL / FSLib (names.csv, lab hook points) — reveng PROG addrs + 0x8000
