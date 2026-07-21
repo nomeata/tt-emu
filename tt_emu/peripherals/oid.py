@@ -98,16 +98,36 @@ class OidSensor(Peripheral):
 
     name = "oid"
 
-    def __init__(self, gpio: GpioBlock, *, answer_status_polls: bool = False) -> None:
+    def __init__(
+        self,
+        gpio: GpioBlock,
+        *,
+        answer_status_polls: bool = False,
+        pin_clock: int = PIN_CLOCK,
+        pin_data: int = PIN_DATA,
+        bit_count_addr: int = BIT_COUNT_ADDR,
+    ) -> None:
         """``answer_status_polls`` (default off): when set, the sensor answers a
         standby 32-bit status poll with the §2 status frame, completing the
         firmware's sensor **sleep handshake** (§4.2). This is the authentic idle
         behaviour but tells the pen to sleep, so it is off for tap sessions —
         held taps survive the unanswered polls via the §6 re-serve. Off is also
-        what §6 recommends ("status frames ... never needed for tap injection")."""
+        what §6 recommends ("status frames ... never needed for tap injection").
+
+        ``pin_clock`` / ``pin_data`` / ``bit_count_addr`` are the wiring, which
+        differs by pen generation (the two-wire link + capture-state address are
+        the *same protocol* on both, just on different GPIO pins / RAM bytes):
+        MT clocks on GPIO2 with data on GPIO9 and reads ``bit_count`` at
+        0x08008C09; the 1st-gen ZC3201 clocks on GPIO7 with data on GPIO16 and
+        reads ``bit_count`` at 0x08007BF9 (its nandboot OID HAL bit-bang
+        ``hal_oid_shift_in`` 0x08005D80 / poll callback 0x08005F48 — see
+        ``docs/zc3201-boot-feasibility.md`` "Leg 20"). The defaults are MT's."""
         super().__init__()
         self._gpio = gpio
         self._answer_status = answer_status_polls
+        self._pin_clock = pin_clock
+        self._pin_data = pin_data
+        self._bit_count_addr = bit_count_addr
         self._queue: deque[int] = deque()
         self._hold_oid: int | None = None
         self._state = _State.IDLE
@@ -128,9 +148,9 @@ class OidSensor(Peripheral):
         self.gameplay_frames_served = 0
         #: Status frames consumed by a 32-bit poll (sleep handshakes answered).
         self.status_frames_served = 0
-        gpio.watch_output(PIN_CLOCK, self._on_clock)
-        gpio.watch_direction(PIN_DATA, self._on_data_dir)
-        self._gpio.set_input(PIN_DATA, 1)  # bus idle: data latched high (§3.1)
+        gpio.watch_output(pin_clock, self._on_clock)
+        gpio.watch_direction(pin_data, self._on_data_dir)
+        self._gpio.set_input(self._pin_data, 1)  # bus idle: data latched high (§3.1)
 
     # --- headless API ------------------------------------------------------------------
 
@@ -174,7 +194,7 @@ class OidSensor(Peripheral):
         self._hold_oid = None
         if self._state is _State.PRE and not self._is_status and not self._queue:
             self._state = _State.IDLE
-            self._gpio.set_input(PIN_DATA, 1)
+            self._gpio.set_input(self._pin_data, 1)
             if self._status_pending:
                 self._arm_status()
 
@@ -195,7 +215,7 @@ class OidSensor(Peripheral):
         self._status_pending = False
         self._release_countdown = None
         self._served = 0
-        self._gpio.set_input(PIN_DATA, 1)
+        self._gpio.set_input(self._pin_data, 1)
 
     # --- state machine helpers -----------------------------------------------------------
 
@@ -219,7 +239,7 @@ class OidSensor(Peripheral):
         self._served = 0
         self._ack_edges = 0
         self._state = _State.PRE
-        self._gpio.set_input(PIN_DATA, 0)  # assert attention (§3.1)
+        self._gpio.set_input(self._pin_data, 0)  # assert attention (§3.1)
         log.debug("OID tap armed: %d (frame %#010x)", oid, self._frame)
 
     def _arm_status(self) -> None:
@@ -238,7 +258,7 @@ class OidSensor(Peripheral):
         self._served = 0
         self._ack_edges = 0
         self._state = _State.PRE
-        self._gpio.set_input(PIN_DATA, 0)
+        self._gpio.set_input(self._pin_data, 0)
         log.debug("OID status frame armed (sleep handshake)")
 
     def _arm_next(self) -> None:
@@ -260,7 +280,7 @@ class OidSensor(Peripheral):
             self._arm_status()
         else:
             self._state = _State.IDLE
-            self._gpio.set_input(PIN_DATA, 1)
+            self._gpio.set_input(self._pin_data, 1)
 
     # --- GPIO observers (the §6 phase advance) ---------------------------------------------
 
@@ -278,13 +298,13 @@ class OidSensor(Peripheral):
             if old == 0 and new == 1:
                 # Shift-in step "clk = 1; wait for GPIO9 == 1": the ready-ACK (§3.2).
                 self._state = _State.ACK
-                self._gpio.set_input(PIN_DATA, 1)
+                self._gpio.set_input(self._pin_data, 1)
         elif state is _State.ACK:
             if old == 1 and new == 0:
                 # A trigger pulse (§3.4) ended without the host ACK — the frame
                 # would strand with attention high (§6 "Timing"); re-assert it.
                 self._state = _State.PRE
-                self._gpio.set_input(PIN_DATA, 0)
+                self._gpio.set_input(self._pin_data, 0)
         elif state is _State.HOST_ACK:
             self._ack_edges += 1
             if self._ack_edges > _HOST_ACK_MAX_EDGES:
@@ -317,7 +337,7 @@ class OidSensor(Peripheral):
                     self._begin_bits()
                 else:  # was a command after all — keep the frame armed
                     self._state = _State.PRE
-                    self._gpio.set_input(PIN_DATA, 0)
+                    self._gpio.set_input(self._pin_data, 0)
             elif self._state is _State.COMMAND:
                 self._rearm_or_idle()
 
@@ -330,18 +350,18 @@ class OidSensor(Peripheral):
     def _read_bit_count(self) -> int:
         """The firmware's own ``bit_count`` at ``0x08008C09`` — 23 or 32 (§4/§6)."""
         if self.machine is not None:
-            value = self.machine.read_u8(BIT_COUNT_ADDR)
+            value = self.machine.read_u8(self._bit_count_addr)
             if value in (23, 32):
                 return value
             log.warning("OID: unexpected bit_count %#x at %#x; assuming 23",
-                        value, BIT_COUNT_ADDR)
+                        value, self._bit_count_addr)
         return 23
 
     def _serve_bit(self) -> None:
         """Present the next frame bit for the firmware's clock-low sample (§3.2)."""
         if self._served < self._bit_count:
             bit = (self._frame >> (FRAME_BITS - 1 - self._served)) & 1
-            self._gpio.set_input(PIN_DATA, bit)
+            self._gpio.set_input(self._pin_data, bit)
             self._served += 1
             if self._served == self._bit_count:
                 # Last bit is on the line; the firmware reads it a few
@@ -350,7 +370,7 @@ class OidSensor(Peripheral):
         else:
             # Clocked past the frame — should not happen; serve idle-high.
             log.warning("OID: clocked past %d frame bits", self._bit_count)
-            self._gpio.set_input(PIN_DATA, 1)
+            self._gpio.set_input(self._pin_data, 1)
 
     def _finalize_serve(self) -> None:
         """Account a completed frame capture (tap or status)."""

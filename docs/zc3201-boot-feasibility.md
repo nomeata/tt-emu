@@ -1386,3 +1386,104 @@ So the concrete next-leg tasks: (a) disasm the ZC3201 nandboot to find the `hal_
 variant (pins + `bit_count` addr) and wire it into `build_zc3201_machine` + a `tap()` API; (d) tap →
 `0x1060` → `game_reading_sm_dispatch 0x0805cbd4` → `game_play_oid_voice 0x0805c730` → capture at
 `voice_play_sample 0x0809f068` entry; (e) parametrise `tests/test_scripting.py` over both firmwares.
+
+## Leg 20 — the ZC3201 OID sensor is RE'd, modelled and WIRED; a tap is captured + dispatched. New wall = game discovery / launch (not the sensor)
+
+The Leg-19 wall — "`build_zc3201_machine` wires no `OidSensor`" — is **solved**. The entire
+1st-gen OID capture HAL was reverse-engineered from the nandboot blob (disasm-cited below),
+a profile-driven `OidSensor` variant was wired in, and the unmodified firmware now captures a
+tapped OID and dispatches its event into the statechart. All findings Proven (disasm +
+live-instrumented run; `scripts/zc3201_oid_probe.py`, `scripts/zc3201_oid_trace.py`).
+
+### The ZC3201 OID HAL (nandboot, all in the `0x08000000` alias view)
+
+The 1st-gen sensor is the **same two-wire bit-bang protocol** as MT (same Anyka family), on
+**different pins / RAM** — confirming Leg 19's prediction that MT's GPIO2/GPIO9 wiring can't be
+reused verbatim. The GPIO helpers decode to `GPIO_IN 0x040000bc`, `GPIO_OUT 0x04000080`,
+`GPIO_DIR 0x0400007c` (DIR bit **1 = input**, so `dir(pin,0)`→input / `dir(pin,1)`→output):
+
+* **`hal_oid_bus_idle` `0x08005cb0`** — rest: **GPIO16** → input (pull high), **GPIO7** → output
+  low (clock). MT's data GPIO9 is the **audio amp** on ZC3201 (`FUN_0809efa4`/`FUN_0809f538`
+  bit-bang pin 9), so the OID data line moved to **GPIO16**.
+* **`hal_oid_shift_in` `0x08005d80`** — abort unless **GPIO16 == 0** (attention); raise clock;
+  drive GPIO16 out high then low (host ACK); pulse clock; release GPIO16 to input; then clock
+  `bit_count` bits, **sampling GPIO16 in the clock-LOW phase, MSB first** (accumulator `<<1` then
+  `+bit`). Identical handshake structure to MT — the shared `OidSensor` state machine drives it.
+* **capture-state struct `0x08007bf8`**: `+0` frame_ready, **`+1` bit_count** (`0x17` = 23 on the
+  gameplay decode) — the twin of MT's `0x08008c09`.
+* **`hal_oid_timer_start` `0x08005cf0`** — arms a **40 ms** (`0x9c40` µs) repeating HAL software
+  timer, callback **`0x08005f48`**. Armed by **`state_init_power_on` (`0x08038eac`)** and the
+  **book-descent SM (`0x0803f13c`)** → so the poll runs on the path we already reach.
+* **poll callback `0x08005f48`** → **decode `0x08005eec`**: on attention, sets bit_count = 23,
+  shifts the frame in, stores **`0x400000 | oid`** to `[gb_app_context 0x0800779c + 0x40] + 8`,
+  then (`0x08005d34`, type check `& 0x600000 == 0x400000`) posts event **`0x1063`** via the
+  ring-post `0x08003c44`. `frame32(oid)` (`(0x400000|oid18)<<9 | …`) is read as its top 23 bits =
+  `0x400000|oid18`, which passes the type check — so the **MT `frame32` encoding is reused as-is**.
+
+### What landed (product; MT byte-identical via defaults — full suite 162 green)
+
+* **`OidSensor(pin_clock, pin_data, bit_count_addr)`** — the shared model (`peripherals/oid.py`)
+  is now wiring-parameterised; MT's constants are the defaults, so MT is bit-for-bit unchanged.
+* **`GpioBlock(amp_pin=…)`** — the amp-enable→`GPIO_IN` mirror pin is per-generation (MT GPIO16;
+  ZC3201 GPIO9), so it no longer clobbers ZC3201's OID data bit (GPIO16).
+* **`FirmwareProfile.oid_pin_clock/oid_pin_data/oid_bit_count_addr/gpio_amp_pin`** — ZC3201 = 7 /
+  16 / `0x08007bf9` / 9 (MT = 2 / 9 / `0x08008c09` / 16).
+* **`build_zc3201_machine`** now constructs and wires the `OidSensor` at the profile pins and
+  exposes it as `machine.oid` (`.tap`/`.hold`/`.lift` — the same API MT's `BootedMachine.tap`
+  drives). Nothing hooked: the firmware runs its own capture against the modelled GPIO.
+* **`tt_emu/firmware/zc3201.py`** — corrected the Leg-17 dispatch misattribution: `FUN_080096a8`
+  (`PC_VOICE_POLL`) is the **voice/media poll** dispatcher (object `0x08009708`, `+8` poll, `+0xc`
+  `Fwl_pfVoice_fn`), **not** the statechart event dispatch. The real event dispatch is
+  **`PC_EVENT_DISPATCH 0x080037d8`** (the pump `0x08003a84` drains ring `0x080075cc`
+  head `0x0800774c` and forwards to the QHsm handler of the current state — scheduler `0x080075a8`).
+  Added the OID HAL landmarks + `EVENT_OID_TAP 0x1063`.
+* **Tests** — `test_zc3201_oid_profile_wiring` (profile data) and
+  `test_zc3201_oid_tap_captured_and_dispatched` (end-to-end: the 40 ms poll runs in book mode, a
+  held tap is latched, `[gb_app_context+0x40]+8 == 0x400000|oid`, event `0x1063` dispatched).
+
+### Verified end to end (`scripts/zc3201_oid_probe.py` / `_trace.py`)
+
+Boot → book-mode idle: the 40 ms poll callback `0x08005f48` fires **~4700×**. `machine.oid.hold(oid)`
+→ `hal_oid_shift_in` runs once, the frame is latched (`gameplay_frames_served++`),
+`[gb_app_context+0x40]+8 == 0x400000|oid` (e.g. `0x401f81` for oid 8065), and event **`0x1063` is
+dispatched** to the app's current book-idle state handler (`0x080037d8`, event confirmed).
+
+### Leg 20 resume pointer — the tap works; the wall is game discovery / launch (+ codepage paths)
+
+The OID sensor is no longer the blocker — the firmware **receives** the tap. But the product tap
+does **not launch example.gme**; instead the book state plays a **tap-acknowledge chomp chime**
+(`play_chomp_voice` → `fs_open("A:/VOIMG/Chomp_Voice.bin")`, which fails — `VOIMG` is empty). Two
+coupled downstream walls remain, both **distinct from the OID sensor** and rooted in the
+FS/codepage layers:
+
+1. **Game discovery never enumerates the `.gme`.** Instrumenting `fs_open 0x0800c0ec` across boot
+   shows the firmware opening fixed system files — `A:/SYSTEM/profile.dat`, `B:/FLAG.bin`,
+   `B:/.tiptoi.log`, `B:/Questionstatus.txt`, `A:/African.fen` — but **never any `*.gme`**. So no
+   booklist entry for product 42 exists, and the product-OID tap finds nothing to mount (it falls
+   through to the generic chime). Trace ZC3201's book-mode game-discovery / directory-enumeration
+   (the twin of MT's B:/ `.gme` scan → booklist) and find why `build_zc3201_nand_image`'s FAT16 B:
+   (which *does* place `example.gme`) is not enumerated — likely a FAT directory-listing path the
+   small-page image or the mount does not satisfy. This is the primary wall to a GME play.
+2. **The codepage/UTF-16 path conversion (Legs 16/19) still bites some paths.** With the
+   codepage-type flag `*0x08007c4c == 1` the chomp/tap path builds **empty** (forcing simple
+   widening `*0x08007c4c = 0` yields the correct `A:/VOIMG/Chomp_Voice.bin`); yet *other* boot
+   paths (`B:/FLAG.bin`, …) convert **correctly** with the flag at 1 — so the partial codepage
+   corrupts only some conversions. Resolve Leg 16's codepage size-unit contradiction for the full
+   codepage load (authentic fix), which should make every path convert.
+
+Once a product tap mounts `example.gme` and a content tap (OID 8065) reaches the shared GME
+interpreter, capture the play at **`voice_load_and_play 0x0809f16c`** (r1 = media file offset — the
+observable the lab `gme_engine_zc3201.py` uses) or **`gme_exec_command 0x0804c6e4`**, then
+parametrise the gme-based tests over both firmwares. The tap-injection half is done and tested;
+`machine.oid.tap(oid)` is the ZC3201 equivalent of MT's `BootedMachine.tap`.
+
+**State now:** the unmodified firmware boots to book-mode idle, the modelled OID sensor's 40 ms
+poll runs, and a `machine.oid` tap is captured and dispatched into the statechart (event `0x1063`)
+— the OID sensor is fully wired and hook-free. It does **not** yet play a GME because the book
+state does not discover/launch `example.gme` (no `*.gme` enumeration) and plays a chime instead.
+The success criterion (a GME plays on a tapped ZC3201 OID; gme tests on both firmwares) is
+**not yet met**. MT unregressed (162 passed). Product changes this leg: the `OidSensor` /
+`GpioBlock` wiring params, the four `FirmwareProfile.oid_*/gpio_amp_pin` fields (+ ZC3201 values),
+the `build_zc3201_machine` OID wiring + `machine.oid`, and the `firmware/zc3201.py` dispatch
+correction + OID landmarks. Probes: `scripts/zc3201_oid_probe.py`, `scripts/zc3201_oid_trace.py`,
+`scripts/zc_nb.py` (nandboot disassembler).

@@ -154,6 +154,25 @@ class FirmwareProfile:
     #: "Leg 18"). Only the model's GPIO idle base — device overrides still win.
     gpio_in_idle: int = 0x0000_3201
 
+    #: OID sensor wiring (``tt_emu.peripherals.oid.OidSensor``): the two-wire
+    #: bit-bang link's clock/data GPIO pins and the firmware's own capture-state
+    #: ``bit_count`` byte. Same protocol on both generations, different pins/RAM:
+    #: MT clocks GPIO2 / data GPIO9 / ``bit_count`` 0x08008C09; ZC3201 clocks
+    #: GPIO7 / data GPIO16 / ``bit_count`` 0x08007BF9 (its nandboot OID HAL —
+    #: ``hal_oid_bus_idle`` 0x08005CB0, ``hal_oid_shift_in`` 0x08005D80, 40 ms
+    #: poll ``hal_oid_timer_start`` 0x08005CF0 → callback 0x08005F48, armed by
+    #: ``state_init_power_on`` (0x08038EAC) and the book-descent SM (0x0803F13C);
+    #: ``docs/zc3201-boot-feasibility.md`` "Leg 20"). ``None`` = don't wire an OID
+    #: sensor (a firmware whose OID path is not modelled yet).
+    oid_pin_clock: int = 2
+    oid_pin_data: int = 9
+    oid_bit_count_addr: int = 0x0800_8C09
+
+    #: GPIO output pin whose latch is mirrored back into GPIO_IN as the amp-enable
+    #: readback (``GpioBlock`` §1.1). MT: GPIO16; ZC3201: GPIO9 (GPIO16 there is
+    #: the OID data line, so the mirror must move or it clobbers OID data).
+    gpio_amp_pin: int = 16
+
     #: SoC chip-ID constant read at ``0x04000000`` (SysCon REG_CHIP_ID). Per-
     #: generation: 2N-MT ``0x30393031`` ("1090"), ZC3201 ``0x33323931`` ("1923").
     #: The firmware's FAT/MtdLib version gate (``fw_version_ref`` 0x0802c880 /
@@ -368,6 +387,10 @@ ZC3201 = FirmwareProfile(
     bss_seed=(0x0800_6FE4, 0x0800_8000 - 0x0800_6FE4),
     nand_sram_window=0x0800_5800,  # L2 buffer 4 (base 0x08005000 + 4·0x200)
     gpio_in_idle=0x0000_3200,  # bit0 (battery-OK comparator) idles released on ZC3201
+    oid_pin_clock=7,           # nandboot hal_oid_shift_in clocks GPIO7
+    oid_pin_data=16,           # ...and samples data/attention on GPIO16 (MT: GPIO9)
+    oid_bit_count_addr=0x0800_7BF9,  # capture-state struct 0x08007bf8, bit_count +1
+    gpio_amp_pin=9,            # ZC3201 audio amp is GPIO9 (frees GPIO16 for OID data)
     soc_chip_id=0x3332_3931,  # "1923" — the ZC3201 SoC chip-ID (FS version gate)
     nand_small_page=True,     # Samsung K9F5608: 512-B page + 16-B OOB, 32 pages/block
     nand_page_size=512,

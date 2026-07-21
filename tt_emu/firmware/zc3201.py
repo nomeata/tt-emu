@@ -61,9 +61,39 @@ AO_PTR_GLOBAL = 0x0800_9708
 AO_STATE_HANDLER_OFF = 0xC
 
 #: Statechart / pump landmark PCs.
-PC_SM_DISPATCH = 0x0800_96A8         # sm_dispatch_hierarchy (per-event)
-PC_RING_DRAIN = 0x0800_3A84          # nandboot event-ring drain loop
+PC_RING_DRAIN = 0x0800_3A84          # nandboot event-ring drain loop (the pump)
+#: The QF event dispatch: the pump (``PC_RING_DRAIN``) drains one event from the
+#: ring (base ``0x080075CC``, head ``0x0800774C`` / tail ``0x0800774E``, & 0x1f)
+#: and calls this with ``r0`` = event id — it forwards to the QHsm handler chain
+#: (``0x080036E0``) of the app's current state (scheduler ``0x080075A8``: current
+#: state index ``[[+0x14]]`` into the handler table ``[+0x18]``). This — not
+#: ``PC_VOICE_POLL`` — is where a tapped OID's event ``0x1063`` is delivered
+#: (``docs/zc3201-boot-feasibility.md`` "Leg 20").
+PC_EVENT_DISPATCH = 0x0800_37D8
+#: The voice/media poll dispatcher the pump *also* calls every iteration
+#: (``FUN_080096A8``): it polls the voice object ``0x08009708`` (``+8`` poll
+#: method) and, on a nonzero result, calls its completion callback
+#: (``+0xc`` = ``Fwl_pfVoice_fn`` ``0x0809EDA4``). It is the idle-loop voice
+#: poll, **not** the statechart event dispatch (a Leg-17 misattribution
+#: corrected in Leg 20); still a useful "pump alive" landmark.
+PC_VOICE_POLL = 0x0800_96A8
+PC_SM_DISPATCH = PC_VOICE_POLL        # back-compat alias (was mislabelled)
 PC_TIMER_TICK = 0x0800_6D38          # HAL software-timer tick (per 20 ms IRQ)
+
+#: OID sensor nandboot HAL (Leg 20). The two-wire bit-bang: clock GPIO7, data /
+#: attention GPIO16, capture-state struct ``0x08007BF8`` (``+1`` = ``bit_count``,
+#: ``0x17`` = 23 on the gameplay decode). ``hal_oid_timer_start`` arms the 40 ms
+#: repeating poll (callback ``PC_OID_POLL_CB``), armed by the INIT leaf
+#: (``0x08038EAC``) and the book-descent SM (``0x0803F13C``); the callback shifts
+#: an armed frame in (``PC_OID_SHIFT_IN``), stores ``0x400000|oid`` to
+#: ``[gb_app_context+0x40]+8``, and posts event ``0x1063``.
+PC_OID_TIMER_START = 0x0800_5CF0
+PC_OID_POLL_CB = 0x0800_5F48
+PC_OID_DECODE = 0x0800_5EEC
+PC_OID_SHIFT_IN = 0x0800_5D80
+OID_CAPTURE_STATE = 0x0800_7BF8
+OID_BIT_COUNT = 0x0800_7BF9
+EVENT_OID_TAP = 0x1063
 
 #: The statechart state handlers, by their entry PC (the leaf observable).
 STATE_HANDLERS: dict[int, str] = {
@@ -82,6 +112,7 @@ EVENT_NAMES: dict[int, str] = {
     0x0030: "sw-timer tick",
     0x1001: "init-after-transition",
     0x1015: "mode/launch",
+    0x1063: "OID tap",
     0x1065: "resume-timer",
 }
 

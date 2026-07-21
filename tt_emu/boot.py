@@ -288,7 +288,7 @@ def build_zc3201_machine(
     hooks: this only loads, seeds and runs the unmodified firmware.
     """
     machine = Machine(config)
-    gpio = GpioBlock(in_idle=profile.gpio_in_idle)
+    gpio = GpioBlock(in_idle=profile.gpio_in_idle, amp_pin=profile.gpio_amp_pin)
     # ZC3201's timer ISR (nandboot 0x08003d6c) acks the top-level line-10 status
     # (0xCC) before reading the second-level timer-fired bit (0x4C bit17) that
     # gates the HAL software-timer tick; decouple the two latches so the tick —
@@ -388,8 +388,22 @@ def build_zc3201_machine(
         dev_addr, geom = profile.nand_dev_geometry
         machine.write_bytes(dev_addr, geom)
 
+    # OID sensor: the two-wire bit-bang link, re-pointed to the ZC3201 pins /
+    # capture-state byte (profile.oid_*). The firmware's own nandboot OID HAL
+    # (hal_oid_shift_in 0x08005d80, 40 ms poll callback 0x08005f48 armed at the
+    # INIT leaf + book descent) clocks the frame out through the modelled GPIO
+    # handshake and posts the tap event into the statechart — nothing hooked.
+    oid = OidSensor(
+        gpio,
+        pin_clock=profile.oid_pin_clock,
+        pin_data=profile.oid_pin_data,
+        bit_count_addr=profile.oid_bit_count_addr,
+    )
+    machine.add_peripheral(oid)
+
     machine.set_entry_state(profile.prog_entry, SVC_STACK_TOP, CPSR_SVC_IRQS_ON)
     machine.nand = nand
+    machine.oid = oid
     log.info(
         "zc3201 machine for %s (%s): PROG @ %#010x, boot-task entry %#010x",
         profile.label, firmware.boot_generation, profile.prog_load, profile.prog_entry,

@@ -72,8 +72,16 @@ class GpioBlock(WordRegisterPeripheral):
     name = "gpio"
     base = 0x0400_0000
 
-    def __init__(self, in_idle: int = GPIO_IN_IDLE) -> None:
+    def __init__(self, in_idle: int = GPIO_IN_IDLE,
+                 amp_pin: int = PIN_AMP_ENABLE) -> None:
         super().__init__()
+        #: The output-latch pin whose level is mirrored back into GPIO_IN so the
+        #: firmware can read the amp-enable state (§1.1). MT's amp enable is
+        #: GPIO16; the 1st-gen ZC3201's amp is GPIO9 (its nandboot audio HAL
+        #: bit-bangs pin 9), and GPIO16 there is instead the OID sensor's data
+        #: line — so the mirror pin must be per-generation or it clobbers the
+        #: OID data bit. See ``docs/zc3201-boot-feasibility.md`` "Leg 20".
+        self._amp_pin = amp_pin
         #: Composite idle GPIO_IN word. MT's retail idle is 0x3201; the
         #: 1st-gen ZC3201 differs in bit0 (a battery-OK comparator that reads
         #: released/0 at idle — MT sets it, ZC3201 does not). Its standby state
@@ -237,8 +245,8 @@ class GpioBlock(WordRegisterPeripheral):
             for pin, level in self._in_overrides.items():
                 word = (word & ~(1 << pin)) | (level << pin)
             # bit16 mirrors the amp-enable output latch (§1.1).
-            word = (word & ~(1 << PIN_AMP_ENABLE)) | (
-                self.out_level(PIN_AMP_ENABLE) << PIN_AMP_ENABLE
+            word = (word & ~(1 << self._amp_pin)) | (
+                self.out_level(self._amp_pin) << self._amp_pin
             )
             self._in_word = word
         return word
@@ -290,7 +298,7 @@ class GpioBlock(WordRegisterPeripheral):
         super().write_reg(offset, value)
         if offset == GPIO_OUT0 and old != value:
             self._notify(self._out_watchers, old, value)
-            if (old ^ value) & (1 << PIN_AMP_ENABLE):
+            if (old ^ value) & (1 << self._amp_pin):
                 self._invalidate_in()  # bit16 mirrors the amp-enable latch (§1.1)
             if (self._boot_power_button and self.machine is not None
                     and self.machine.ram_page_active

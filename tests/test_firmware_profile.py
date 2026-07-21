@@ -352,3 +352,77 @@ def test_zc3201_standby_descends_past_gpio_pin0_wait() -> None:
         "(Fwl_pfVoice_fn 0x0809eda4) — the pen is spinning on GPIO_IN bit0 instead "
         "of proceeding toward book mode"
     )
+
+
+def test_zc3201_oid_profile_wiring() -> None:
+    """The ZC3201 OID sensor wiring differs from MT (Leg 20) — pure profile data."""
+    assert ZC3201.oid_pin_clock == 7 and ZC3201.oid_pin_data == 16
+    assert ZC3201.oid_bit_count_addr == 0x0800_7BF9
+    assert ZC3201.gpio_amp_pin == 9  # GPIO16 is OID data here, not the amp
+    # MT keeps the original wiring (GPIO2 clock / GPIO9 data / 0x08008C09).
+    assert MT.oid_pin_clock == 2 and MT.oid_pin_data == 9
+    assert MT.oid_bit_count_addr == 0x0800_8C09 and MT.gpio_amp_pin == 16
+
+
+@pytest.mark.skipif(ZC_PATH is None, reason="ZC3201 firmware .upd not available")
+def test_zc3201_oid_tap_captured_and_dispatched() -> None:
+    """A tapped OID is captured by the ZC3201 OID sensor and dispatched (Leg 20).
+
+    The 1st-gen OID path is a genuine hardware delta (MT's GPIO2/GPIO9 wiring does
+    not transfer — GPIO9 is the audio amp here). Its nandboot HAL bit-bang clocks on
+    GPIO7 and samples data/attention on GPIO16, reading its own ``bit_count`` at
+    ``0x08007BF9`` (capture-state struct ``0x08007BF8``); a 40 ms poll timer
+    (``hal_oid_timer_start`` ``0x08005CF0`` → callback ``0x08005F48``, armed by
+    ``state_init_power_on`` and the book-descent SM) shifts an armed frame in
+    (``hal_oid_shift_in`` ``0x08005D80``), stores ``0x400000 | oid`` to
+    ``[gb_app_context+0x40]+8``, and posts the OID event ``0x1063`` into the
+    statechart event ring (drained by the pump ``0x08003A84`` → dispatch
+    ``0x080037D8``). :func:`build_zc3201_machine` re-points the shared
+    :class:`tt_emu.peripherals.oid.OidSensor` to those pins/address via the profile,
+    so the unmodified firmware runs its own capture — nothing hooked. This asserts,
+    end to end: the poll timer runs in book mode, a held tap is latched, the exact
+    ``0x400000 | oid`` lands in the app context, and event ``0x1063`` is dispatched.
+    """
+    from unicorn.arm_const import UC_ARM_REG_R0
+
+    from tt_emu.boot import build_zc3201_machine
+    from tt_emu.loader import load_upd
+    from tt_emu.machine import MachineConfig
+
+    fw = load_upd(str(ZC_PATH))
+    machine = build_zc3201_machine(fw, MachineConfig(instructions_per_tick=20_000))
+
+    poll_cb = {"n": 0}
+    machine.on_code(0x0800_5F48, lambda _m: poll_cb.__setitem__("n", poll_cb["n"] + 1))
+    oid_events = {"n": 0}
+
+    def on_dispatch(m: object) -> None:
+        if machine.uc.reg_read(UC_ARM_REG_R0) == 0x1063:
+            oid_events["n"] += 1
+
+    machine.on_code(0x0800_37D8, on_dispatch)
+
+    machine.run(40_000_000)  # boot to book-mode idle
+    assert poll_cb["n"] > 50, (
+        f"the 40 ms OID poll timer callback did not run in book mode ({poll_cb['n']}) "
+        "— the OID sensor's driver is not armed"
+    )
+
+    oid = 8065  # a scripted OID from the example.gme range
+    base = machine.oid.gameplay_frames_served
+    machine.oid.hold(oid)
+    machine.run(30_000_000)
+    machine.oid.lift()
+    machine.run(20_000_000)
+
+    assert machine.oid.gameplay_frames_served > base, (
+        "the firmware never latched the tapped OID (the nandboot shift-in did not "
+        "capture the frame through the modelled GPIO7/GPIO16 handshake)"
+    )
+    ctx = machine.read_u32(0x0800_779C + 0x40)
+    assert machine.read_u32(ctx + 8) == (0x40_0000 | oid), (
+        "the captured OID did not reach [gb_app_context+0x40]+8 as 0x400000|oid"
+    )
+    assert oid_events["n"] >= 1, (
+        "the OID tap event 0x1063 was never dispatched into the statechart"
+    )
