@@ -544,6 +544,30 @@ def test_smallpage_nfc_reads_page_and_oob_together() -> None:
     assert bytes(m.read_bytes(0x0800_5800 + 512, 16)) == oob
 
 
+def test_smallpage_surface_spare_puts_oob_at_window_head() -> None:
+    """The ZC3201 readspare leaf reads the map tag from ``window[0]`` *after* a
+    GPIO-3 strobe surfaces the spare. ``surface_spare`` copies the last-read
+    page's 16-byte OOB to the window head (``nandboot 0x080030d8`` /
+    ``0x08002bac``: main 512 out, strobe, ``ldr [window]``)."""
+    img = NandImage()
+    row = 4124  # block 128 page 28 — a map-tag page
+    img.program(row * 512, bytes(512))
+    oob = struct.pack("<I", 0x1256_0000 | 42) + b"\xff" * 12
+    img.set_tag(row, oob)
+
+    m = Machine(MachineConfig())
+    ecc = EccEngine()
+    nfc = NfcController(img, ecc, sram_window=0x0800_5800, small_page=True, page_size=512)
+    m.add_peripheral(nfc)
+    m.add_peripheral(ecc)
+    nfc._row, nfc._col, nfc._bytes_done = row, 0, 0
+    nfc._data_read(528)
+    # Before the strobe the window head holds the 512 main bytes (all zero here).
+    assert bytes(m.read_bytes(0x0800_5800, 4)) == b"\x00\x00\x00\x00"
+    nfc.surface_spare(3, 0, 1 << 3)  # GPIO-3 level-watch callback signature
+    assert struct.unpack_from("<I", m.read_bytes(0x0800_5800, 4), 0)[0] == (0x1256_0000 | 42)
+
+
 def test_smallpage_nfc_program_round_trip() -> None:
     """A small-page program stages 512 main + 16 OOB into the window; the flush
     strobe commits both (data at row*512, OOB keyed by row)."""
@@ -593,13 +617,17 @@ def test_smallpage_erase_uses_row_shift_5() -> None:
 
 def test_build_zc3201_nand_image_superblock_and_fat() -> None:
     """The hand-built ZC3201 image has a valid FS-info superblock (block 0 page
-    31: reserve 64, shift 9, two partitions) and valid FAT16 A:/B: boot sectors
-    with the map-magic OOB tag on the first mapped page."""
+    31: reserve 64, shift 9, two partitions), and A:'s FAT16 boot sector plus its
+    per-block map tag at the mapped physical block's map-tag page (28) OOB."""
     from tt_emu.nand_image_zc3201 import (
         MAP_OOB_MAGIC,
+        MAP_TAG_PAGE,
+        ZC_BLOCK,
         ZC_PAGE,
         ZC_PAGES_PER_BLOCK,
+        ZC_PLANES,
         ZC_RESERVE_BLOCKS,
+        _phys_block,
         build_zc3201_nand_image,
     )
 
@@ -610,11 +638,49 @@ def test_build_zc3201_nand_image_superblock_and_fat() -> None:
     assert sb[0x0A] == 2                                            # partition count
     assert sb[0x10 + 0x0B] == 0 and sb[0x20 + 0x0B] == 1            # ids A:=0 B:=1
 
-    base = ZC_RESERVE_BLOCKS * ZC_PAGES_PER_BLOCK  # A: logical 0 physical page
-    boot = img.read(base * ZC_PAGE, ZC_PAGE)
+    # A: logical block 0 lands at plane-0 physical block 2*reserve = 128; its FAT16
+    # boot sector is at that block's page 0, and its map tag at page 28's OOB.
+    phys0 = _phys_block(0, 0)
+    assert phys0 == ZC_PLANES * ZC_RESERVE_BLOCKS
+    boot = img.read(phys0 * ZC_BLOCK, ZC_PAGE)
     assert boot[0x1FE:0x200] == b"\x55\xaa"
     assert boot[0x36:0x3E] == b"FAT16   "
-    assert struct.unpack_from("<I", img.get_tag(base), 0)[0] == (MAP_OOB_MAGIC | 0)
+    tag_row = phys0 * ZC_PAGES_PER_BLOCK + MAP_TAG_PAGE
+    assert struct.unpack_from("<I", img.get_tag(tag_row), 0)[0] == (MAP_OOB_MAGIC | 0)
+
+
+def test_build_zc3201_nand_image_map_tags() -> None:
+    """Per-block map tags sit at each mapped block's map-tag page (28) OOB:
+    ``0x12560000 | logical`` for live blocks, ``0x12345678`` for the free spares.
+
+    Verified against the firmware's own MtdLib scan (``FUN_0802edb8``): with this
+    layout the map-table build's scan is fully consistent (fe2c=1, 951 valid, 9
+    free spares) — the readspare storm collapses from 50144 to 960 reads.
+    (docs/zc3201-boot-feasibility.md Leg 12.)
+    """
+    from tt_emu.nand_image_zc3201 import (
+        MAP_FREE_SENTINEL,
+        MAP_OOB_MAGIC,
+        MAP_TAG_PAGE,
+        ZC_BLOCKS_PER_PLANE,
+        ZC_PAGES_PER_BLOCK,
+        ZC_RESERVE_BLOCKS,
+        ZC_SPARE_BLOCKS,
+        _phys_block,
+        build_zc3201_nand_image,
+    )
+
+    img = build_zc3201_nand_image(None)
+    hi = ZC_BLOCKS_PER_PLANE - ZC_RESERVE_BLOCKS   # 960 usable / plane
+    lo = hi - ZC_SPARE_BLOCKS                       # 951 valid logical
+    for plane in (0, 1):
+        def tag_of(logical: int) -> int:
+            row = _phys_block(logical, plane) * ZC_PAGES_PER_BLOCK + MAP_TAG_PAGE
+            return struct.unpack_from("<I", img.get_tag(row), 0)[0]
+        assert tag_of(0) == (MAP_OOB_MAGIC | 0)
+        assert tag_of(lo - 1) == (MAP_OOB_MAGIC | (lo - 1))
+        assert tag_of(lo) == MAP_FREE_SENTINEL       # first spare
+        assert tag_of(hi - 1) == MAP_FREE_SENTINEL   # last spare
 
 
 def test_build_zc3201_nand_image_bad_block_table_is_zeroed() -> None:

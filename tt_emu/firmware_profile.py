@@ -161,6 +161,16 @@ class FirmwareProfile:
     nand_small_page: bool = False
     nand_page_size: int = 512
 
+    #: Firmware-absolute PC of the NAND spare-surface strobe leaf (ZC3201 nandboot
+    #: ``0x080030d8``). The small-page ``MtdLib`` readspare presents a page's OOB
+    #: at the L2 window head before reading the 4-byte map tag from ``window[0]``;
+    #: on hardware the daughterboard advances the window to the spare when this
+    #: leaf pulses its dedicated GPIO. The GPIO bit *latches high* (not an
+    #: edge/level signal), so the model keys the hardware effect on the leaf's PC,
+    #: which runs only in the readspare path (:meth:`NfcController.surface_spare`).
+    #: ``None`` for large-page (MT) firmware, which has no such split.
+    nand_spare_surface_strobe: int | None = None
+
     #: NAND READ-ID dword the pen's boot probe expects (``NfcController.read_id``).
     #: 2N-MT: Samsung K9GAG08U0M ``0x9551D3EC`` (bytes EC D3 51 95, 4-KiB page).
     #: ZC3201: Samsung K9F5608 ``0xBDA575EC`` (bytes EC 75 A5 BD, 512-byte page) —
@@ -320,6 +330,7 @@ ZC3201 = FirmwareProfile(
     soc_chip_id=0x3332_3931,  # "1923" — the ZC3201 SoC chip-ID (FS version gate)
     nand_small_page=True,     # Samsung K9F5608: 512-B page + 16-B OOB, 32 pages/block
     nand_page_size=512,
+    nand_spare_surface_strobe=0x0800_30D8,  # nandboot readspare spare-surface leaf
     # MtdLib device-geometry struct at dev=0x08007d94, decoded from the K9F5608
     # flash_ic row (update.upd[0x200]) the way the producer's descriptor builder
     # 0x080056d4 does (docs/zc3201-producer-addresses.md §10): u32 fields

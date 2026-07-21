@@ -49,7 +49,12 @@ __all__ = [
     "ZC_BLOCK",
     "ZC_NBLOCKS",
     "ZC_RESERVE_BLOCKS",
+    "ZC_PLANES",
+    "ZC_BLOCKS_PER_PLANE",
+    "ZC_SPARE_BLOCKS",
     "MAP_OOB_MAGIC",
+    "MAP_FREE_SENTINEL",
+    "MAP_TAG_PAGE",
     "BBT_PAGES",
 ]
 
@@ -89,9 +94,38 @@ SHIFT = 9  #: log2(512) — the page/sector shift the mount reads at ``buf+8``.
 #: seeded ``flash_ic`` descriptor — see ``docs/zc3201-boot-feasibility.md`` Leg 11.)
 BBT_PAGES = (0, 1, 2, 3)
 
-#: OOB map magic: a mapped (live) page carries ``0x12560000 | logical_page`` in its
-#: 4-byte OOB tag (``FUN_0802edb8`` ``0x0802edb8`` classifier).
+#: OOB map magic: a mapped (live) **block** carries ``0x12560000 | logical_block``
+#: in the 4-byte OOB tag of its **map-tag page** (``FUN_0802edb8`` ``0x0802edb8``
+#: classifier). Recovered by tracing the readspare leaf ``FUN_08030224``
+#: ``0x08030224`` → ``nandboot 0x08002bac`` and the classifier: the scan reads,
+#: per logical scan-index ``B`` of a partition, **page ``32·phys + 28``** (the
+#: ``dev[0x14]-4`` tag page) of physical block ``phys``, column 0, then strobes
+#: GPIO-out bit 3 (``0x080030d8``) to surface that page's **OOB[0:4]** into the
+#: NAND window head (``NfcController.surface_spare``) and reads the tag there.
+#: Physical block for scan-index ``B`` = ``planes·reserve + planes·B + plane``
+#: (plane 0 = even blocks from ``2·reserve``); the tag's low 16 bits are the
+#: **logical block** ``B``.
 MAP_OOB_MAGIC = 0x1256_0000
+
+#: Free/spare-block sentinel (``DAT_0802f0a0``): a block whose map-tag page OOB
+#: carries ``0x12345678`` is a free spare, added to the partition's free-block
+#: ring (``FUN_0802e574`` → consumed by ``mtd_helper_d244`` ``0x08035244``).
+#: A partition needs ~9 of these (``hi − lo``) or ``mtd_MapTblInit`` cannot
+#: allocate a map-table home and the mount fails ("MtdLib15:0").
+MAP_FREE_SENTINEL = 0x1234_5678
+
+#: The map-tag page inside each block: ``dev[0x14] − 4`` = 32 − 4 = 28. The
+#: readspare computes ``page = dev[0x14]·B + (param_4 ÷ dev[0x18])`` with
+#: ``param_4 = dev[0x14]−4 = 28``, ``dev[0x18] = 1`` → ``page = 32·B + 28``.
+MAP_TAG_PAGE = 28
+
+#: Small-page geometry the mount derives (dev fields + superblock): 2 planes,
+#: 1024 blocks/plane. Per plane a partition spans ``1024 − reserve = 960``
+#: usable blocks (``hi``), of which the top ``9`` are free spares → ``lo = 951``
+#: valid logical blocks. (docs/zc3201-boot-feasibility.md Leg 12.)
+ZC_PLANES = 2
+ZC_BLOCKS_PER_PLANE = 1024
+ZC_SPARE_BLOCKS = 9
 
 
 def _superblock_payload(reserve_blocks: int, a_sectors: int, b_sectors: int) -> bytes:
@@ -121,22 +155,42 @@ def _place_page(img: NandImage, abs_page: int, data: bytes, oob: bytes) -> None:
     img.set_tag(abs_page, (bytes(oob) + b"\xff" * ZC_OOB)[:ZC_OOB])
 
 
-def _place_volume(img: NandImage, volume: bytes, logical_page0: int) -> int:
-    """Place a FAT16 volume as identity-mapped small pages from ``logical_page0``.
+def _phys_block(logical_block: int, plane: int) -> int:
+    """Physical block holding ``logical_block`` of ``plane`` (the map-scan formula).
 
-    Physical page = ``ZC_RESERVE_BLOCKS·32 + logical_page`` (identity map inside the
-    mapped region). Each placed page carries OOB ``MAP_OOB_MAGIC | (logical & 0xFFFF)``
-    so the map scan resolves it as live at its logical address. Returns the number of
-    logical pages placed.
+    ``phys = planes·reserve + planes·logical + plane`` — plane 0 = even blocks
+    starting at ``2·reserve`` (= 128 for reserve 64), plane 1 = the odd blocks.
     """
-    npages = (len(volume) + ZC_PAGE - 1) // ZC_PAGE
-    base_phys = ZC_RESERVE_BLOCKS * ZC_PAGES_PER_BLOCK
-    for i in range(npages):
-        logical = logical_page0 + i
-        abs_page = base_phys + logical
-        oob = struct.pack("<I", MAP_OOB_MAGIC | (logical & 0xFFFF))
-        _place_page(img, abs_page, volume[i * ZC_PAGE : (i + 1) * ZC_PAGE], oob)
-    return npages
+    return ZC_PLANES * ZC_RESERVE_BLOCKS + ZC_PLANES * logical_block + plane
+
+
+def _lay_map_tags(img: NandImage, plane: int) -> None:
+    """Lay one plane's per-block map tags at each block's map-tag page (28) OOB.
+
+    Logical blocks ``0..lo-1`` are live (``0x12560000 | logical``); ``lo..hi-1``
+    are free spares (``0x12345678``) so the mount's free-block ring is non-empty.
+    """
+    hi = ZC_BLOCKS_PER_PLANE - ZC_RESERVE_BLOCKS      # 960 usable blocks/plane
+    lo = hi - ZC_SPARE_BLOCKS                          # 951 valid logical blocks
+    for logical in range(hi):
+        phys = _phys_block(logical, plane)
+        row = phys * ZC_PAGES_PER_BLOCK + MAP_TAG_PAGE
+        tag = MAP_OOB_MAGIC | logical if logical < lo else MAP_FREE_SENTINEL
+        img.set_tag(row, struct.pack("<I", tag))
+
+
+def _place_volume(img: NandImage, volume: bytes, plane: int) -> int:
+    """Place a FAT16 volume identity-mapped onto ``plane``'s live blocks.
+
+    FAT logical block ``L`` (16 KiB) lands at physical block ``_phys_block(L,
+    plane)``, matching the map so a post-mount logical read resolves to the data.
+    Returns the number of logical blocks placed.
+    """
+    nblocks = (len(volume) + ZC_BLOCK - 1) // ZC_BLOCK
+    for L in range(nblocks):
+        phys = _phys_block(L, plane)
+        img.place(phys * ZC_BLOCK, volume[L * ZC_BLOCK : (L + 1) * ZC_BLOCK])
+    return nblocks
 
 
 def build_zc3201_nand_image(
@@ -181,8 +235,16 @@ def build_zc3201_nand_image(
         _place_page(img, SUPERBLOCK_BLOCK * ZC_PAGES_PER_BLOCK + page, sb,
                     struct.pack("<I", 0x1234_5678))  # system/reserved sentinel tag
 
-    # A: at logical 0, B: right after it (identity map inside the mapped region).
-    a_pages = _place_volume(img, bytes(vol_a.data), 0)
-    _place_volume(img, bytes(vol_b.data), a_pages)
+    # Per-block map tags at each block's map-tag page (28) OOB, one partition
+    # per plane: plane 0 (even blocks) = A:, plane 1 (odd blocks) = B:. This is
+    # the on-media logical->physical map the scan (FUN_0802edb8) consumes; with
+    # it the map-table build's scan is fully consistent (fe2c=1, 951 valid, 9
+    # free spares — verified against the firmware's own MtdLib diagnostics).
+    _lay_map_tags(img, plane=0)
+    _lay_map_tags(img, plane=1)
+
+    # FAT volumes on the mapped physical blocks (A: plane 0, B: plane 1).
+    _place_volume(img, bytes(vol_a.data), plane=0)
+    _place_volume(img, bytes(vol_b.data), plane=1)
 
     return img

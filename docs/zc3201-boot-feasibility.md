@@ -701,3 +701,105 @@ fs_storage_mount_init 0x0802d0e0`: map_read (reserve=64 ✓) → whole_disk_map_
 map_table_build → **bad-block check passes (BBT)** → **readspare runs (960 scans × ~52 reads)** →
 still fails to match a map tag because the reserve-zone map-table pages are absent (candidate #3).
 MT unregressed. Product change this leg: the BBT in `nand_image_zc3201.py` only.
+
+## Leg 12 — the map-table scan is SOLVED (OOB spare-surface + page-28 per-block tags); the paged map-table load is the new wall
+
+Leg 11's candidate #2 ("data[0:4]") was itself the artifact of an incomplete emulator: the
+readspare tag genuinely lives in the page's **OOB**, surfaced into the NAND window by a GPIO
+strobe the emulator wasn't modelling. Modelling it authentically + laying the tags at the right
+page cracked the whole map-table scan. All Proven (disasm + the firmware's own MtdLib printf
+diagnostics, hooked at logf `0x08008a48` = `*(0x081d9ad8+0x10)`; probes
+`scripts/zc3201_scan_struct.py`, `scripts/zc3201_oob_offset.py`, scratch traces).
+
+### The spare-surface mechanism (candidate #2, corrected + fixed authentically)
+
+The `MtdLib` readspare leaf `FUN_08030224` `0x08030224` (`dev+0x34`) → nandboot `func_0x08002bac`
+`0x08002bac` does: a normal small-page read (cmd 0x00→0x30, 523-byte data op) → `memcpy` the 512
+**main** bytes out → wait ready → **strobe GPIO output bit 3** (`0x080030d8` → `0x08006954` sets
+`*0x04000080` bit 3) → `ldr [0x08005800]` (window head) = the 4-byte tag. So the tag is the page's
+**OOB[0:4]**, presented at the window head by the strobe — *not* page data. Crucially the GPIO bit
+is set **once** and **never cleared** (it latches high; ~11 000 later GPIO writes all keep it high),
+so it is *not* an edge or level signal we can key on — a GPIO-level watch would fire the surface on
+every unrelated GPIO write and clobber the window during plain data reads. So the model keys the
+hardware effect on the **strobe leaf's PC** (`0x080030d8`), whose sole purpose is this spare surface
+and which runs only in the readspare path:
+* `NfcController.surface_spare()` copies the last small-page read's retained 16-B OOB to the window
+  head (`tt_emu/peripherals/nand.py`; `_last_oob` kept per read);
+* `FirmwareProfile.nand_spare_surface_strobe = 0x080030d8`; `boot.build_zc3201_machine` does
+  `machine.on_code(strobe, nfc.surface_spare)`, small-page only, so **MT is byte-for-byte
+  untouched**.
+
+### The per-block map-table format (candidate #3, RE'd + laid down)
+
+The scan reads a **per-block tag page**, not reserve-zone pages. For partition scan-index `B`,
+the readspare computes `page = dev[0x14]·B + (param_4 ÷ dev[0x18])` with `param_4 = dev[0x14]−4 =
+28`, `dev[0x18] = 1` → **`page = 32·B + 28`** (col 0), of **physical block `128 + 2·B`** (=
+`planes·reserve + planes·B + plane`; plane 0 = even blocks from `2·reserve`, planes=2, reserve=64).
+Its **OOB[0:4]** carries `0x12560000 | logical` (live), `0x12345678` (`DAT_0802f0a0` = a free spare
+block → joins the free-block ring `FUN_0802e574`), or `0xFFFFFFFF` (blank → treated bad). Per plane
+a partition spans `1024 − 64 = 960` usable blocks (`hi`), top **9** free spares → `lo = 951` valid.
+`nand_image_zc3201.build_zc3201_nand_image` now lays these at page 28's OOB for both planes
+(`_lay_map_tags`, `_phys_block`); FAT volumes are placed on the mapped physical blocks.
+
+**Result (verified against the firmware's own diagnostics):** the map-table scan is **fully
+consistent** — `FUN_0802edb8` classifies 951 valid + 9 free with **zero** bad; the consistency
+gate `mtd_helper_fe2c` (`0x08037e2c`) returns 1 with `iVar9=951 (valid)`, `iVar11=0 (bad)`,
+`rec+6=0`, `rec+6+iVar9 == lo`. The readspare storm **collapses 50144 → 960** reads (one clean read
+per block). The MtdLib initialises the partition (`MtdLib - NandPart:…,BCnt=1984,PCnt=2,…`) and the
+FatLib version prints.
+
+### Leg 12 resume pointer — the paged map-table load (`mtd_MapTblInit`)
+
+The mount now fails one level deeper: `FUN_0802ea54`'s per-partition builder `FUN_0802e5e0` returns
+**false** because **`mtd_MapTblInit` `0x08035318` returns 0** (→ `map_table_build FUN_0802cbd8`
+NULL → the same hang `0x0802d208`). Root cause is Proven: `mtd_MapTblInit` gates on
+`record[+0x16]` (= `lo` = **951**); since `951 > 0x101` (257) it takes the **large-partition
+paged-map branch**, which calls `mtd_helper_d244` `0x08035244` to pull a free block from the ring
+and then **reads an on-NAND paged map-table** back from it via `dev+0x28` (`0x08030310`) +
+`nandmtd_fn`. On the hand-built image the ring yields nothing / the paged map isn't present
+("MtdLib15:0" logs), so `mtd_helper_d244` returns ≥ `hi` and `mtd_MapTblInit` bails (`return 0`).
+
+**The firmware WRITES its own map table at mount — the wall is the small-page NAND WRITE
+round-trip, not a missing on-media structure.** The `MtdLib31` diagnostic (capture with
+`scripts/zc3201_mtdlog.py`) shows the large-partition branch **writing** the paged map to each free
+spare block and **verifying** it by read-back:
+`MtdLib31:Off:0,Wrt:0x10000,Read:0x12345678,P:0,F:951,Pg:0` → `MtdLib - MarkBadBlk:P:0,F:951`, for
+every free block `F` (951..959), until the ring empties (`MtdLib15:0`) and `mtd_MapTblInit` returns
+0. It writes `0x10000` but reads back **`0x12345678`** — the pre-placed free-spare **OOB** sentinel.
+Traced (`scripts/…` scratch): the spare-surface strobe `0x080030d8` fires **repeatedly inside
+`mtd_MapTblInit`** with `_last_oob = 0x12345678`, i.e. the verify's read-back is served the **stale
+pre-placed OOB tag** instead of the `0x10000` just written. Root cause: the emulator's small-page
+**write** path does not round-trip here — the firmware's map-table write (via `dev+0x30` spare-write
+`0x080301b8` → nandboot `func_0x08002228`, and/or the data program) is **not committing to the
+`NandImage` tag/data store**, so the readspare read-back surfaces the old sentinel. Next steps,
+precise:
+
+1. **Model the small-page NAND WRITE round-trip so `mtd_MapTblInit` can write+verify its map.**
+   Disassemble the spare-write leaf `dev+0x30 = 0x080301b8` → nandboot `func_0x08002228` (the twin
+   of the readspare `func_0x08002bac`, but programming a page/OOB), and confirm `NfcController`'s
+   small-page program path (`_data_program`/`l2_strobe`, and any spare-only program) commits the
+   written bytes to the same tag store `surface_spare` later reads. The firmware then builds its own
+   paged map at mount — **no hand-built paged map needed** (the pre-placed `0x12345678` free
+   sentinels are exactly the free pool it writes into). Verify with `zc3201_mtdlog.py`:
+   `MtdLib31 Read` should become `0x10000` and `mtd_MapTblInit` return 1.
+   **MT-oracle note:** MT's tt-emu image is read-only at runtime (its NFTL derives log2phy at init,
+   `nftl_build_log2phy 0x08047510`, no stored paged map — correspondences.tsv: `mtd_MapTblInit` has
+   *no confident MT twin*), so the small-page *write* path has never been exercised end-to-end;
+   this is the first mount that writes NAND. This is the last storage wall before A:/B: mount.
+2. Then A:/B: mount → drive pump → standby → product/cover-OID tap → book → GME play (re-point
+   `OidSensor`, add a ZC3201 `firmware.mt`-style debugger), and parametrise `tests/test_scripting.py`
+   over both firmwares.
+
+**State now:** the unmodified firmware boots to `fs_storage_mount_init 0x0802d0e0` and runs the
+**complete, consistent map-table scan** (BBT ✓, spare-surface ✓, 951 valid + 9 free, readspare
+collapsed 50144→960); it then reaches `mtd_MapTblInit 0x08035318`, which **writes its own paged map
+table** and fails only because the small-page NAND **write** round-trip is unmodelled (the verify
+read-back surfaces the stale pre-placed OOB sentinel; `MtdLib31 Read:0x12345678` ≠ `Wrt:0x10000` →
+`MarkBadBlk` → `MtdLib15:0` → `return 0`). MT unregressed (159 passed). Product changes this leg:
+`FirmwareProfile.nand_spare_surface_strobe`, `NfcController.surface_spare` + `_last_oob`, the
+`boot.build_zc3201_machine` strobe-PC wiring, and the page-28 per-block map-tag layout
+(`_lay_map_tags`/`_phys_block`, live `0x12560000|logical` + free `0x12345678`) in
+`nand_image_zc3201.py`. New tests: `test_smallpage_surface_spare_puts_oob_at_window_head`,
+`test_build_zc3201_nand_image_map_tags`. Probes: `scripts/zc3201_mtdlog.py` (firmware's own MtdLib
+diagnostics via logf `0x08008a48`), `scripts/zc3201_scan_struct.py`, `scripts/zc3201_oob_offset.py`,
+`scripts/zc3201_scan_trace.py`.

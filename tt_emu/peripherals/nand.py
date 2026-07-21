@@ -247,6 +247,13 @@ class NfcController(WordRegisterPeripheral):
         #: outstanding, else 0 (satisfies the !=0/==8 read waits and the ==0
         #: program-drain wait simultaneously, §10).
         self.l2_level = 0
+        #: The last small-page read's 16-byte OOB, kept so the spare-surface
+        #: strobe (GPIO out bit 3, ``nandboot 0x080030d8``) can copy it into
+        #: the window head — the ZC3201 ``MtdLib`` readspare leaf reads the
+        #: 4-byte map tag from ``window[0]`` *after* that strobe (§ readspare
+        #: ``0x08030224`` → ``func_0x08002bac``: main 512 B out, then strobe,
+        #: then ``ldr [window]``).
+        self._last_oob = b"\xff" * self.SMALLPAGE_OOB
 
     @property
     def regions(self) -> tuple[MmioRegion, ...]:
@@ -400,9 +407,24 @@ class NfcController(WordRegisterPeripheral):
         self._bytes_done += self.page_size
         self.machine.write_bytes(self.sram_window, data)
         self.machine.write_bytes(self.sram_window + self.page_size, oob)
+        self._last_oob = oob
         self._stream = None
         self._stream_polls = 0
         self.l2_level = 8
+
+    def surface_spare(self, *_ignored) -> None:
+        """Surface the last-read page's OOB into the window head (§ readspare).
+
+        The ZC3201 ``MtdLib`` spare-read leaf (``nandboot 0x08002bac``) reads the
+        512-byte main data out of the window, then strobes GPIO output bit 3
+        (``0x080030d8``) to make the chip present its spare bytes, and reads the
+        4-byte map tag from ``window[0]``. On real hardware the strobe advances
+        the chip's column pointer into the spare region; here it simply copies
+        the retained OOB to the window head. Wired via ``GpioBlock.watch_output``
+        on pin 3 (accepts ``(pin, old, new)`` and ignores them).
+        """
+        if self.machine is not None:
+            self.machine.write_bytes(self.sram_window, self._last_oob)
 
     def _data_read_largepage(self, nbytes: int) -> None:
         """0x119: deposit one record into the SRAM window (§8.1 / §10).

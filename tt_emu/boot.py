@@ -322,6 +322,18 @@ def build_zc3201_machine(
     machine.add_peripheral(nfc)
     machine.add_peripheral(ecc)
     machine.add_peripheral(L2NandBuffer(nfc))
+    if profile.nand_small_page and profile.nand_spare_surface_strobe:
+        # The MtdLib readspare leaf presents the page's OOB at the NAND window
+        # head, then reads the 4-byte map tag from window[0]. On hardware the
+        # NAND daughterboard advances the L2 window to the spare when the HAL
+        # pulses its dedicated spare-surface strobe leaf (nandboot 0x080030d8:
+        # sets GPIO out bit 3). That GPIO bit *latches high* and is written on
+        # every later GPIO access, so it is not an edge/level signal we can key
+        # on; instead we model the hardware effect at the strobe leaf itself —
+        # its sole purpose is this spare surface, and it runs only in the
+        # readspare path, never during a main data read (nand.py
+        # NfcController.surface_spare).
+        machine.on_code(profile.nand_spare_surface_strobe, nfc.surface_spare)
 
     machine.write_bytes(profile.prog_load, firmware.prog.data)
     machine.write_bytes(profile.nandboot_load, firmware.nandboot.data)
