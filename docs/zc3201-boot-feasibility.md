@@ -845,40 +845,56 @@ now partition-aware; volumes are clamped to `lo`. Result: **`InitPlane succeed: 
 `P=1,V=1015`** — the full MtdLib mount, both partitions, is consistent. A:'s FAT16 boot sector reads
 back correctly at logical 0 (`row 4096`, `eb 3c 90 "TEMU1.0" … 512 B/sector`).
 
-### Leg 14 resume pointer — FatLib disk-map `+0x2c = 0` → divide-by-zero abort
+### Leg 14 resume pointer — a page read overruns/overlaps the MtdLib manager → divide-by-zero abort
 
 Past the MtdLib mount, `fs_storage_mount_init` builds the FatLib volumes and immediately aborts.
 The abort is the **ARM semihosting SWI** `svc 0x123456` (the ARM-state semihosting number; the
 emulator only special-cases the Thumb `0xAB`, so it logs "ignored" and wrongly falls through — the
 downstream `0x034d034c` deref in the `FUN_080b193c` cleanup is just the fallout of not honouring the
 abort). `FUN_080c9b20` issues it with **R0 = 0x18 = SYS_EXIT** — a fatal abort, *not* a catchable
-throw (it returns cleanly). Origin (Proven): `FUN_0800cec4` (the FatLib disk read) →
-`FUN_0800c974` (global-block → (partition, block) translation) hits a **compiler divide-by-zero
-guard**: it divides by `param_1[0xb]` (**disk-map object `0x80fa420`, offset `0x2c`**) which is
-**0** (also `[0x24] = 0`). So the whole-disk map object's geometry field at `+0x2c` was never
-populated during mount.
+throw (it returns cleanly). Origin (Proven): `FUN_0800cec4` (FatLib disk read) → `FUN_0800c974`
+(global-block → (partition, block) translation) hits a **compiler divide-by-zero guard** dividing by
+`param_1[0xb]` = the **MtdLib manager object `0x80fa420`, offset `0x2c`** (= its pages-per-block, and
+its first-call value is the correct **`0x20` = 32**, matching `dev+0x14`).
+
+**The manager gets clobbered to 0.** Watching `[0x80fa44c]` (= manager `+0x2c`): it is initialised to
+`0x20` (by `0x0802eb78`), then **overwritten by a 512-byte page read** — `func_0x080028b0`
+(readpage, `lr=0x8002a08`) memcpys the NAND window `0x08005800` into a **buffer at `0x80fa400`**,
+whose 512-byte span (`0x80fa400..0x80fa600`) **overlaps the manager at `0x80fa420`** (buffer + 0x20).
+The read page's byte at offset **0x4c** lands on the manager's `+0x2c`; the *first* such read carries
+`0x20` there (harmless), but the read just before the abort carries **0** → the next `FUN_0800c974`
+divides by 0 → SYS_EXIT. So the real bug is a **heap collision**: a FatLib sector buffer
+(`0x80fa400`) and the live MtdLib manager (`0x80fa420`) occupy overlapping heap — a stale/reused
+allocation (likely use-after-free of the manager, or the emulator's heap layout differs from
+hardware because some skipped-init heap bound/seed is missing).
 
 **Next steps, precise:**
-1. Find what sets disk-map `+0x2c` (the divisor in `FUN_0800c974`'s block translation) and why it is
-   0 on our image — start at the disk-map constructor `FUN_0802f0c0` and `mtd_helper59 0x0802d408`
-   (installs the dev vtable + `+0x2c` = readpage `0x0800c208`; the *disk-map* `+0x2c` is a different
-   struct — the whole-disk object built over the two partitions). It is almost certainly a
-   superblock-derived geometry (sectors/cluster, or total logical blocks) that our
-   `_superblock_payload` leaves 0. Capture it live: hook `FUN_0800c974 0x0800c974`, dump `param_1`
-   (`0x80fa420`) fields `[0..0x30]`, and back-trace which mount function should store `+0x2c`.
-2. Optionally make the emulator honour ARM-state semihosting `svc 0x123456` (at minimum SYS_EXIT
-   0x18 → stop with a clear "firmware SYS_EXIT/abort" reason instead of "ignored" + fall-through), so
-   future FatLib aborts surface cleanly rather than as a garbage deref. Keep it generation-agnostic
-   (MT never hits it during boot — 158 green).
+1. Find why the FatLib sector buffer `0x80fa400` and the MtdLib manager `0x80fa420` overlap. Hook the
+   allocator (the `puVar1[0]`/`DAT_…[0]` malloc slot used across these libs — e.g. `FUN_0802f0c0`
+   allocates `0x60` via `(*(code*)*puVar1)(0x60,…)`) and log every alloc/free of the region around
+   `0x80fa400`: is the manager freed before the FatLib buffer is allocated (use-after-free), or does
+   the heap arena simply run them into each other? Compare the arena base/limit the firmware uses
+   against what our from-entry boot leaves — the C-runtime/heap-init the ZC3201 boot skips may leave
+   a heap-bounds global at 0 so `malloc` hands out overlapping/low addresses (analogous to the
+   `bss_seed`/geometry seeds we already add in `build_zc3201_machine`). Seed it if so.
+2. Optionally make the emulator honour ARM-state semihosting `svc 0x123456` (at least SYS_EXIT
+   `0x18` → stop with a clear "firmware SYS_EXIT/abort" reason instead of "ignored" + fall-through),
+   generation-agnostic (MT never hits it during boot — 158 green). This turns future FatLib aborts
+   into clean stops instead of garbage derefs.
 3. Then the FAT mount should complete → confirm the firmware opens the test `.gme` on `B:/`, then
    drive pump → standby → OID tap → book → GME play, mirroring the MT `firmware.mt` debugger path
    via the FirmwareProfile (correspondences.tsv), and parametrise `tests/test_scripting.py` over both
    firmwares.
 
+Probes for this leg live in the session scratchpad (`probe_mtdlog`/`probe_seq`/`probe_watch`/
+`probe_mcpy` patterns): hook `FUN_0800c974 0x0800c974` (divisor object), watch `[manager+0x2c]`
+writes, and trace the readpage memcpy (`0x0800339c`, `lr=0x8002a08`) dst/src to see the overlap.
+
 **State now:** the unmodified firmware boots through the **complete MtdLib mount** — both partitions
 `InitPlane succeed` (A: 951 valid, B: 1015 valid, 0 bad), the small-page write round-trips, A:'s FAT16
-boot sector reads back — and dies in **FatLib** at a disk-map divide-by-zero (`disk_map[+0x2c] = 0`,
-surfaced as semihosting `SYS_EXIT`). MT unregressed (158 passed). Product changes this leg:
+boot sector reads back — and dies in **FatLib** at a divide-by-zero: a 512-byte page read into buffer
+`0x80fa400` overlaps the live MtdLib manager `0x80fa420`, zeroing its `+0x2c` pages-per-block divisor
+(heap collision; surfaced as semihosting `SYS_EXIT`). MT unregressed (158 passed). Product changes this leg:
 `NfcController.l2_strobe` small-page main-from-`_prog_staged` + `SMALLPAGE_OOB_TAG`; partition-aware
 `_phys_block`/`_partition_geom`/`_lay_map_tags`/`_place_volume` + volume clamp in
 `nand_image_zc3201.py`. Tests updated: `test_smallpage_nfc_program_round_trip` (real FIFO protocol),
