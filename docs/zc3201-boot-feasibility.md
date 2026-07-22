@@ -1789,3 +1789,43 @@ Product changes: `AudioDma` parameterised (`dac_port_dst`, `swallow_flag_addr`, 
 `Emulator._enter_zc3201` sets `self._capture`; `Clip.pcm`/`rate`/`save_wav` work on ZC3201.
 `test_mount_tap_play_core` now asserts real byte-level PCM (S16LE-framed, standard rate, non-silent,
 un-railed) on **both** firmwares. Full suite **167 passed**.
+
+## Leg 26 — ZC3201 runs under its REAL MMU (the flat model retired); one Emulator-flow thrash remains
+
+The 1st-gen firmware now boots under its **own ARM MMU**, exactly as MT does — no more flat
+load, no `Zc3201DacPageMap` inversion. The DAC is a genuine physical bus master again (plain
+`read_phys`). Reached by reusing `MmuBoot` via a per-firmware `MmuAnchors` descriptor (`ZC3201_MMU`),
+recovered by CP15-op scan + control-flow tracing on the 1st-gen nandboot. The whole demand-pager
+mechanism transferred — same standard-ARM L1@`0x08004000` + coarse-L2@`0x08004400`, same
+fault→dispatcher→refiner→retry, same shadow backing store — with only a table of addresses and three
+structural deltas (frame_count 38, usage-clock MMIO `0x04010120`, PROG-evict's swapped VA/idx regs).
+
+**Two non-obvious fixes were needed beyond the address table:**
+
+1. **IRQ-mode stack (`Machine.irq_stack_top`).** From-entry boot enters `boot_task_main` past the
+   reset handler's per-mode stack setup, so the machine seeds the IRQ stack on first delivery. Its
+   MT value `0x083F0000` sits outside ZC3201's demand window `[0x08008000,0x08200000)`, so the first
+   timer IRQ pushed to an out-of-window address and faulted fatally. ZC3201 uses its authentic
+   reset-handler value `0x08008000` (in the resident low region).
+
+2. **Pacing calibration (100k insn/tick, not the flat 20k).** The content-play regression was *not*
+   a paging bug — the shadow store is provably correct (26930 pages restored, **0 lost/revived**;
+   OID capture, both eviction conventions, frame_base/evict_table, and the TLB flush all verified).
+   Demand-paging fault-handler overhead makes the firmware execute ~5x more instructions per unit of
+   progress, so the flat-tuned 20k cadence starved the audio-completion-gated GME playlist advance (a
+   welcome playlist stopped after its first media). At 100k the timer/audio cadence matches progress
+   and content OIDs play their game media.
+
+**Result:** `test_zc3201_scripting.py` (machine-level: boot → discover → mount → **content OID plays
+its game media, under the real MMU**) passes. `MmuBoot` parameterization and the `Machine.irq_stack_top`
+/ `AudioDma` pager-LRU plumbing landed on `main`.
+
+**Open (tracked, xfail):** the higher-level `Emulator`-API path (`test_mount_tap_play_core[zc3201]`)
+trips a **demand-paging thrash**. Driving the same mount→content-tap→play chain through the Emulator's
+*stop/restart* run loop (each `_run_until` ends its `emu_start` at a predicate) leaves the CPU stuck in
+**abort mode (I=1)** cycling the refiner (`pc≈0x08001498`/`0x08003200`) after a content tap — IRQs mask,
+the timer stops, the event pump starves, no play. Run **continuously** (the machine-level test) the same
+chain is fine, so it is an Emulator-flow / Unicorn abort-delivery-across-`emu_stop` interaction, **not**
+an MMU-model defect. Leading hypothesis: an `emu_stop` landing on an in-flight abort rewinds the faulting
+instruction's TB, re-delivering the abort and mis-pairing the `pgstack` push/pop — worth understanding as
+it may be a latent bug on any demand-paging path, MT included.

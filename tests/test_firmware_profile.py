@@ -201,14 +201,16 @@ def test_zc3201_fatlib_mount_completes() -> None:
     from unicorn.arm_const import UC_ARM_REG_R0
 
     fw = load_upd(str(ZC_PATH))
-    machine = build_zc3201_machine(fw, MachineConfig(instructions_per_tick=20_000))
+    machine = build_zc3201_machine(fw, MachineConfig(instructions_per_tick=100_000))
 
     divisors: list[int] = []
     reached_lookup = {"v": False}
 
     def on_div(m: object) -> None:
         r0 = machine.uc.reg_read(UC_ARM_REG_R0)
-        divisors.append(int.from_bytes(machine.read_bytes(r0 + 0x2C, 4), "little"))
+        # r0 is a *virtual* struct pointer; under the real MMU read through the
+        # translation (read_u32 routes via machine.mmu.read_va), not raw physical.
+        divisors.append(machine.read_u32(r0 + 0x2C))
 
     def on_lookup(m: object) -> None:
         reached_lookup["v"] = True
@@ -217,7 +219,7 @@ def test_zc3201_fatlib_mount_completes() -> None:
     machine.on_code(0x0800_C974, on_div)   # FUN_0800c974 (global-block → part/block)
     machine.on_code(0x0800_0868, on_lookup)  # nandboot post-mount file-by-name lookup
 
-    machine.run(250_000_000)
+    machine.run(500_000_000)
 
     assert divisors, "FUN_0800c974 (FatLib block translation) never reached"
     assert 0 not in divisors, "map divisor zeroed — manager overrun (nandboot_geom_seed?)"
@@ -340,10 +342,10 @@ def test_zc3201_standby_descends_past_gpio_pin0_wait() -> None:
 
     fw = load_upd(str(ZC_PATH))
     assert ZC3201.gpio_in_idle == 0x0000_3200, "ZC3201 idle word must clear GPIO bit0"
-    machine = build_zc3201_machine(fw, MachineConfig(instructions_per_tick=20_000))
+    machine = build_zc3201_machine(fw, MachineConfig(instructions_per_tick=100_000))
     dbg = fw_zc.Zc3201Debugger(machine)
     dbg.attach_watches()
-    machine.run(40_000_000)
+    machine.run(200_000_000)
 
     visited = [pc for _clock, pc in dbg.leaves]
     assert 0x0803_EF7C in visited, "statechart never reached the standby state machine"
@@ -390,7 +392,7 @@ def test_zc3201_oid_tap_captured_and_dispatched() -> None:
     from tt_emu.machine import MachineConfig
 
     fw = load_upd(str(ZC_PATH))
-    machine = build_zc3201_machine(fw, MachineConfig(instructions_per_tick=20_000))
+    machine = build_zc3201_machine(fw, MachineConfig(instructions_per_tick=100_000))
 
     poll_cb = {"n": 0}
     machine.on_code(0x0800_5F48, lambda _m: poll_cb.__setitem__("n", poll_cb["n"] + 1))
@@ -402,7 +404,7 @@ def test_zc3201_oid_tap_captured_and_dispatched() -> None:
 
     machine.on_code(0x0800_37D8, on_dispatch)
 
-    machine.run(40_000_000)  # boot to book-mode idle
+    machine.run(200_000_000)  # boot to book-mode idle
     assert poll_cb["n"] > 50, (
         f"the 40 ms OID poll timer callback did not run in book mode ({poll_cb['n']}) "
         "— the OID sensor's driver is not armed"
@@ -411,9 +413,9 @@ def test_zc3201_oid_tap_captured_and_dispatched() -> None:
     oid = 8065  # a scripted OID from the example.gme range
     base = machine.oid.gameplay_frames_served
     machine.oid.hold(oid)
-    machine.run(30_000_000)
+    machine.run(80_000_000)
     machine.oid.lift()
-    machine.run(20_000_000)
+    machine.run(120_000_000)
 
     assert machine.oid.gameplay_frames_served > base, (
         "the firmware never latched the tapped OID (the nandboot shift-in did not "
