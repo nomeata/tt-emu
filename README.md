@@ -10,9 +10,9 @@ terminal UI where you "tap" OID codes and hear the audio in real time.
 
 The **1st-generation ZC3201 pen** (`v0136 / 120117`) is supported too: its unmodified
 firmware boots and plays GMEs through the same scripting API (discover the `.gme` → mount
-it on a product-OID tap → play a content OID's media). It is recognized automatically from
-the `.upd` you pass. The ZC3201 DAC PCM decode is not modelled, so on that firmware a
-played clip carries the media *identity* (index / offset+size) rather than PCM bytes.
+it on a product-OID tap → play a content OID's media), **including the decoded audio** — a
+played clip carries real S16LE PCM (`clip.pcm` / `save_wav`), captured off the pen's own DAC
+just like on the 2nd-gen pen. It is recognized automatically from the `.upd` you pass.
 
 ![The tt-emu TUI with the firmware-aware debugger open — live statechart, GME interpreter
 registers, and OID→script-line routing with symbolic names joined from a tttool

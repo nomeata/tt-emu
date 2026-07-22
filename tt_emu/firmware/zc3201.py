@@ -33,6 +33,7 @@ __all__ = [
     "FINGERPRINT",
     "PC_VOICE_PLAY_SAMPLE",
     "STATE_HANDLERS",
+    "Zc3201DacPageMap",
     "Zc3201DebugSnapshot",
     "Zc3201Debugger",
     "event_name",
@@ -149,6 +150,70 @@ def event_name(event: int) -> str:
     if 0x1015 <= event <= 0x1045:
         return f"{event:#x} game/mode launch"
     return f"{event:#x}"
+
+
+#: The virtual→physical page table the 1st-gen nandboot MMU installs. Base
+#: ``0x08004400`` is a literal in ``virt_to_phys`` (``0x0800203c``): 512 PTEs cover
+#: the 2 MiB virtual window ``[0x08000000, 0x08200000)``; a PTE is ``phys_frame |
+#: flags``, valid iff ``PTE & 0xff0``, and ``virt_to_phys(v) = (PTE[v]&~0xfff) |
+#: (v&0xfff)`` (proven at runtime — it reproduces every observed DAC mapping).
+DAC_PT_BASE = 0x0800_4400
+DAC_VBASE = 0x0800_0000
+DAC_VSPAN = 0x0020_0000
+DAC_PT_ENTRIES = DAC_VSPAN >> 12
+
+
+class Zc3201DacPageMap:
+    """Physical→flat resolver for the DAC bus master on the flat-loaded ZC3201.
+
+    tt-emu runs the ZC3201 firmware **flat** (virtual == flat address; no MMU
+    peripheral, unlike MT's :class:`~tt_emu.mmu_boot.MmuBoot`). That is faithful
+    for code and almost all data, because the firmware's own page table is
+    identity for them — but **not** for the audio DMA buffers, which use a
+    *non-identity* mapping: the software codec decodes S16LE PCM into a **virtual**
+    buffer (e.g. ``0x080fe800``) that the page table maps to **physical** low RAM
+    (e.g. ``0x08008800``). The DAC engine is a *physical* bus master, so its source
+    register carries the physical address; but in this flat emulator the decoded
+    bytes live at the *virtual* (== flat) address, while the physical address
+    aliases unrelated PROG memory. So to read what the DAC truly streams, invert
+    the firmware's page table (phys frame → virtual page) and read flat memory
+    there. Purely read-only: the firmware runs unmodified; this only consults its
+    installed page table and RAM. A small ``phys_frame → virt_page`` cache keeps it
+    to one page-table probe per submit once a buffer is known.
+    """
+
+    def __init__(self, machine: "Machine", *, pt_base: int = DAC_PT_BASE) -> None:
+        self.machine = machine
+        self._pt_base = pt_base
+        self._cache: dict[int, int] = {}
+
+    def resolve(self, phys: int, length: int) -> bytes | None:
+        """The ``length`` bytes the DAC streams from physical ``phys`` (or ``None``
+        if no valid page maps there). Reads at the *virtual* alias — contiguous in
+        flat memory, so a chunk that runs to a page edge is still read correctly."""
+        frame = phys & 0xFFFF_F000
+        virt_page = self._cache.get(frame)
+        if virt_page is None or not self._maps_to(virt_page, frame):
+            virt_page = self._scan(frame)
+            if virt_page is None:
+                return None
+            self._cache[frame] = virt_page
+        return self.machine.read_bytes(virt_page | (phys & 0xFFF), length)
+
+    def _maps_to(self, virt_page: int, frame: int) -> bool:
+        idx = (virt_page - DAC_VBASE) >> 12
+        pte = self._u32(self._pt_base + idx * 4)
+        return bool(pte & 0xFF0) and (pte & 0xFFFF_F000) == frame
+
+    def _scan(self, frame: int) -> int | None:
+        for idx in range(DAC_PT_ENTRIES):
+            pte = self._u32(self._pt_base + idx * 4)
+            if pte & 0xFF0 and (pte & 0xFFFF_F000) == frame:
+                return DAC_VBASE + (idx << 12)
+        return None
+
+    def _u32(self, addr: int) -> int:
+        return struct.unpack("<I", self.machine.read_bytes(addr, 4))[0]
 
 
 @dataclass

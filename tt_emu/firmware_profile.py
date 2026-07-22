@@ -213,6 +213,19 @@ class FirmwareProfile:
     #: ``None`` for large-page (MT) firmware, which has no such split.
     nand_spare_surface_strobe: int | None = None
 
+    #: DAC destination-port word the audio DMA submit programs into ``0x04010008``
+    #: (``AudioDma._on_start``). MT's bootrom port resolver maps the audio port to
+    #: code ``0x6200`` (``0x08086200``); the 1st-gen ZC3201 bootrom (``0x08003928``)
+    #: maps audio port 1 to ``0x5200`` (``0x08085200``) — proven at runtime. The
+    #: rest of the submit (``(len>>2)|0x2000`` START, bit16 kick) is identical.
+    dac_port_dst: int = 0x0808_6200
+
+    #: One live divider→rate calibration point ``(divider, rate_hz)`` for the DAC
+    #: rate decode (``AudioDma.current_rate`` / ``rate_from_divider``). MT: ``0x28 →
+    #: 22050``. ZC3201: ``0x18 → 32000`` (its 1st-gen audio master clock; the
+    #: example media's own context declares 32000 Hz mono).
+    dac_rate_ref: tuple[int, int] = (0x28, 22050)
+
     #: NAND READ-ID dword the pen's boot probe expects (``NfcController.read_id``).
     #: 2N-MT: Samsung K9GAG08U0M ``0x9551D3EC`` (bytes EC D3 51 95, 4-KiB page).
     #: ZC3201: Samsung K9F5608 ``0xBDA575EC`` (bytes EC 75 A5 BD, 512-byte page) —
@@ -404,6 +417,8 @@ ZC3201 = FirmwareProfile(
     oid_pin_data=16,           # ...and samples data/attention on GPIO16 (MT: GPIO9)
     oid_bit_count_addr=0x0800_7BF9,  # capture-state struct 0x08007bf8, bit_count +1
     gpio_amp_pin=9,            # ZC3201 audio amp is GPIO9 (frees GPIO16 for OID data)
+    dac_port_dst=0x0808_5200,  # bootrom port resolver 0x08003928 maps audio port 1 -> 0x5200
+    dac_rate_ref=(0x18, 32000),  # 1st-gen DAC clock: divider 0x18 -> 32000 Hz (media ctx: 32000 mono)
     # The AUTHENTIC ZC3201 SVC stack top (Leg 22): the reset handler's own stack
     # setup — nandboot ``0x07ff8108`` does ``mov r1, #0x8200000; mov sp, r1`` in SVC
     # mode immediately before ``ldr pc, =boot_task_main``. ZC3201's ``Utl_UStr*``

@@ -13,6 +13,7 @@ This is a slow test: a full boot → mount → tap → play chain on the emulate
 from __future__ import annotations
 
 import os
+import struct
 import wave
 from pathlib import Path
 
@@ -20,6 +21,7 @@ import pytest
 from _data import firmware_path, firmware_path_zc3201, game_dir, gme_zc3201
 
 from tt_emu import Clip, Emulator, ExpectationError
+from tt_emu.audio_capture import FRAME_BYTES, SAMPLE_BYTES
 from tt_emu.firmware.symbols import GmeScripts
 
 UPD_PATH = firmware_path()
@@ -29,6 +31,12 @@ YAML_PATH = GAME_DIR / "taschenrechner.yaml" if GAME_DIR is not None else None
 
 #: The OID code assigned to the "acht" (eight) script (taschenrechner.codes.yaml).
 ACHT_OID = 4716
+
+#: Standard PCM rates a decoded clip may report (the DAC bring-up default 8000 is
+#: transient and never the settled track rate). MT content is 22050; the ZC3201
+#: example content is 32000, but the previous clip's rate can bleed across the
+#: boundary before the divider is reprogrammed, so the test asserts membership.
+_STANDARD_DECODE_RATES = frozenset({11025, 16000, 22050, 32000, 44100})
 
 #: The MT-specific tests (real S16LE PCM byte-compare, live ``$``-register file,
 #: the multi-part number readout) ride the taschenrechner game + its YAML, which
@@ -118,10 +126,9 @@ def test_mount_tap_play_core(case: dict) -> None:
     firmwares expose (``tap`` / ``mounted`` / ``expect_play`` / ``now_playing``),
     resolving "what plays" through each firmware's own play observable — MT's
     ``play_media`` and ZC3201's ``voice_play_sample``, both keyed on the media
-    table's ``(offset, size)``. MT additionally asserts real PCM, the live register
-    file, and the multi-part readout in :func:`test_scripting_end_to_end` (below);
-    those are genuinely MT-specific and stay MT-only. On ZC3201 the DAC PCM decode
-    is not modelled, so the play is asserted by media identity (index), not bytes.
+    table's ``(offset, size)`` — and the actual **decoded PCM** captured off each
+    firmware's DAC. The MT-specific extras (the live ``$``-register file and the
+    multi-part number readout) stay in :func:`test_scripting_end_to_end` below.
     """
     with Emulator(firmware=case["firmware"], gme=case["gme"], yaml=case["yaml"]) as pen:
         # Booted into book mode via the authentic power-on descent; nothing mounted.
@@ -137,6 +144,20 @@ def test_mount_tap_play_core(case: dict) -> None:
         assert clip.kind == "media"
         assert clip.index is not None  # a real media-table entry played
         assert pen.now_playing == case["expected"]
+
+        # Byte-level PCM: run the playback on a bit, then assert real audio was
+        # captured off the DAC — modelled on BOTH firmwares. On ZC3201 this rides
+        # the retargeted DAC DMA (port 0x08085200) + the page-table source resolver
+        # (Zc3201DacPageMap); on MT the native path. The bytes are S16LE stereo,
+        # decoded at a standard rate, non-silent and not clipped-garbage.
+        pen.wait("500ms")
+        pcm = clip.pcm
+        assert len(pcm) > 0 and len(pcm) % FRAME_BYTES == 0  # whole S16LE stereo frames
+        assert clip.rate in _STANDARD_DECODE_RATES           # a real decoded rate
+        samples = struct.unpack(f"<{len(pcm) // SAMPLE_BYTES}h", pcm)
+        peak = max(abs(s) for s in samples)
+        assert 0 < peak < 32768                       # real waveform, not silence/rail
+        assert any(s != 0 for s in samples)
 
 
 @mt_only

@@ -1744,3 +1744,48 @@ Product changes this leg: `FirmwareProfile.svc_stack_top` (ZC3201 `0x08200000`),
 udisk merge, `stubs.OrBitsRegisterStub`/`make_zc3201_audio_codec_stub`, the codec/DAC/dormant wiring
 in `build_zc3201_machine`. New: `tests/test_zc3201_scripting.py`, `tests/_data.gme_zc3201`,
 `scripts/zc3201_opendir_probe.py`. Full suite **165 passed**.
+
+## Leg 25 — the ZC3201 DAC PCM is captured hook-free (Leg 18 premise CORRECTED); byte-level clip assertions on both firmwares
+
+The one deferred model — real ZC3201 DAC PCM, so `Clip.pcm` / `save_wav` work on the 1st-gen pen —
+is done. Two Leg-18 premises turned out wrong, both the same pre-solution guess class:
+
+1. **The DAC submit is NOT a different encoding — it is MT's, verbatim.** Proven at the register
+   level (empirical trace + disassembly of the bootrom submit primitive `func_0x080039a4`, the audio
+   HAL's `hal_dma_submit` twin): it writes **src→`+0x04`**, **dst→`+0x08`**, **`(len>>2)|0x2000`
+   (START/bit13)→`+0x0c`**, then kicks **`+0x00` bit16**, and busy-polls `+0x0c` bit13 — identical
+   to `AudioDma._on_start`. Leg 18's "writes `+0x00` directly, no `+0x0c` START" observed the **NAND
+   L2-staging strobes** (`0x00520424`/`0x00520c24` at pc `0x080038xx`, bit11), which share `+0x00`,
+   and mistook them for the audio submit. The **only** real difference is the DAC destination-port
+   code: the bootrom port resolver `0x08003928` maps audio **port 1 → `0x5200`** (dst word
+   `0x08085200`), vs MT's `0x6200`/`0x08086200`. Chunk `0x400`, same as MT. So the MT `AudioDma`
+   model is reused, retargeted via `profile.dac_port_dst`; it drives the completion IRQ (line 0) and
+   the ping-pong refill runs (0 unresolved submits). The Leg-18 "spurious kick-clear" fear does not
+   bite in practice.
+
+2. **The DAC read needs the firmware's page table.** The decisive subtlety: tt-emu runs ZC3201
+   **flat** (no `MmuBoot`), which is faithful for code and nearly all data — but **not** for the
+   audio DMA buffers. The software codec (IMA-ADPCM/`adpcm_decode` `0x080c43a4`) decodes S16LE PCM
+   into a **virtual** buffer (e.g. `0x080fe800`) that the firmware's page table (`virt_to_phys`
+   `0x0800203c`, PT base `0x08004400`) maps to **physical** low RAM (`0x08008800`). The DAC is a
+   *physical* bus master, so its source register carries the physical address — which in the flat
+   emulator aliases unrelated **PROG code** (reading it gave the image header as "audio"). Fix:
+   invert the firmware's own page table (phys frame → virtual page) and read the virtual (== flat)
+   alias where the decoded bytes actually live — `firmware/zc3201.Zc3201DacPageMap`, injected as the
+   `AudioDma` `src_translate`. Purely read-only (page table + RAM); firmware runs unmodified.
+   Verified genuine: mid-clip samples are a smooth `207,207 195,195 184,184 …` waveform, L==R
+   (mono duplicated to stereo).
+
+**Rate.** Decoded from the DAC divider (`0x04000008` bits[20:13]) with a per-SoC clock constant
+`rate_ref × (div_ref+1)`: ZC3201 `0x18 → 32000` (`rate_k = 800000`), cross-checked against the media
+context's own declared field (32000 Hz mono at `+0x14`; `+0x1c` channels = 1). `Clip.rate` is now
+window-local (a track runs at one rate, but the previous clip's rate can bleed across the boundary
+before the divider is reprogrammed).
+
+Product changes: `AudioDma` parameterised (`dac_port_dst`, `swallow_flag_addr`, `src_translate`,
+`amp_pin`/`mute_pin`, `rate_ref`); `rate_from_divider(divider, rate_k, default)`;
+`FirmwareProfile.dac_port_dst` + `dac_rate_ref`; `Zc3201DacPageMap` in `firmware/zc3201.py`;
+`build_zc3201_machine` wires `AudioDma` (replacing the bare `L2NandBuffer`) + `machine.audio`;
+`Emulator._enter_zc3201` sets `self._capture`; `Clip.pcm`/`rate`/`save_wav` work on ZC3201.
+`test_mount_tap_play_core` now asserts real byte-level PCM (S16LE-framed, standard rate, non-silent,
+un-railed) on **both** firmwares. Full suite **167 passed**.

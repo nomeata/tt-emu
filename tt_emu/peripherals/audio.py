@@ -48,6 +48,7 @@ the boot/playback paths exercised so far.
 from __future__ import annotations
 
 import logging
+from typing import Callable
 
 from ..audio_capture import AudioCapture
 from ..machine import PHYS_RAM_BASE, Machine
@@ -119,15 +120,18 @@ PIN_AMP_ENABLE = 16
 PIN_MUTE = 13
 
 
-def rate_from_divider(divider: int) -> int:
+def rate_from_divider(divider: int, rate_k: int = _RATE_K, default: int = _RATE_REF) -> int:
     """Decode the achieved DAC rate from the ``0x04000008`` divider code.
 
-    Scaled from the live-Observed 0x28 → 22050 Hz point (see module docstring
-    DOC GAP note) and snapped to the standard rate set when within 8 %.
+    ``rate ≈ rate_k / (divider + 1)``, snapped to the standard rate set within 8 %.
+    ``rate_k`` is the per-SoC clock constant ``rate_ref × (div_ref + 1)`` calibrated
+    from one live divider→rate point: MT ``0x28 → 22050`` (``rate_k = 904050``);
+    ZC3201 ``0x18 → 32000`` (``rate_k = 800000``, its 1st-gen audio master clock),
+    cross-checked against the media context's declared rate field (32000 Hz mono).
     """
     if divider <= 0:
-        return _RATE_REF  # divider never programmed: assume the GME track rate
-    estimate = _RATE_K / (divider + 1)
+        return default  # divider never programmed: assume the track rate
+    estimate = rate_k / (divider + 1)
     best = min(STANDARD_RATES, key=lambda r: abs(r - estimate))
     if abs(best - estimate) / best <= 0.08:
         return best
@@ -146,11 +150,44 @@ class AudioDma(L2NandBuffer):
         syscon: SysCon,
         gpio: GpioBlock | None = None,
         capture: AudioCapture | None = None,
+        *,
+        dac_port_dst: int = DAC_PORT_DST,
+        swallow_flag_addr: int | None = SWALLOW_FLAG_ADDR,
+        src_translate: "Callable[[int, int], bytes | None] | None" = None,
+        amp_pin: int = PIN_AMP_ENABLE,
+        mute_pin: int | None = PIN_MUTE,
+        rate_ref: tuple[int, int] = (_DIV_REF, _RATE_REF),
     ) -> None:
         super().__init__(nfc)
         self._intc = intc
         self._syscon = syscon
         self._gpio = gpio
+        #: Physical→flat resolver for the DAC source bytes. ``None`` (MT) reads the
+        #: source straight through :meth:`~tt_emu.machine.Machine.read_phys` (its
+        #: MMU model resolves physical→flat). ZC3201 runs flat and its DMA buffers
+        #: use a non-identity page mapping, so it injects
+        #: :meth:`~tt_emu.firmware.zc3201.Zc3201DacPageMap.resolve` to read the
+        #: virtual alias where the decoded PCM actually lives.
+        self._src_translate = src_translate
+        #: Amp-enable / mute pins for the "audible" annotation (§1). MT: amp GPIO16,
+        #: mute GPIO13. ZC3201: amp GPIO9, no modelled mute pin (``mute_pin=None``).
+        self._amp_pin = amp_pin
+        self._mute_pin = mute_pin
+        #: DAC destination port word this SoC uses (``src|dst`` encoding of §2):
+        #: MT programs port code ``0x6200`` (``0x08086200``); the 1st-gen ZC3201
+        #: bootrom port resolver maps audio port 1 to ``0x5200`` (``0x08085200``,
+        #: proven at runtime). Everything else about the submit is identical.
+        self._dac_port_dst = dac_port_dst
+        #: Teardown swallow-flag address (§6), or ``None`` to never swallow — the
+        #: ZC3201 flush flag is a heap struct field (not a fixed global), so that
+        #: firmware passes ``None`` and its short teardown silence buffer is simply
+        #: captured (benign trailing silence) rather than suppressed.
+        self._swallow_flag_addr = swallow_flag_addr
+        #: Per-SoC DAC clock constant for the divider→rate decode (see
+        #: :func:`rate_from_divider`): ``rate_ref × (div_ref + 1)``. MT ``(0x28,
+        #: 22050)``; ZC3201 ``(0x18, 32000)``.
+        self._rate_k = rate_ref[1] * (rate_ref[0] + 1)
+        self._rate_default = rate_ref[1]
         self.capture = capture if capture is not None else AudioCapture()
         self._complete_at: int | None = None
         self._warned_mem2mem = False
@@ -215,7 +252,7 @@ class AudioDma(L2NandBuffer):
         length = (value & WORDCOUNT_MASK) * 4
         dst = self._regs.get(DMA_DST, 0)
         src = self._regs.get(DMA_SRC, 0)
-        if dst != DAC_PORT_DST:
+        if dst != self._dac_port_dst:
             if (dst & ~0xFFFF) == PORT_FLAG or (src & ~0xFFFF) == PORT_FLAG:
                 log.warning("DMA to/from unmodelled port (src=%#x dst=%#x len=%#x)",
                             src, dst, length)
@@ -237,7 +274,7 @@ class AudioDma(L2NandBuffer):
             machine.clock + machine.config.instructions_per_tick * 5
         )
         rate = self.current_rate()
-        if machine.read_u8(SWALLOW_FLAG_ADDR):
+        if self._swallow_flag_addr is not None and machine.read_u8(self._swallow_flag_addr):
             self.flush_submits += 1  # §6 silence flush: complete, don't capture
         else:
             data = self._resolve_and_read(src, length)
@@ -273,17 +310,22 @@ class AudioDma(L2NandBuffer):
         machine = self.machine
         assert machine is not None
         phys = PHYS_RAM_BASE | (src & SRC_WINDOW_MASK)
+        if self._src_translate is not None:
+            return self._src_translate(phys, length)
         return machine.read_phys(phys, length)
 
     def _audible(self) -> bool:
-        """Amp on (GPIO16=1) and mute released (GPIO13=0) — §1 audibility."""
+        """Amp on and mute released — §1 audibility (pins per SoC: see ctor)."""
         if self._gpio is None:
             return True
-        return self._gpio.out_level(PIN_AMP_ENABLE) == 1 and self._gpio.out_level(PIN_MUTE) == 0
+        if self._gpio.out_level(self._amp_pin) != 1:
+            return False
+        return self._mute_pin is None or self._gpio.out_level(self._mute_pin) == 0
 
     def current_rate(self) -> int:
         """The DAC rate per the divider field ``0x04000008`` bits[20:13] (§7 item 5)."""
-        return rate_from_divider((self._syscon.read_reg(REG_CLK_AUDIO) >> 13) & 0xFF)
+        divider = (self._syscon.read_reg(REG_CLK_AUDIO) >> 13) & 0xFF
+        return rate_from_divider(divider, self._rate_k, self._rate_default)
 
     # --- completion delivery (§3/§4) --------------------------------------------------------------
 

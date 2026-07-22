@@ -53,7 +53,14 @@ from typing import Callable, Iterable, Iterator
 
 from unicorn.arm_const import UC_ARM_REG_R0, UC_ARM_REG_R1, UC_ARM_REG_R2, UC_ARM_REG_R3
 
-from .audio_capture import CHANNELS, FRAME_BYTES, SAMPLE_BYTES, AudioCapture, AudioStats
+from .audio_capture import (
+    BRINGUP_RATE,
+    CHANNELS,
+    FRAME_BYTES,
+    SAMPLE_BYTES,
+    AudioCapture,
+    AudioStats,
+)
 from .boot import BootedMachine, build_machine, build_zc3201_machine
 from .firmware import mt as fw_mt
 from .firmware import zc3201 as fw_zc3201
@@ -255,16 +262,28 @@ class Clip:
 
     @property
     def rate(self) -> int:
-        """The capture sample rate (Hz); 0 when no DAC PCM is captured (ZC3201)."""
+        """The capture sample rate (Hz) of *this* clip; 0 when no DAC PCM captured.
+
+        Window-local: the last non-bring-up rate among this clip's own chunks (a
+        playback runs at one rate, but the previous clip's rate can bleed across
+        the boundary before the DAC divider is reprogrammed, so keying on the
+        clip's chunks — not the global capture — reports the track's real rate).
+        Falls back to the global capture rate if this window has no settled rate."""
         capture = self._emu._capture
-        return capture.wav_rate if capture is not None else 0
+        if capture is None:
+            return 0
+        end = self._end_clock
+        for chunk in reversed(capture.chunks):
+            if self._start <= chunk.clock < end and chunk.rate != BRINGUP_RATE:
+                return chunk.rate
+        return capture.wav_rate
 
     @property
     def pcm(self) -> bytes:
         """The captured S16LE stereo PCM of this playback (may grow as it plays).
 
-        Empty on ZC3201, whose DAC PCM decode is not modelled — the clip still
-        carries the played media *identity* (:attr:`media` / :attr:`index`)."""
+        Modelled on both firmwares (MT and 1st-gen ZC3201); the clip also carries
+        the played media *identity* (:attr:`media` / :attr:`index`)."""
         capture = self._emu._capture
         if capture is None:
             return b""
@@ -313,9 +332,10 @@ class Emulator:
         too and driven through :func:`tt_emu.boot.build_zc3201_machine` + the
         :class:`~tt_emu.firmware.zc3201.Zc3201Debugger`, exposing the same
         surface (:meth:`tap`, :attr:`mounted`, :meth:`wait_for_audio` /
-        :meth:`expect_play`, :attr:`now_playing`). The ZC3201 DAC PCM decode is
-        not modelled, so on that firmware a :class:`Clip` carries the played
-        media *identity* (index / offset+size) but no PCM bytes.
+        :meth:`expect_play`, :attr:`now_playing`) — including the DAC PCM: the
+        1st-gen audio path is modelled (its software codec's decoded S16LE bytes
+        are captured off the retargeted DAC DMA), so a :class:`Clip` carries real
+        :attr:`~Clip.pcm` and :meth:`save_wav` works, just like on MT.
     gme, gmes:
         The ``.gme`` file(s) to place on partition B:. ``gme`` is a single file;
         ``gmes`` an iterable of files. The first game's product code is what
@@ -476,7 +496,11 @@ class Emulator:
         self._is_zc3201 = True
         self._booted = None
         self.machine = machine
-        self._capture = None  # the ZC3201 DAC PCM decode is not modelled (identity only)
+        # The 1st-gen DAC PCM path IS modelled: build_zc3201_machine wires an
+        # AudioDma retargeted to the ZC3201 DAC port with the page-table source
+        # resolver (Zc3201DacPageMap), so the same off-the-DAC capture MT uses
+        # yields real S16LE PCM here. Clip.pcm / save_wav therefore work.
+        self._capture = machine.audio.capture
         self._oid_sensor = machine.oid
         self._zc_debugger = Zc3201Debugger(machine)
         self._zc_debugger.attach_watches()
@@ -825,7 +849,7 @@ class Emulator:
     def save_wav(self, path: str | Path) -> AudioStats:
         """Write everything captured off the DAC so far as an S16LE stereo WAV."""
         if self._capture is None:
-            raise ScriptingError("no DAC PCM captured on this firmware (ZC3201): media identity only")
+            raise ScriptingError("no DAC PCM captured on this firmware")
         return self._capture.write_wav(path)
 
     # --- read-only properties (pure, no side effects) ----------------------------------

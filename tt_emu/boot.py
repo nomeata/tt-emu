@@ -34,6 +34,7 @@ from .loader import (
     PROG_ENTRY,
     PROG_LOAD_ADDR,
 )
+from .firmware.zc3201 import Zc3201DacPageMap
 from .machine import Machine, MachineConfig
 from .mmu_boot import MmuBoot
 from .nand_image import NandImage, build_nand_image
@@ -41,7 +42,7 @@ from .peripherals.audio import AudioDma
 from .peripherals.battery import BatteryAdc
 from .peripherals.gpio import GpioBlock
 from .peripherals.intc import IntcTimer
-from .peripherals.nand import EccEngine, L2NandBuffer, NfcController
+from .peripherals.nand import EccEngine, NfcController
 from .peripherals.oid import OidSensor
 from .peripherals import stubs
 from .peripherals.syscon import SysCon
@@ -294,7 +295,8 @@ def build_zc3201_machine(
     # gates the HAL software-timer tick; decouple the two latches so the tick —
     # and thus the statechart's periodic event driver — actually runs.
     intc = IntcTimer(gpio, zc3201_timer_ack=True)
-    machine.add_peripheral(SysCon(chip_id=profile.soc_chip_id))
+    syscon = SysCon(chip_id=profile.soc_chip_id)
+    machine.add_peripheral(syscon)
     machine.add_peripheral(intc)
     machine.add_peripheral(gpio)
     machine.add_peripheral(BatteryAdc())
@@ -332,13 +334,32 @@ def build_zc3201_machine(
     )
     machine.add_peripheral(nfc)
     machine.add_peripheral(ecc)
-    machine.add_peripheral(L2NandBuffer(nfc))
-    # NOTE: the 0x04010000 block is shared between NAND L2 staging and the audio
-    # DAC DMA, but ZC3201's DAC submit encoding differs from MT's (it writes the
-    # control word at +0x00 directly — no +0x0c wordcount START — and involves
-    # 0x04080000), so MT's AudioDma model does not fire here and its DMA_CTRL
-    # kick-clear could spuriously drop the audio IRQ line. Retargeting the audio
-    # DAC is the next wall (docs/zc3201-boot-feasibility.md "Leg 18").
+    # The 0x04010000 block is shared between NAND L2 staging and the audio DAC DMA.
+    # ZC3201 drives the DAC through the SAME submit protocol MT uses — proven at
+    # runtime: the bootrom submit primitive (nandboot 0x080039a4) writes src to
+    # +0x04, dst to +0x08, ``(len>>2)|0x2000`` (START/bit13) to +0x0c, then kicks
+    # +0x00 bit16 — register-for-register identical to MT. The ONLY difference is
+    # the DAC destination-port code: the bootrom port resolver (0x08003928) maps
+    # audio port 1 to 0x5200 (dst word 0x08085200) vs MT's 0x6200 (0x08086200).
+    # So the MT AudioDma model captures ZC3201 PCM verbatim once retargeted via
+    # ``profile.dac_port_dst``; its teardown swallow flag is a heap struct field
+    # here (not a fixed global), so pass ``swallow_flag_addr=None`` — the short
+    # teardown silence buffer is then captured (benign) rather than suppressed.
+    # The DAC is a physical bus master, but ZC3201 runs flat while its audio
+    # buffers use a non-identity page mapping (the codec decodes PCM to a virtual
+    # buffer the MMU maps to low physical RAM). So resolve the DAC source through
+    # the firmware's own page table (phys frame -> virtual page -> flat) — see
+    # Zc3201DacPageMap. The amp is GPIO9 (profile.gpio_amp_pin), no modelled mute.
+    dac_pagemap = Zc3201DacPageMap(machine)
+    audio = AudioDma(
+        nfc, intc, syscon, gpio,
+        dac_port_dst=profile.dac_port_dst, swallow_flag_addr=None,
+        src_translate=dac_pagemap.resolve,
+        amp_pin=profile.gpio_amp_pin, mute_pin=None,
+        rate_ref=profile.dac_rate_ref,
+    )
+    machine.add_peripheral(audio)
+    machine.audio = audio  # the scripting API reads audio.capture for Clip.pcm
     if profile.nand_small_page and profile.nand_spare_surface_strobe:
         # The MtdLib readspare leaf presents the page's OOB at the NAND window
         # head, then reads the 4-byte map tag from window[0]. On hardware the
