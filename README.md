@@ -13,8 +13,8 @@ hear the audio in real time.
 Both generations run the **same way through the same API** — discover the `.gme`, mount
 it on a product-OID tap, play a content OID's media, and capture the decoded **S16LE PCM**
 (`clip.pcm` / `save_wav`) off the pen's own DAC — and tt-emu recognizes which generation an
-image is automatically. (The only asymmetry is the TUI's rich firmware-aware debugger,
-which is currently mapped for the 2N "MT" build; see [The GME debugger](#the-gme-debugger).)
+image is automatically, including the TUI's rich firmware-aware debugger (see
+[The GME debugger](#the-gme-debugger)).
 
 ![The tt-emu TUI with the firmware-aware debugger open — live statechart, GME interpreter
 registers, and OID→script-line routing with symbolic names joined from a tttool
@@ -87,27 +87,28 @@ timing-sensitive game behaviour; the captured audio is identical either way.
 
 ### The GME debugger
 
-The TUI's rich, firmware-aware debugger panels are the one place the two pen generations
-differ: they are mapped for the 2N **"MT"** build (`N0038MT / 20131009`, identified by a
-byte-exact fingerprint), whose statechart, GME interpreter, and OID→script routing are
-fully reverse-engineered. When that image is loaded, the TUI adds these live panels on top
-of the generic view — press **`d`** to toggle them:
+Both recognized builds — the 2N **"MT"** (`N0038MT / 20131009`) and the 1st-gen
+**ZC3201** (`v0136 / 120117`), each identified by a byte-exact fingerprint — get the TUI's
+rich, firmware-aware debugger. When a recognized image is loaded, the TUI adds these live
+panels on top of the generic view — press **`d`** to toggle them:
 
-- **Statechart** — the firmware's live QHsm state hierarchy (all 70 states named), active
-  leaf highlighted;
-- **Transitions** — a clock-stamped log of every state change (push/pop/sibling),
-  annotated with the event that caused it;
+- **Statechart** — the firmware's live state. On MT this is the full QHsm state hierarchy
+  (all 70 states named) with the active leaf highlighted; the ZC3201 uses a flat
+  handler-dispatch statechart, so its panel shows the single active leaf;
+- **Transitions** — a clock-stamped log of every state change, annotated with the event
+  that caused it;
 - **GME interpreter** — the mounted product and file, the `$`-register file with live
   values, playlist/media state, armed GME timers, pending deferred jumps;
 - **OID → script** — the last tapped OID, which script line it routed to, and that line's
   conditions (with live register values), actions, and playlist, plus a trace of the
   actions the interpreter actually executed.
 
-It's all **hook-free**: the firmware runs unmodified and the debugger only polls emulator
-RAM (plus documented read-only watchpoints for the executed-action trace). Other firmware
-— including the 1st-gen ZC3201 — runs the same emulation but keeps the generic TUI panels;
-the ZC3201 has its own hook-free live readers (statechart leaf, event ring), but they drive
-the scripting API rather than the TUI panels for now.
+This works across generations because the GME interpreter is a **shared twin**: the 2N and
+1st-gen builds run the same bytecode interpreter over the same RAM layout, shifted by a
+uniform offset, so the same hook-free readers drive both. It's all **hook-free**: the
+firmware runs unmodified and the debugger only polls emulator RAM (plus documented
+read-only watchpoints for the executed-action trace). Unrecognized firmware runs the same
+emulation but keeps the generic TUI panels.
 
 With `--yaml book.yaml` (the tttool source of the loaded `.gme`, plus its sibling
 `book.codes.yaml` for the script→OID codes), the panels show **symbolic names**: registers

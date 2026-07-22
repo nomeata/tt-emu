@@ -22,8 +22,20 @@ On any other firmware :func:`recognize` fails and none of this is used.
 from __future__ import annotations
 
 import struct
-from dataclasses import dataclass
+from collections import deque
 from typing import TYPE_CHECKING, Callable
+
+from unicorn.arm_const import UC_ARM_REG_R0, UC_ARM_REG_R1, UC_ARM_REG_R2, UC_ARM_REG_R3
+
+from .mt import (
+    MtDebugSnapshot,
+    OidRouting,
+    PRODUCT_OID_MAX,
+    Transition,
+    render_action,
+    render_condition,
+)
+from .symbols import GmeScripts, TttoolSymbols
 
 if TYPE_CHECKING:
     from ..machine import Machine
@@ -34,7 +46,6 @@ __all__ = [
     "PC_VOICE_PLAY_SAMPLE",
     "STATE_HANDLERS",
     "Zc3201DacPageMap",
-    "Zc3201DebugSnapshot",
     "Zc3201Debugger",
     "event_name",
     "recognize",
@@ -43,6 +54,8 @@ __all__ = [
 
 # --- Firmware recognition (matches firmware_profile.ZC3201.build_prefix) ------------------
 FINGERPRINT = b"v0136\x00\x00\x00\x00\x00" + b"120117" + b"\x00\x00\x00\x00" + b"Tiptoi"
+#: Short label for the recognized image (the debugger-panel banner).
+FIRMWARE_LABEL = "v0136 / 120117 (1st-gen ZC3201)"
 
 
 def recognize(prog: bytes) -> bool:
@@ -216,19 +229,37 @@ class Zc3201DacPageMap:
         return struct.unpack("<I", self.machine.read_bytes(addr, 4))[0]
 
 
-@dataclass
-class Zc3201DebugSnapshot:
-    """One immutable-ish view of the ZC3201 framework state (RAM + PC observation)."""
+# --- GME-interpreter RAM addresses (verified live against a content tap; the whole
+# 2N GME state block is a uniform -0x2028 shift of the MT block — see firmware-2n-mt §4
+# and the MT addresses in :mod:`tt_emu.firmware.mt`). The register file, the register
+# count, the GME context, and the akoid low fields are all solid; the resident parsed-
+# script-line arrays proved unreliable (cleared between parse and exec), so the OID→script
+# panel renders from the .gme container keyed on the reliable akoid ``last_oid`` instead.
+REG_FILE_ADDR = 0x081D_8328    # u16[] $-register file
+REG_COUNT_ADDR = 0x081D_8078   # u32 (low 16 = count)
+PRODUCT_ID_ADDR = 0x081D_8064  # u32 mounted product id
+GME_STATUS_ADDR = 0x081D_805F  # u8, bit7 = GME mounted, bit6 = scanning
+TICK_ADDR = 0x0800_7DEC        # u32 monotonic tick (20 ms timer)
+XOR_ACTIVE_ADDR = 0x0800_7BE8  # u8, 1 = GME media (vs system voice)
 
-    ready: bool = False               #: the AO pointer global is populated
-    leaf: str = ""                    #: current statechart leaf (last handler entered)
-    leaf_pc: int = 0
-    ring_head: int = 0
-    ring_tail: int = 0
-    ring_pending: int = 0             #: events queued but not yet drained
-    timer_ticks: int = 0             #: HAL software-timer ticks observed
-    dispatches: int = 0              #: sm_dispatch_hierarchy calls observed
-    recent_events: tuple[int, ...] = ()  #: events seen flowing through the ring
+#: akoid_buf (OID-routing struct): base = ``*(gb_app_context + 0x40)``. The low fields
+#: match MT; the play/jump fields sit at ZC-specific offsets (mid-struct layout differs).
+AKOID_PTR_ADDR = 0x0800_77DC        # = gb_app_context(0x0800779C) + 0x40
+AKOID_LAST_OID = 0x04               # u32 (OID fits 16 bits)
+AKOID_LAST_CONTENT = 0x1A           # u16
+AKOID_OID_MIN = 0x1C                # u16 mounted GME's first content OID
+AKOID_OID_MAX = 0x1E                # u16 last content OID
+AKOID_PLAY_BUSY = 0xD8              # u8
+AKOID_PLAYALL_MODE = 0xDC           # u8
+AKOID_PLAYALL_CURSOR = 0xDD         # u8
+AKOID_JUMP_PENDING = 0xD80          # u8
+AKOID_JUMP_TARGET = 0xD82           # u16
+
+#: Interpreter watchpoints (twins of MT's): the executed-action trace and "now playing".
+PC_GME_EXEC_COMMAND = 0x0804_C6E4   # r0..r3 = register, opcode, is-const, operand
+PC_PLAY_CHOMP_VOICE = 0x0809_7374   # system-voice play (Chomp_Voice.bin)
+_OPCODE_PLAY = 0xFFE8               # GME "Play n" action opcode
+MAX_REGISTERS = 256                 # display clamp
 
 
 class Zc3201Debugger:
@@ -244,22 +275,45 @@ class Zc3201Debugger:
         self,
         machine: "Machine",
         *,
+        gme_files: list[bytes] | None = None,
+        symbols: TttoolSymbols | None = None,
         log: Callable[[str], None] | None = None,
     ) -> None:
         self.machine = machine
+        self.symbols = symbols
         self._log = log or (lambda _msg: None)
         self.leaf_pc = 0
         self.timer_ticks = 0
         self.dispatches = 0
         self.leaves: list[tuple[int, int]] = []   # (clock, handler_pc)
+        self._reported_leaves = 0                 # poll_transition cursor into leaves
         self._recent_events: list[int] = []
+        self._recent_actions: deque[str] = deque(maxlen=12)  # executed-action trace
+        self.last_play = ""                       # "now playing" from the play watches
+        #: The mounted game(s), for the container-driven OID→script routing.
+        self._scripts: list[GmeScripts] = []
+        for data in gme_files or ():
+            try:
+                self._scripts.append(GmeScripts(data))
+            except (ValueError, struct.error, IndexError):
+                continue
 
-    # --- low-level safe reads -------------------------------------------------------------
+    # --- low-level safe reads (MMU-aware) -------------------------------------------------
+    def _read(self, addr: int, size: int) -> bytes:
+        """Read guest memory, translating VA→physical through the firmware's MMU.
+
+        The interpreter globals (0x081Dxxxx) live in the demand-paged region where VA≠PA,
+        so a raw physical ``read_bytes`` would read the wrong bytes; go through the MMU's
+        ``read_va`` when it is enabled (identity for the resident low region, so the ring /
+        AO reads are unaffected)."""
+        mmu = self.machine.mmu
+        return mmu.read_va(addr, size) if mmu is not None else self.machine.read_bytes(addr, size)
+
     def _u16(self, addr: int) -> int:
-        return struct.unpack("<H", self.machine.read_bytes(addr, 2))[0]
+        return struct.unpack("<H", self._read(addr, 2))[0]
 
     def _u32(self, addr: int) -> int:
-        return struct.unpack("<I", self.machine.read_bytes(addr, 4))[0]
+        return struct.unpack("<I", self._read(addr, 4))[0]
 
     @property
     def ready(self) -> bool:
@@ -271,11 +325,20 @@ class Zc3201Debugger:
 
     # --- read-only PC watchpoints ---------------------------------------------------------
     def attach_watches(self) -> None:
-        """Add the leaf-handler / pump / timer observation points (firmware unmodified)."""
+        """Add the leaf-handler / pump / timer / interpreter observation points.
+
+        Read-only PC watchpoints (the firmware runs unmodified): the statechart leaves,
+        the pump, the software-timer tick, plus the GME interpreter's executed-action
+        command (the twin of MT's ``gme_exec_command``) and the two play paths (game
+        media / system voice) for the "now playing" line.
+        """
         for pc in STATE_HANDLERS:
             self.machine.on_code(pc, self._make_leaf(pc))
         self.machine.on_code(PC_SM_DISPATCH, self._on_dispatch)
         self.machine.on_code(PC_TIMER_TICK, self._on_timer_tick)
+        self.machine.on_code(PC_GME_EXEC_COMMAND, self._on_exec_command)
+        self.machine.on_code(PC_VOICE_PLAY_SAMPLE, self._on_play_media)
+        self.machine.on_code(PC_PLAY_CHOMP_VOICE, self._on_play_voice)
 
     def _make_leaf(self, pc: int) -> Callable[["Machine"], None]:
         def cb(machine: "Machine") -> None:
@@ -290,6 +353,69 @@ class Zc3201Debugger:
 
     def _on_timer_tick(self, _machine: "Machine") -> None:
         self.timer_ticks += 1
+
+    def _on_exec_command(self, machine: "Machine") -> None:
+        """One executed GME script action (r0..r3 = register, opcode, is-const, operand).
+
+        The exact action trace — the same observable MT's ``gme_exec_command`` watch gives,
+        rendered generation-neutrally. The playlist for a ``Play n`` action comes from the
+        routed line, resolved in :meth:`snapshot`; here the raw opcode/operand are enough.
+        """
+        uc = machine.uc
+        reg = uc.reg_read(UC_ARM_REG_R0)
+        opcode = uc.reg_read(UC_ARM_REG_R1)
+        is_const = uc.reg_read(UC_ARM_REG_R2)
+        operand = uc.reg_read(UC_ARM_REG_R3)
+        text = render_action(reg, opcode, is_const, operand, self.symbols, ())
+        self._recent_actions.append(text)
+        self._log(f"zc3201 gme: exec {text}")
+
+    def _on_play_media(self, _machine: "Machine") -> None:
+        self.last_play = "GME media (voice_play_sample)"
+        self._log(f"zc3201 gme: {self.last_play}")
+
+    def _on_play_voice(self, _machine: "Machine") -> None:
+        self.last_play = "system voice (Chomp_Voice)"
+        self._log(f"zc3201 voice: {self.last_play}")
+
+    # --- interpreter RAM reads ------------------------------------------------------------
+    def _u8(self, addr: int) -> int:
+        return self._read(addr, 1)[0]
+
+    def _ptr(self, addr: int) -> int | None:
+        p = self._u32(addr)
+        return p if 0x0800_0000 <= p < 0x0844_0000 else None
+
+    def registers(self) -> tuple[int, ...]:
+        """The GME ``$``-register file, clamped to the live register count."""
+        count = min(self._u16(REG_COUNT_ADDR), MAX_REGISTERS)
+        if count <= 0:
+            return ()
+        return struct.unpack(f"<{count}H", self._read(REG_FILE_ADDR, 2 * count))
+
+    def _scripts_for(self, product: int) -> GmeScripts | None:
+        for scripts in self._scripts:
+            if scripts.product == product:
+                return scripts
+        return None
+
+    # --- transition log (leaf changes; the QF framework has no QHsm frame stack) ----------
+    def poll_transition(self) -> Transition | None:
+        """One statechart move since the last poll, or ``None``.
+
+        ZC3201's QF framework is dispatched by handler PC (no QHsm frame-byte stack), so a
+        "transition" is a change of the active leaf handler. Pre-rendered with the ZC3201
+        state names (:data:`Transition.text`), since MT's ``state_name`` doesn't know them.
+        """
+        if self._reported_leaves >= len(self.leaves):
+            return None
+        _clock, pc = self.leaves[self._reported_leaves]
+        prev = self.leaves[self._reported_leaves - 1][1] if self._reported_leaves else 0
+        self._reported_leaves += 1
+        old = state_name(prev) if prev else "(pre-init)"
+        text = f"leaf    {old} → {state_name(pc)}"
+        return Transition(kind="leaf", old_chain=(prev,) if prev else (),
+                          new_chain=(pc,), text=text)
 
     # --- event ring (pure RAM) ------------------------------------------------------------
     def ring_state(self) -> tuple[int, int]:
@@ -306,21 +432,125 @@ class Zc3201Debugger:
             i = (i + 1) & 0x1F
         return tuple(out)
 
-    # --- snapshot -------------------------------------------------------------------------
-    def snapshot(self) -> Zc3201DebugSnapshot:
+    # --- OID -> script routing (container-driven, keyed on akoid last_oid) -----------------
+    def _routing(
+        self, oid: int, product: int, registers: tuple[int, ...], oid_min: int, oid_max: int
+    ) -> OidRouting | None:
+        """Render "tap OID → script line" from the .gme container + symbols.
+
+        Unlike MT (which reads the resident parsed line out of RAM), ZC3201's resident
+        line arrays are cleared between parse and exec, so this routes from the container
+        keyed on the reliable akoid ``last_oid`` and its content-OID band. The interpreter
+        evaluates lines in order and runs the first whose conditions hold; the first line is
+        the executed one for the single-line scripts typical of content OIDs.
+        """
+        if oid == 0:
+            return None
+        symbols = self.symbols
+        label = (symbols.oid_label(oid) or "") if symbols else ""
+        if oid <= PRODUCT_OID_MAX:
+            return OidRouting(oid=oid, kind="product-band", label=label)
+        if oid_min and not (oid_min <= oid <= oid_max):
+            return OidRouting(oid=oid, kind="out-of-range", label=label)
+        scripts = self._scripts_for(product)
+        lines = scripts.script(oid) if scripts else None
+        if lines is None:  # no container loaded — show the tap + band only
+            return OidRouting(oid=oid, kind="content", label=label)
+        if not lines:
+            return OidRouting(oid=oid, kind="no-script", label=label)
+        matched = 0
+        line = lines[matched]
+        conditions = tuple(render_condition(c, symbols, registers) for c in line.conds)
+        actions = tuple(
+            render_action(reg, op, const, operand, symbols, line.playlist)
+            for reg, op, const, operand in line.actions
+        )
+        playlist = tuple(
+            f"{index}:{symbols.media_name(index)}" if symbols else str(index)
+            for index in line.playlist
+        )
+        source = symbols.script_source(oid, matched) if symbols else None
+        return OidRouting(
+            oid=oid, label=label, kind="content", line_count=len(lines),
+            matched_line=matched, conditions=conditions, actions=actions,
+            playlist=playlist, source=source or "",
+        )
+
+    # --- the full snapshot (the shared MtDebugSnapshot the TUI panels render) --------------
+    def snapshot(self) -> MtDebugSnapshot:
+        """One immutable debug view; all-RAM, never raises (empty on any torn read)."""
         try:
-            head, tail = self.ring_state()
-            pending = (tail - head) & 0x1F
+            return self._snapshot()
         except Exception:  # noqa: BLE001
-            head = tail = pending = 0
-        return Zc3201DebugSnapshot(
-            ready=self.ready,
-            leaf=state_name(self.leaf_pc) if self.leaf_pc else "",
-            leaf_pc=self.leaf_pc,
-            ring_head=head,
-            ring_tail=tail,
-            ring_pending=pending,
-            timer_ticks=self.timer_ticks,
-            dispatches=self.dispatches,
-            recent_events=tuple(self._recent_events[-16:]),
+            return MtDebugSnapshot()
+
+    def _snapshot(self) -> MtDebugSnapshot:
+        if not self.ready:
+            return MtDebugSnapshot(ready=False)
+        chain = (self.leaf_pc,) if self.leaf_pc else ()
+        chain_names = (state_name(self.leaf_pc),) if self.leaf_pc else ()
+        registers = self.registers()
+        product = self._u32(PRODUCT_ID_ADDR)
+        handle = self._u32(CURRENT_GME_HANDLE)
+        handle = handle - 0x1_0000_0000 if handle >= 0x8000_0000 else handle
+        status = self._u8(GME_STATUS_ADDR)
+        symbols = self.symbols
+        product_label = (
+            symbols.comment
+            if symbols and symbols.product_id == product and symbols.comment
+            else ""
+        )
+        register_names = tuple(
+            (symbols.register_name(i) if symbols else f"${i}") for i in range(len(registers))
+        )
+
+        last_oid = oid_first = oid_last = 0
+        routing = None
+        play_busy = False
+        playall_mode = playall_cursor = 0
+        deferred: int | None = None
+        deferred_label = ""
+        akoid = self._ptr(AKOID_PTR_ADDR)
+        if akoid is not None:
+            last_oid = self._u32(akoid + AKOID_LAST_OID) & 0xFFFF
+            oid_first = self._u16(akoid + AKOID_OID_MIN)
+            oid_last = self._u16(akoid + AKOID_OID_MAX)
+            routing = self._routing(last_oid, product, registers, oid_first, oid_last)
+            play_busy = bool(self._u8(akoid + AKOID_PLAY_BUSY))
+            playall_mode = self._u8(akoid + AKOID_PLAYALL_MODE)
+            playall_cursor = self._u8(akoid + AKOID_PLAYALL_CURSOR)
+            if self._u8(akoid + AKOID_JUMP_PENDING):
+                deferred = self._u16(akoid + AKOID_JUMP_TARGET)
+                if symbols is not None:
+                    deferred_label = symbols.oid_label(deferred) or ""
+
+        return MtDebugSnapshot(
+            ready=True,
+            chain=chain,
+            chain_names=chain_names,
+            last_event=self._recent_events[-1] if self._recent_events else 0,
+            registers=registers,
+            register_names=register_names,
+            product=product,
+            product_label=product_label,
+            gme_handle=handle,
+            gme_mounted=bool(status & 0x80),
+            gme_path="",
+            book_count=0,
+            oid_first=oid_first,
+            oid_last=oid_last,
+            last_oid=last_oid,
+            first_tap_oid=0,
+            routing=routing,
+            play_busy=play_busy,
+            playall_mode=playall_mode,
+            playall_cursor=playall_cursor,
+            xor_active=bool(self._u8(XOR_ACTIVE_ADDR)),
+            deferred_jump=deferred,
+            deferred_jump_label=deferred_label,
+            timer_slot=None,
+            tick=self._u32(TICK_ADDR),
+            heartbeat=0,
+            last_play=self.last_play,
+            recent_actions=tuple(self._recent_actions),
         )

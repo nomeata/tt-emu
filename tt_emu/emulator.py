@@ -511,7 +511,11 @@ class Emulator:
         assert machine.audio is not None
         self._capture = machine.audio.capture
         self._oid_sensor = machine.oid
-        self._zc_debugger = Zc3201Debugger(machine)
+        self._zc_debugger = Zc3201Debugger(
+            machine,
+            gme_files=list(self._b_files.values()),
+            symbols=self._symbols,
+        )
         self._zc_debugger.attach_watches()
 
         # The GME play observable: voice_play_sample (r1=offset, r2=size) — the

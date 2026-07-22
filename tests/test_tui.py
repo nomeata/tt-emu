@@ -11,10 +11,11 @@ import asyncio
 import time
 
 import pytest
-from _data import firmware_path, game_dir
+from _data import firmware_path, firmware_path_zc3201, game_dir, gme_zc3201
 from _pilot import run_app, wait_for
 
 from tt_emu.audio_capture import AudioCapture
+from tt_emu.firmware import zc3201 as fw_zc3201
 from tt_emu.runner import gme_product_code
 from tt_emu.tui import (
     AudioOutput,
@@ -28,6 +29,8 @@ from tt_emu.tui import (
 _GAME_DIR = game_dir()
 UPD_PATH = firmware_path()
 GME_PATH = _GAME_DIR / "taschenrechner.gme" if _GAME_DIR is not None else None
+ZC_UPD_PATH = firmware_path_zc3201()
+ZC_GME_PATH = gme_zc3201()
 
 
 # --- audio ring / queue plumbing -----------------------------------------------------
@@ -267,3 +270,44 @@ def test_emulator_session_thread_boots_and_stops() -> None:
     assert session.snapshot.clock >= 2_000_000
     events = session.drain_events()
     assert any("checkpoint" in e for e in events), events
+
+
+@pytest.mark.skipif(
+    ZC_UPD_PATH is None or ZC_GME_PATH is None,
+    reason="ZC3201 firmware .upd / example.gme not available",
+)
+def test_zc3201_session_attaches_rich_debugger() -> None:
+    """The interactive session runs the 1st-gen ZC3201 through its own substrate
+    (build_zc3201_machine + real MMU) and attaches the rich Zc3201Debugger, so the
+    TUI's interpreter / OID→script / statechart panels render at parity with MT.
+
+    Boots to the stable book-idle voice-player leaf (~22 M insn) and asserts the
+    generation was recognized, the ZC3201 debugger (not MT's) is wired, and its
+    snapshot is populated with a live statechart leaf name.
+    """
+    session = EmulatorSession(
+        ZC_UPD_PATH, [ZC_GME_PATH], pacing="deterministic"
+    )
+    assert session.product_code == 42
+    session.start()
+    try:
+        # Book-idle is reached ~22 M insn in; give generous headroom for the
+        # demand-paging fault overhead on the boot descent.
+        deadline = time.monotonic() + 180.0
+        while True:
+            snap = session.snapshot
+            if snap.debug is not None and snap.debug.ready and snap.debug.leaf_name:
+                break
+            assert time.monotonic() < deadline, snap
+            assert session.running or snap.power.startswith("stopped"), snap
+            time.sleep(0.1)
+    finally:
+        session.shutdown(timeout=20.0)
+
+    # The refactor wired the 1st-gen path, not MT's, onto this image.
+    assert session._is_zc3201
+    assert isinstance(session.debugger, fw_zc3201.Zc3201Debugger)
+    assert "ZC3201" in session.snapshot.firmware_label
+    # The rich reader published a live statechart leaf (the flat handler-PC view).
+    assert session.snapshot.debug is not None
+    assert session.snapshot.debug.leaf_name

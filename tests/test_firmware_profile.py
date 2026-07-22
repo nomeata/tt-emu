@@ -309,9 +309,8 @@ def test_zc3201_statechart_advances_init_to_standby() -> None:
     dbg.attach_watches()
     machine.run(40_000_000)
 
-    snap = dbg.snapshot()
-    assert snap.timer_ticks > 100, (
-        f"HAL software-timer tick never ran ({snap.timer_ticks}) — the timer-status "
+    assert dbg.timer_ticks > 100, (
+        f"HAL software-timer tick never ran ({dbg.timer_ticks}) — the timer-status "
         "decouple regressed; the statechart's periodic driver is dead"
     )
     visited = [pc for _clock, pc in dbg.leaves]

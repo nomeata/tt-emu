@@ -114,7 +114,7 @@ class BootedMachine:
         self,
         machine: Machine,
         firmware: Firmware,
-        zc90b: Zc90bAuth,
+        zc90b: Zc90bAuth | None,
         nand: NandImage,
         oid: OidSensor,
         audio: AudioDma,
@@ -447,6 +447,7 @@ def build_zc3201_machine(
     machine.set_entry_state(profile.prog_entry, profile.svc_stack_top, CPSR_SVC_IRQS_ON)
     machine.nand = nand
     machine.oid = oid
+    machine.gpio = gpio  # so the interactive TUI can drive button pins
     log.info(
         "zc3201 machine for %s (%s): PROG @ %#010x, boot-task entry %#010x",
         profile.label, firmware.boot_generation, profile.prog_load, profile.prog_entry,

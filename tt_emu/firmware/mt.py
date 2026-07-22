@@ -375,14 +375,18 @@ class MtDebugSnapshot:
     heartbeat: int = 0
     last_play: str = ""  #: from the optional PC watches ("now playing")
     recent_actions: tuple[str, ...] = ()  #: executed-action trace (PC watch)
+    #: Human names of ``chain``, filled by the producing debugger (each firmware has
+    #: its own state_name), so a snapshot renders without the renderer knowing the
+    #: firmware. Empty when ``chain`` is empty.
+    chain_names: tuple[str, ...] = ()
 
     @property
     def leaf(self) -> int:
         return self.chain[-1] if self.chain else 0
 
     @property
-    def chain_names(self) -> tuple[str, ...]:
-        return tuple(state_name(s) for s in self.chain)
+    def leaf_name(self) -> str:
+        return self.chain_names[-1] if self.chain_names else ""
 
 
 @dataclass(frozen=True)
@@ -398,8 +402,14 @@ class Transition:
     old_chain: tuple[int, ...]
     new_chain: tuple[int, ...]
     last_oid: int = 0
+    #: Pre-rendered line, set by debuggers whose states aren't named by this module's
+    #: ``state_name`` (e.g. the 1st-gen ZC3201, whose leaves are handler PCs). When set,
+    #: :meth:`format` returns it verbatim instead of the MT-QHsm rendering.
+    text: str = ""
 
     def format(self) -> str:
+        if self.text:
+            return self.text
         old = state_name(self.old_chain[-1]) if self.old_chain else "(pre-init)"
         new = state_name(self.new_chain[-1]) if self.new_chain else "?"
         depth = f"depth {max(len(self.old_chain) - 1, 0)}→{len(self.new_chain) - 1}"
@@ -720,6 +730,7 @@ class MtDebugger:
         return MtDebugSnapshot(
             ready=True,
             chain=chain,
+            chain_names=tuple(state_name(s) for s in chain),
             last_event=self.last_event(),
             registers=registers,
             register_names=register_names,

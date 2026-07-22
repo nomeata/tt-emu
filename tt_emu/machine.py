@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from .mmu_boot import MmuBoot
     from .nand_image import NandImage
     from .peripherals.audio import AudioDma
+    from .peripherals.gpio import GpioBlock
     from .peripherals.oid import OidSensor
 
 __all__ = ["Machine", "MachineConfig", "RunResult"]
@@ -266,6 +267,9 @@ class Machine:
         #: for the scripting API's tap injection and off-the-DAC PCM capture).
         self.oid: OidSensor | None = None
         self.audio: AudioDma | None = None
+        #: The GPIO block (set by the ZC3201 machine builder, so the interactive
+        #: TUI can drive button pins without a separate BootedMachine handle).
+        self.gpio: GpioBlock | None = None
 
         self._peripherals: list[Peripheral] = []
         self._ticking: list[Peripheral] = []  # peripherals that override tick()

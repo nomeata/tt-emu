@@ -1839,3 +1839,44 @@ removed) — both pen generations run their whole gme test through the Emulator 
 100k cadence is still needed, but for a *separate*, genuine reason: it keeps the instruction-counted timer
 in step with fault-slowed real progress so the boot descent reaches book mode — at 20k the pen stalls in
 standby.)
+
+## Leg 27 — the rich TUI debugger reaches ZC3201 parity (the last MT-only asymmetry closed)
+
+The interactive TUI's firmware-aware panels — Statechart, Transitions, GME interpreter, OID→script —
+now render for the 1st-gen ZC3201, not just MT. This exploited the **shared-twin** interpreter: the 2N
+and 1st-gen builds run the same GME bytecode over the same RAM layout (uniform `-0x2028` shift), so the
+same `MtDebugSnapshot` model and panel renderers drive both. `Zc3201Debugger.snapshot()` returns a
+`MtDebugSnapshot`; the panels are generation-agnostic.
+
+**What the refactor actually required (it was *not* "just addresses in the profile"):** the TUI worker was
+hard-wired to MT's `build_machine`/`BootedMachine` and MT-only plumbing. Three couplings had to be
+generalized:
+
+1. **Machine build.** `build_zc3201_machine` returns a bare `Machine` (its MMU/OID/audio/GPIO attached as
+   attributes); the worker now wraps it in a `BootedMachine` (`zc90b=None` — the 1st gen has no ZC90B auth
+   chip). `Machine.gpio` was promoted to a real declared slot so the wrap has a GPIO handle. ZC3201 also runs
+   at 100k insn/tick (the boot-descent cadence from Leg 26), applied when the session is left at the default.
+
+2. **Tap-readiness gate.** MT gates a tap on `book_ready_for_tap` (a book-entry-tail PC hook + the MT
+   statechart/product/audio globals). ZC3201 has no such book gate; the TUI now mirrors the scripting
+   Emulator's `_zc_ready_for_tap` — wait for the book-idle voice-player leaf (`BOOK_IDLE_LEAF_PC`, seen via
+   the debugger's leaf watchpoints), no OID frame still armed, and the audio chain idle (no DAC submit for
+   ~2 ticks) so a content tap never lands mid-playlist.
+
+3. **Generic snapshot fields.** The MT boot-progress checkpoints, the book-tail hook, and the
+   `statechart_leaf`/`CURRENT_PRODUCT_ADDR`/`AUDIO_FLAGS_ADDR`/`RESUME_BYTE_ADDR` reads are MT PROG
+   addresses. Under the ZC3201 MMU those VAs would demand-page unrelated frames, so they are skipped for the
+   1st gen — its live state comes entirely from the rich debugger snapshot (`leaf_name`, routing, registers,
+   action trace), and its transition log is driven by the debugger's own `poll_transition()`.
+
+**Two latent bugs the parity test caught** (the `snapshot()` rich-view migration had never been test-run —
+Leg 26 left "test parity" pending): the debugger's `timer_ticks` moved off the snapshot onto the debugger
+instance (a boot-health check read the stale field), and the earlier `chain_names`→stored-field change (so
+ZC3201's flat leaf can name a state with no numeric id) left the TUI's fake-session snapshot supplying only
+`chain`, rendering the statechart panel empty. Both fixed.
+
+**Result:** `test_zc3201_session_attaches_rich_debugger` (headless: the interactive session recognizes the
+1st gen, builds it under the real MMU, attaches `Zc3201Debugger`, and publishes a live statechart leaf)
+passes; the scripting Emulator's ZC3201 debugger now also gets `gme_files`/`symbols` so its routing/OID panel
+resolves container playlists and symbolic names. Full suite green (mypy + ruff clean). The README's
+"the only asymmetry is the MT-only debugger" caveat is retired.

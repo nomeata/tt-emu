@@ -9,7 +9,7 @@ the TUI falls back to its generic panels.
 
 from __future__ import annotations
 
-from . import mt
+from . import mt, zc3201
 
 __all__ = ["detect", "mt"]
 
@@ -18,4 +18,6 @@ def detect(prog: bytes) -> str | None:
     """A short label for a recognized PROG image, or None."""
     if mt.recognize(prog):
         return mt.FIRMWARE_LABEL
+    if zc3201.recognize(prog):
+        return zc3201.FIRMWARE_LABEL
     return None

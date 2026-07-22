@@ -67,9 +67,10 @@ from textual.widgets import Button, Footer, Header, Input, OptionList, RichLog, 
 from textual.widgets.option_list import Option
 
 from .audio_capture import DEFAULT_RATE, FRAME_BYTES, CapturedChunk
-from .boot import BootedMachine, build_machine
+from .boot import BootedMachine, build_machine, build_zc3201_machine
 from .firmware import detect as detect_firmware
 from .firmware import mt as fw_mt
+from .firmware import zc3201 as fw_zc3201
 from .firmware.symbols import GmeScripts, TttoolSymbols, derive_media_names, load_tttool_yaml
 from .firmware_fetch import FirmwareDownloadError, FirmwareIntegrityError, ensure_firmware
 from .loader import load_upd
@@ -119,6 +120,11 @@ BUTTON_HOLD_TICKS = 40
 #: Give up on a held tap the firmware never latched after this many emulated
 #: instructions (mirrors the scripted runner's react timeout: 250 ticks).
 TAP_TIMEOUT_INSTRUCTIONS = 250 * SESSION_INSTRUCTIONS_PER_TICK
+
+#: ZC3201's boot descent needs a coarser tick than MT: its demand-paging fault
+#: overhead starves the timer-gated descent at the default rate, so the 1st-gen
+#: build runs at 100k insn/tick (mirrors the scripting Emulator's ZC3201 default).
+ZC3201_INSTRUCTIONS_PER_TICK = 100_000
 
 #: Snapshot republish cadence, in **wall** seconds (10 Hz — plenty for the UI).
 #: Wall-based on purpose: a clock-based cadence tuned for deterministic speeds
@@ -498,8 +504,10 @@ class EmuSnapshot:
 
     @property
     def leaf_name(self) -> str:
-        if self.debug is not None and self.debug.ready:
-            return fw_mt.state_name(self.leaf)
+        # The recognized debugger publishes its own state name (per firmware) in the
+        # snapshot; fall back to the generic QHsm-leaf table for unrecognized images.
+        if self.debug is not None and self.debug.ready and self.debug.leaf_name:
+            return self.debug.leaf_name
         return STATE_NAMES.get(self.leaf, f"state {self.leaf}")
 
 
@@ -566,8 +574,15 @@ class EmulatorSession:
         self.ring = AudioRing()
         self.booted: BootedMachine | None = None
         self.snapshot = EmuSnapshot()
-        self.debugger: fw_mt.MtDebugger | None = None  #: set on the worker thread
+        #: The firmware-aware debugger (set on the worker thread once recognized). MT's
+        #: rich reader or the 1st-gen ZC3201's — both publish the same MtDebugSnapshot and
+        #: a poll_transition(), so the panels render firmware-agnostically.
+        self.debugger: fw_mt.MtDebugger | fw_zc3201.Zc3201Debugger | None = None
         self._firmware_label = ""
+        #: True once the loaded image is recognized as the 1st-gen ZC3201 build.
+        #: The two generations differ in the machine builder, the tap-readiness
+        #: gate, and the boot-progress checkpoints — everything else is shared.
+        self._is_zc3201 = False
 
         self._commands: deque[tuple[object, ...]] = deque()  # thread-safe deque
         self._events: deque[str] = deque(maxlen=2000)
@@ -582,6 +597,7 @@ class EmulatorSession:
         self._held: tuple[int, int, int] | None = None  # (oid, press clock, gameplay base)
         self._last_lift = 0
         self._book_tail_at: int | None = None  # set by the book-entry-tail hook
+        self._zc_book_reached = False  # ZC3201: book-idle leaf seen (tap-gate latch)
         self._button_releases: list[tuple[int, str, int]] = []  # (clock, name, pin)
         self._last_snapshot_wall = 0.0
         self._last_leaf = -1
@@ -649,24 +665,44 @@ class EmulatorSession:
         self.post_event(f"loading firmware {Path(self.firmware_path).name} …")
         try:
             firmware = load_upd(self.firmware_path)
+            self._is_zc3201 = fw_zc3201.recognize(firmware.prog.data)
+            ipt = ZC3201_INSTRUCTIONS_PER_TICK if (
+                self._is_zc3201 and self._ipt == SESSION_INSTRUCTIONS_PER_TICK
+            ) else self._ipt
+            self._ipt = ipt  # the readiness gate's audio-idle window keys on it
             # In deterministic (count-paced) mode chunk_instructions is pinned
             # to the historical 2000: coarser deterministic chunks shift a held
             # tap's first post-book-entry capture into the welcome-jingle window
             # where the firmware discards it. In realtime mode chunks are
             # wall-interval-paced (the default effective_chunk = 2 ms) and the
             # shared book_ready_for_tap gate spaces the taps.
-            booted = build_machine(
-                firmware,
-                MachineConfig(
-                    instructions_per_tick=self._ipt,
-                    chunk_instructions=(
-                        2_000 if self._pacing == "deterministic" else None
-                    ),
-                    dac_pacing=self._dac_pacing,
-                    pacing=self._pacing,
+            config = MachineConfig(
+                instructions_per_tick=ipt,
+                chunk_instructions=(
+                    2_000 if self._pacing == "deterministic" else None
                 ),
-                b_files=self._b_files or None,
+                dac_pacing=self._dac_pacing,
+                pacing=self._pacing,
             )
+            if self._is_zc3201:
+                # 1st-gen substrate: build_zc3201_machine returns a bare Machine
+                # (its own MMU + peripherals attached as attributes); wrap it in a
+                # BootedMachine so the shared worker plumbing is generation-agnostic.
+                # It has no ZC90B auth chip (zc90b=None).
+                machine = build_zc3201_machine(
+                    firmware, config, b_files=self._b_files or None
+                )
+                assert machine.mmu is not None
+                assert machine.nand is not None
+                assert machine.oid is not None
+                assert machine.audio is not None
+                assert machine.gpio is not None
+                booted = BootedMachine(
+                    machine, firmware, None, machine.nand,
+                    machine.oid, machine.audio, machine.gpio, machine.mmu,
+                )
+            else:
+                booted = build_machine(firmware, config, b_files=self._b_files or None)
         except Exception as exc:  # noqa: BLE001 — surface any build failure in the UI
             self.snapshot = replace(self.snapshot, power=f"failed: {exc}")
             self.post_event(f"FAILED to build the machine: {exc}")
@@ -682,13 +718,23 @@ class EmulatorSession:
         self._firmware_label = detect_firmware(firmware.prog.data) or ""
         if self._firmware_label:
             game_blobs = list(self._b_files.values())
-            self.debugger = fw_mt.MtDebugger(
-                booted.machine,
-                gme_files=game_blobs,
-                symbols=self.symbols,
-                log=self._debug_log,
-                read_mem=booted.mmu.read_va,
-            )
+            if self._is_zc3201:
+                # The 1st-gen reader is MMU-aware internally (it routes RAM reads
+                # through machine.mmu), so it needs no read_mem hook.
+                self.debugger = fw_zc3201.Zc3201Debugger(
+                    booted.machine,
+                    gme_files=game_blobs,
+                    symbols=self.symbols,
+                    log=self._debug_log,
+                )
+            else:
+                self.debugger = fw_mt.MtDebugger(
+                    booted.machine,
+                    gme_files=game_blobs,
+                    symbols=self.symbols,
+                    log=self._debug_log,
+                    read_mem=booted.mmu.read_va,
+                )
             self.debugger.attach_watches()
             self.post_event(
                 f"firmware recognized: {self._firmware_label} — debugger panels enabled"
@@ -704,14 +750,21 @@ class EmulatorSession:
                 f"{len(sym.scripts)} scripts, {len(sym.register_names)} registers, "
                 f"{len(sym.media_names)} media names)"
             )
-        for addr, name in CHECKPOINTS.items():
-            booted.machine.on_code(addr, self._make_checkpoint(name))
-        for addr, name in FATAL_ADDRS.items():
-            booted.machine.on_code(addr, self._make_checkpoint(f"FATAL: {name}", fatal=True))
-        booted.machine.on_code(
-            BOOK_ENTRY_TAIL_PC, self._make_checkpoint("book entry finished (§7.3.2)")
-        )
-        booted.machine.on_code(BOOK_ENTRY_TAIL_PC, self._note_book_tail)
+        # Boot-progress checkpoints + the book-entry-tail tap gate are keyed on MT
+        # PROG addresses (runner.py). ZC3201 has its own boot descent and tap-gate
+        # (keyed on the book-idle statechart leaf, see _ready_for_tap), so these are
+        # MT-only — under ZC3201 they would register hooks on PCs that never execute.
+        if not self._is_zc3201:
+            for addr, name in CHECKPOINTS.items():
+                booted.machine.on_code(addr, self._make_checkpoint(name))
+            for addr, name in FATAL_ADDRS.items():
+                booted.machine.on_code(
+                    addr, self._make_checkpoint(f"FATAL: {name}", fatal=True)
+                )
+            booted.machine.on_code(
+                BOOK_ENTRY_TAIL_PC, self._make_checkpoint("book entry finished (§7.3.2)")
+            )
+            booted.machine.on_code(BOOK_ENTRY_TAIL_PC, self._note_book_tail)
         booted.audio.capture.listener = self._on_audio_chunk
 
         self.snapshot = replace(self.snapshot, power="running")
@@ -760,7 +813,31 @@ class EmulatorSession:
         :func:`~tt_emu.runner.book_ready_for_tap` condition (a tap pressed
         during the book-entry jingle is discarded without mounting; once a
         product is mounted content taps proceed on the settle gap alone)."""
+        if self._is_zc3201:
+            return self._zc_ready_for_tap(machine)
         return book_ready_for_tap(machine, self._book_tail_at)
+
+    def _zc_ready_for_tap(self, machine: Machine) -> bool:
+        """ZC3201 twin of the readiness gate (the settle gap is checked by the
+        caller). Mirrors the scripting Emulator's ``_zc_ready_for_tap``: wait for
+        the boot to reach the stable book-idle voice-player leaf, no OID frame
+        still armed, and the audio chain idle (no DAC submit for ~2 ticks) so a
+        content tap never lands mid-playlist and drops its remaining entries."""
+        dbg = self.debugger
+        if not isinstance(dbg, fw_zc3201.Zc3201Debugger):
+            return False
+        if not self._zc_book_reached:
+            if any(pc == fw_zc3201.BOOK_IDLE_LEAF_PC for _, pc in dbg.leaves):
+                self._zc_book_reached = True
+            else:
+                return False
+        booted = self.booted
+        if booted is not None and booted.oid.pending:
+            return False
+        audio = machine.audio
+        if audio is not None and machine.clock - audio.last_dac_submit_at < 2 * self._ipt:
+            return False
+        return True
 
     def _on_chunk(self, machine: Machine) -> None:
         """Per-chunk callback on the emulation thread: apply commands, observe."""
@@ -849,24 +926,38 @@ class EmulatorSession:
             self._insn_per_s = (now - self._rate_clock) / (wall - self._rate_wall)
             self._rate_clock = now
             self._rate_wall = wall
-        leaf = statechart_leaf(machine)
-        if leaf != self._last_leaf:
-            self._last_leaf = leaf
-            if self.debugger is not None:
-                name = fw_mt.state_name(leaf)
-            else:
-                name = STATE_NAMES.get(leaf, f"state {leaf}")
-            self.post_event(f"[{now:>12,}] statechart leaf -> {name} ({leaf})")
-        mounted = machine.read_u32(CURRENT_PRODUCT_ADDR)
-        if mounted != self._last_mounted:
-            self._last_mounted = mounted
-            self.post_event(f"[{now:>12,}] mounted product -> {mounted}")
-        chain = bool(machine.read_u8(AUDIO_FLAGS_ADDR) & AUDIO_CHAIN_ACTIVE)
-        if chain != self._last_chain:
-            self._last_chain = chain
-            self.post_event(
-                f"[{now:>12,}] audio chain {'started (play_media)' if chain else 'stopped'}"
-            )
+        if self._is_zc3201:
+            # ZC3201's live state comes from the rich debugger snapshot (published
+            # via ``debug=`` below). The MT statechart / current-product / audio-flags
+            # globals live at other addresses on 1st-gen, and reading those MT VAs
+            # under the ZC3201 MMU would demand-page unrelated frames — so the generic
+            # top-line fields stay neutral and the debugger drives the panels + the
+            # transition log (its poll_transition already reports leaf changes).
+            leaf = 0
+            mounted = 0
+            chain = False
+            resume_byte = 0
+        else:
+            leaf = statechart_leaf(machine)
+            if leaf != self._last_leaf:
+                self._last_leaf = leaf
+                if self.debugger is not None:
+                    name = fw_mt.state_name(leaf)
+                else:
+                    name = STATE_NAMES.get(leaf, f"state {leaf}")
+                self.post_event(f"[{now:>12,}] statechart leaf -> {name} ({leaf})")
+            mounted = machine.read_u32(CURRENT_PRODUCT_ADDR)
+            if mounted != self._last_mounted:
+                self._last_mounted = mounted
+                self.post_event(f"[{now:>12,}] mounted product -> {mounted}")
+            chain = bool(machine.read_u8(AUDIO_FLAGS_ADDR) & AUDIO_CHAIN_ACTIVE)
+            if chain != self._last_chain:
+                self._last_chain = chain
+                self.post_event(
+                    f"[{now:>12,}] audio chain "
+                    f"{'started (play_media)' if chain else 'stopped'}"
+                )
+            resume_byte = machine.read_u8(RESUME_BYTE_ADDR)
         capture = booted.audio.capture
         last = self._last_chunk
         # One emulated second = instructions_per_tick * 50 instructions.
@@ -876,7 +967,7 @@ class EmulatorSession:
             clock=now,
             leaf=leaf,
             mounted_product=mounted,
-            resume_byte=machine.read_u8(RESUME_BYTE_ADDR),
+            resume_byte=resume_byte,
             pen_down=booted.oid.pending,
             chain_active=chain,
             insn_per_s=self._insn_per_s,

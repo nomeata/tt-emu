@@ -222,6 +222,7 @@ class _FakeDebugSession:
             debug=mt.MtDebugSnapshot(
                 ready=True,
                 chain=(3, 12, 13),
+                chain_names=tuple(mt.state_name(s) for s in (3, 12, 13)),
                 last_event=0x1060,
                 registers=(0, 0, 8, 0, 0, 0, 8, 0, 0, 0, 0),
                 register_names=tuple(
