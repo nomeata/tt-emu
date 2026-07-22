@@ -60,8 +60,12 @@ def _reg_reader(machine):
 
 def _build(gme: bytes):
     fw = load_upd(str(UPD_PATH))
+    # 100k insn/tick: the firmware runs under its real MMU, whose demand-paging
+    # fault overhead is ~5x the flat model's instruction count per unit of
+    # progress; the timer/audio cadence scales with it (see emulator._ZC3201_
+    # INSTRUCTIONS_PER_TICK). Run budgets below are likewise ~5x the flat values.
     machine = build_zc3201_machine(
-        fw, MachineConfig(instructions_per_tick=20_000), b_files={"example.gme": gme}
+        fw, MachineConfig(instructions_per_tick=100_000), b_files={"example.gme": gme}
     )
     plays: list[tuple[int, int]] = []
     read = _reg_reader(machine)
@@ -73,7 +77,7 @@ def _build(gme: bytes):
     return machine, plays
 
 
-def _tap(machine, oid: int, *, latch: int = 30_000_000, play: int = 45_000_000) -> None:
+def _tap(machine, oid: int, *, latch: int = 60_000_000, play: int = 200_000_000) -> None:
     machine.oid.hold(oid)
     machine.run(latch)
     machine.oid.lift()
@@ -95,13 +99,13 @@ def test_zc3201_discovers_mounts_and_plays_tapped_oid() -> None:
 
     # Power-on descent into book-mode idle (the chime may play from A:'s
     # Chomp_Voice.bin — its source is the udisk image, not the game media).
-    machine.run(45_000_000)
+    machine.run(150_000_000)
 
     # Product tap → discovery-listed EXAMPLE.GME mounts and its welcome media plays.
     machine.oid.hold(PRODUCT_OID)
-    machine.run(30_000_000)
+    machine.run(60_000_000)
     machine.oid.lift()
-    machine.run(45_000_000)
+    machine.run(200_000_000)
     product_plays = [p for p in plays if p in media_set]
     assert product_plays, (
         "product tap produced no game-media play (mount/welcome) — "

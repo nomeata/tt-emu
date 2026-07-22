@@ -98,11 +98,16 @@ __all__ = [
 #: 20 ms timer period is the pacing unit).
 _TICK_MS = 20
 
-#: ZC3201's proven emulation cadence (``tests/test_zc3201_scripting.py`` /
-#: ``docs/zc3201-boot-feasibility.md``): the 1st-gen timer/OID-poll timing is
-#: calibrated at 20k instructions per 20 ms tick, not MT's ~1M session cadence.
-#: Used for ZC3201 when the caller left the pacing at the MT default.
-_ZC3201_INSTRUCTIONS_PER_TICK = 20_000
+#: ZC3201's proven emulation cadence under its real MMU (``docs/zc3201-boot-
+#: feasibility.md``). The 1st-gen firmware demand-pages heavily, so a large share
+#: of executed instructions are the abort-handler/refiner overhead of servicing
+#: faults — ~5x more instructions per unit of firmware progress than the flat
+#: model. The timer/audio/OID cadence must scale with that, so one 20 ms tick is
+#: 100k instructions (not the flat build's 20k): at 20k the timer fires too often
+#: relative to progress and the audio-completion-gated GME playlist advance
+#: starves (a welcome playlist stops after its first media). Used for ZC3201 when
+#: the caller left the pacing at the MT default.
+_ZC3201_INSTRUCTIONS_PER_TICK = 100_000
 
 #: Pen buttons (``gpio-buttons-led.md`` §2/§3): name -> (pin, active level).
 _BUTTONS: dict[str, tuple[int, int]] = {
@@ -689,10 +694,15 @@ class Emulator:
         """The ZC3201 twin of the readiness gate (settle gap already checked).
 
         The boot has descended to the stable book-idle leaf (``voice_player`` —
-        entered ~22 M insn in and held), and no OID frame is still armed/held. The
-        ZC3201 event ring is a continuously-cycling timer/event pump (rarely
-        momentarily drained), so — unlike MT — readiness keys on the book leaf, not
-        a ring-quiet condition.
+        entered ~22 M insn in and held), no OID frame is still armed/held, and the
+        audio chain is idle. The ZC3201 event ring is a continuously-cycling
+        timer/event pump (rarely momentarily drained), so — unlike MT — readiness
+        keys on the book leaf, not a ring-quiet condition. The audio-idle check
+        (no DAC submit for a settle gap) is what keeps a content tap from landing
+        mid-playlist: a product tap returns as soon as its welcome *starts*, but
+        that welcome is often a multi-media playlist, and interrupting it before it
+        finishes drops the remaining entries (the shared GME interpreter advances
+        the playlist on audio completion).
         """
         assert self._zc_debugger is not None
         if not self._zc_book_reached:
@@ -700,7 +710,15 @@ class Emulator:
                 self._zc_book_reached = True
             else:
                 return False
-        return not (self._oid_sensor is not None and self._oid_sensor.pending)
+        if self._oid_sensor is not None and self._oid_sensor.pending:
+            return False
+        # Audio idle: no DAC submit for ~2 ticks (a playback in progress submits
+        # buffers continuously; a finished playlist stops). machine.audio is the
+        # AudioDma wired by build_zc3201_machine.
+        audio = getattr(self.machine, "audio", None)
+        if audio is not None and self.machine.clock - audio.last_dac_submit_at < 2 * self._ipt:
+            return False
+        return True
 
     def _mount_token(self) -> int:
         """The RAM word whose change signals "a game got mounted" for this
