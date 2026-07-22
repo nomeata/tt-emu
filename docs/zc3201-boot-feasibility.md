@@ -1820,12 +1820,22 @@ structural deltas (frame_count 38, usage-clock MMIO `0x04010120`, PROG-evict's s
 its game media, under the real MMU**) passes. `MmuBoot` parameterization and the `Machine.irq_stack_top`
 / `AudioDma` pager-LRU plumbing landed on `main`.
 
-**Open (tracked, xfail):** the higher-level `Emulator`-API path (`test_mount_tap_play_core[zc3201]`)
-trips a **demand-paging thrash**. Driving the same mount→content-tap→play chain through the Emulator's
-*stop/restart* run loop (each `_run_until` ends its `emu_start` at a predicate) leaves the CPU stuck in
-**abort mode (I=1)** cycling the refiner (`pc≈0x08001498`/`0x08003200`) after a content tap — IRQs mask,
-the timer stops, the event pump starves, no play. Run **continuously** (the machine-level test) the same
-chain is fine, so it is an Emulator-flow / Unicorn abort-delivery-across-`emu_stop` interaction, **not**
-an MMU-model defect. Leading hypothesis: an `emu_stop` landing on an in-flight abort rewinds the faulting
-instruction's TB, re-delivering the abort and mis-pairing the `pgstack` push/pop — worth understanding as
-it may be a latent bug on any demand-paging path, MT included.
+**The demand-paging thrash — ROOT-CAUSED and FIXED (`MmuBoot._fault_addr` scaled-index bug).** The
+Emulator-API path (`test_mount_tap_play_core[zc3201]`) had tripped a thrash: after a content tap the CPU
+stuck in **abort mode (I=1)** cycling the refiner (`pc≈0x08001498`/`0x08003200`) — IRQs masked, timer
+dead, event pump starved, no play — while the machine-level continuous run was fine. Tracing it (the
+process itself is the lesson): pgstack stayed balanced (not a push/pop leak); the eviction LRU and its
+usage-clock (`0x04010120`, off by frames 0-2 locked, not the offset) were correct; the frame masks
+(`0x04010014/18`) were firmware-managed and fine. The stuck was ~2700 allocator calls/3 s = a **re-fault
+loop on one VA** (`0x08114000`), which had PTE `0x8014ffa` — **present, AP=11, domain OK** — so it should
+never fault. The faulting instruction was `strlt r1, [r2, r0, lsl #2]` (a scaled-register store); its real
+target is `r2 + (r0<<2) = 0x8115000`, but `_fault_addr` computed `0x8114000`: it read the index scale from
+`op.mem.lshift` (0 in this capstone build) instead of `op.shift.value` (=2), dropping the `<<2`. So the
+handler refined the *wrong* page forever while `0x8115000` stayed unmapped. **Fix:** `_scaled_index()`
+honours `op.shift` (LSL/LSR/ASR/ROR). Latent on **any** demand-paged scaled-index store (MT included); it
+only surfaced when such a store was the *first* to fault a page, which the Emulator's execution order hit
+and the flat build / 100k pacing did not. With it fixed, `test_mount_tap_play_core[zc3201]` passes (xfail
+removed) — both pen generations run their whole gme test through the Emulator API under their real MMU. (The
+100k cadence is still needed, but for a *separate*, genuine reason: it keeps the instruction-counted timer
+in step with fault-slowed real progress so the boot descent reaches book mode — at 20k the pen stalls in
+standby.)

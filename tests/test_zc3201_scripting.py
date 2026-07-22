@@ -60,10 +60,11 @@ def _reg_reader(machine):
 
 def _build(gme: bytes):
     fw = load_upd(str(UPD_PATH))
-    # 100k insn/tick: the firmware runs under its real MMU, whose demand-paging
-    # fault overhead is ~5x the flat model's instruction count per unit of
-    # progress; the timer/audio cadence scales with it (see emulator._ZC3201_
-    # INSTRUCTIONS_PER_TICK). Run budgets below are likewise ~5x the flat values.
+    # 100k insn/tick: under the real MMU the demand-paging fault-handler overhead
+    # inflates the instruction count per unit of firmware progress, so the timer
+    # cadence scales up to keep the timer-gated boot descent from starving (see
+    # emulator._ZC3201_INSTRUCTIONS_PER_TICK, docs Leg 26). Budgets below are ~5x
+    # the flat values to cover the same overhead.
     machine = build_zc3201_machine(
         fw, MachineConfig(instructions_per_tick=100_000), b_files={"example.gme": gme}
     )

@@ -98,15 +98,17 @@ __all__ = [
 #: 20 ms timer period is the pacing unit).
 _TICK_MS = 20
 
-#: ZC3201's proven emulation cadence under its real MMU (``docs/zc3201-boot-
-#: feasibility.md``). The 1st-gen firmware demand-pages heavily, so a large share
-#: of executed instructions are the abort-handler/refiner overhead of servicing
-#: faults — ~5x more instructions per unit of firmware progress than the flat
-#: model. The timer/audio/OID cadence must scale with that, so one 20 ms tick is
-#: 100k instructions (not the flat build's 20k): at 20k the timer fires too often
-#: relative to progress and the audio-completion-gated GME playlist advance
-#: starves (a welcome playlist stops after its first media). Used for ZC3201 when
-#: the caller left the pacing at the MT default.
+#: ZC3201's emulation cadence under its real MMU (``docs/zc3201-boot-feasibility.md``
+#: Leg 26). The 1st-gen firmware demand-pages heavily, so a large share of executed
+#: instructions are the abort-handler/refiner overhead of servicing faults — work
+#: that does not exist on real silicon (hardware paging is ~free). To keep the
+#: instruction-counted timer firing in step with *real* firmware progress (as it
+#: does on hardware and in the flat model), one 20 ms tick is ~100k instructions,
+#: not the flat build's 20k. At 20k the timer fires far too often relative to
+#: fault-slowed progress and the timer-gated boot descent never reaches book mode
+#: (the firmware stalls in standby). Used for ZC3201 when the caller left the
+#: pacing at the MT default. (Distinct from the ``MmuBoot._fault_addr`` scaled-index
+#: bug — the *thrash* root cause — which 100k had merely masked; see Leg 26.)
 _ZC3201_INSTRUCTIONS_PER_TICK = 100_000
 
 #: Pen buttons (``gpio-buttons-led.md`` §2/§3): name -> (pin, active level).
