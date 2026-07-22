@@ -6,29 +6,36 @@ that boot runs under the **real** ARMv5 MMU (Unicorn honours it), with the DMA e
 genuine physical bus masters — no page-table inversion in Python:
 
 1. **Handoff through nandboot's MMU builder.** Before PROG runs, we execute nandboot
-   ``init2`` (:data:`INIT2`), which builds the authentic L1/L2 tables and sets ``SCTLR.M=1``
-   (Unicorn then translates every CPU access). This is the same code the pen runs; we just
-   enter it directly instead of replaying init1/init3.
+   ``init2`` (:attr:`MmuAnchors.init2`), which builds the authentic L1/L2 tables and sets
+   ``SCTLR.M=1`` (Unicorn then translates every CPU access). This is the same code the pen
+   runs; we just enter it directly instead of replaying init1/init3.
 
 2. **Exception entry + a romboot-style backing store.** The tables start most pages
    no-access (``AP=00``); the firmware demand-refines them on abort. On a prefetch/data
    abort Unicorn raises ``UC_HOOK_INTR`` (intno 3/4) but does not vector ARMv5 exceptions,
    so we decode the fault address, write FAR, bank to abort mode, and jump to nandboot's
-   *own* handler (:data:`PABT_VEC`/:data:`DABT_VEC`) — which refines the page and retries.
-   The refiner zeroes each frame it maps; the romboot would have loaded PROG's bytes into
-   the compact physical layout it maps onto, so at the handler's return we write PROG's
-   content into whichever physical frame the refiner chose. A per-VA **shadow** (PROG image
-   + captured runtime writes) makes that survive frame eviction/re-zeroing. Romboot is
+   *own* handler (``vector_base + 0x0C/0x10``) — which refines the page and retries. The
+   refiner zeroes each frame it maps; the romboot would have loaded PROG's bytes into the
+   compact physical layout it maps onto, so at the handler's return we write PROG's content
+   into whichever physical frame the refiner chose. A per-VA **shadow** (PROG image +
+   captured runtime writes) makes that survive frame eviction/re-zeroing. Romboot is
    hardware, so this backing store is part of the modelled machine, not a firmware hook.
 
-Nothing in the firmware is patched or intercepted. See ``firmware-re/mmu-prototype`` for the
-derivation (``54_shadow.py`` and ``FINDINGS.md``).
+Both pen generations boot this identical way — the same Anyka boot-ROM family (the vector
+table even tags itself ``ANYKANB1`` on the 2nd-gen MT, ``ANYKANB0`` on the 1st-gen ZC3201).
+The only per-firmware differences are a table of nandboot addresses and three small structural
+constants; :class:`MmuAnchors` captures them, and :data:`MT_MMU` / :data:`ZC3201_MMU` are the
+two instances. The **architectural** anchors (the abort vectors at ``vector_base + 0x0C/0x10``)
+and the mechanism are shared; nothing in the firmware is patched or intercepted. See
+``firmware-re/mmu-prototype`` for the MT derivation (``54_shadow.py`` and ``FINDINGS.md``); the
+ZC3201 twin was located by CP15-op scan + control-flow tracing on its nandboot blob.
 """
 
 from __future__ import annotations
 
 import logging
 import struct
+from dataclasses import dataclass
 
 import unicorn.arm_const as ac
 from capstone import CS_ARCH_ARM, CS_MODE_ARM, CS_MODE_THUMB, Cs  # type: ignore[import-untyped]
@@ -45,76 +52,24 @@ from unicorn.arm_const import (
 
 from typing import TYPE_CHECKING
 
-from .loader import Firmware, PROG_LOAD_ADDR
-from .machine import Machine
+from .loader import Firmware
 
 if TYPE_CHECKING:
     from .peripherals.audio import AudioDma
+    from .machine import Machine
 
 log = logging.getLogger(__name__)
 
-# --- nandboot addresses this boot generation exposes (from the .upd disassembly) --------
-#: nandboot ``init2`` — builds the L1/L2 page tables and enables the MMU.
-INIT2 = 0x0800_18D4
-#: A low, ``AP=11`` (always-accessible) stack for the init2 call, and the return sentinel
-#: it returns to (LR); both live in the page-table/globals region init2 keeps mapped.
-INIT2_STACK = 0x0800_8400
-INIT2_SENTINEL = 0x0800_7000
-#: nandboot's own abort vectors (prefetch, data) — the reset table at 0x08000000.
-PABT_VEC = 0x0800_000C
-DABT_VEC = 0x0800_0010
-#: The handlers' retry instructions (``subs pc,lr,#4`` / ``#8``); we place page content
-#: here, just before the firmware resumes the faulting instruction.
-PABT_RET = 0x0800_0190
-DABT_RET = 0x0800_01C4
-#: Abort-mode stack (from the reset handler's literal); the ``push {r0-r12,lr}`` prologue
-#: of the fault handlers uses it.
-SP_ABT = 0x0800_6000
-#: The firmware's demand-pager is direct-mapped: a VA hashes to a frame index and lands at
-#: frame ``PAGER_FRAME_BASE + index*0x1000``; an eviction table records the page VA at each
-#: frame. At :data:`PAGER_REFINER_CAPTURE` (early in the refiner ``0x080014d8``) r4 holds the
-#: index and r5 the page VA about to be evicted from that frame (0 if the frame is free) —
-#: the exact point to snapshot the outgoing page's content before the refiner reuses it.
-PAGER_REFINER_CAPTURE = 0x0800_14F8
-#: PROG's own page-eviction routine clears the frame's eviction-table entry here (str r0,
-#: [fp,#0x800] with r0=0), after swapping/invalidating, before paging in a replacement — the
-#: same eviction shape as the refiner but outside nandboot, so it needs the same content
-#: snapshot (r5 = outgoing page VA, r4 = frame index) or the evicted page's writes are lost.
-PAGER_PROG_EVICT = 0x0800_9634
-PAGER_FRAME_BASE = 0x0800_9000
-#: The pager's per-frame globals base (the refiner's ``[pc,#-0x8d0]`` literal) and
-#: its eviction table (``[base+0x800+idx*4]`` = the page VA resident in frame idx,
-#: 0 = free). The pager writes an entry when it maps a page into a frame; we watch
-#: those writes to stamp the hardware frame-usage clock (:meth:`AudioDma.touch_frame`)
-#: so the pager's LRU victim scan can rank frames instead of thrashing a few.
-PAGER_SB_BASE = 0x0800_7F8C
-PAGER_EVICT_TABLE = PAGER_SB_BASE + 0x800
-PAGER_FRAME_COUNT = 37
-#: The firmware's unified-TLB invalidate leaf (``mcr p15,0,rN,c8,c7,0`` then ``mov pc,lr``).
-#: It runs it after every page-table edit (via the L2 updater 0x08001860). Unicorn's ARM926
-#: model does not act on that CP15 op, so its softmmu TLB keeps stale VA->frame translations
-#: — a later access to an evicted VA then silently hits the frame the pager has since reused,
-#: clobbering the new occupant (the media-path object → the book/2nd-GME crash). We honour the
-#: firmware's own invalidate by flushing Unicorn's TLB at this leaf.
-TLB_INVALIDATE_LEAF = 0x0800_3310
-#: The loader keeps the work/data region **resident** (identity, AP=11) and demand-pages
-#: only the code range below it. These nandboot literals bound it: the allocator's frame
-#: threshold (page-aligned) is the code/data split, and its dynamic-alloc VA pool base is
-#: the top of the fixed-data region (the pool above stays unmapped for the firmware to hand
-#: out). Without residency the data pages get demand-paged into code frames and the pager
-#: clobbers them (the DMA-pool aliasing that crashed the book/media path).
-ALLOC_THRESHOLD_LIT = 0x0800_0C2C   #: -> frame threshold ~0x08120a63; split @0x08120000
-ALLOC_POOL_START_LIT = 0x0800_0C34  #: -> dynamic-VA pool base ~0x081dcf44
+# --- architectural constants (same for every ARMv5 image) -------------------------------
+#: ARM exception-vector offsets from the vector base: prefetch abort +0x0C, data abort +0x10.
+PABT_VEC_OFF = 0x0C
+DABT_VEC_OFF = 0x10
 #: CP15 register selectors (coproc, is64, sec, CRn, CRm, opc1, opc2).
-_FAR = (15, 0, 0, 6, 0, 0, 0)   # fault address register (c6)
+_FAR = (15, 0, 0, 6, 0, 0, 0)    # fault address register (c6)
 _TTBR0 = (15, 0, 0, 2, 0, 0, 0)  # translation table base 0
+_SCTLR = (15, 0, 0, 1, 0, 0, 0)  # system control register (M-bit = MMU enable)
 #: L2 small-page descriptor "mapping present" bits.
 _PRESENT = 0xFF0
-#: Top of the demand-paged main-RAM domain (the refiner refines [0x08009000, this)).
-#: PROG's image occupies the low part; runtime stack/heap pages live above it and must be
-#: shadowed too — the refiner re-zeroes any frame it maps, so an evicted stack page would
-#: otherwise lose its return addresses.
-DEMAND_TOP = 0x0840_0000
 
 _CPSR_MODE_MASK = 0x1F
 _MODE_ABORT = 0x17
@@ -122,21 +77,130 @@ _CPSR_I = 0x80
 _CPSR_T = 0x20
 
 
+@dataclass(frozen=True)
+class MmuAnchors:
+    """The per-firmware nandboot addresses + structural constants an MMU boot needs.
+
+    Every field is a runtime address or count recovered from that firmware's nandboot
+    (MT: the ``.upd`` disassembly + ``firmware-re/mmu-prototype``; ZC3201: CP15-op scan +
+    control-flow tracing). The mechanism in :class:`MmuBoot` is identical across gens; only
+    these values change. The three genuine structural deltas between MT and ZC3201 are
+    ``frame_count`` (37 vs 38), ``usage_clock_off`` (0x124 vs 0x120), and the per-site
+    eviction register convention in ``evict_sites`` (ZC3201's PROG-evict swaps VA/idx).
+    """
+
+    #: nandboot ``init2`` — builds the L1/L2 page tables and enables the MMU; standalone-
+    #: callable in SVC mode with a resident stack and a mapped return sentinel.
+    init2: int
+    init2_stack: int
+    init2_sentinel: int
+    #: The abort handlers' retry instructions (``subs pc,lr,#4`` / ``#8``); we place page
+    #: content here, just before the firmware resumes the faulting instruction.
+    pabt_ret: int
+    dabt_ret: int
+    #: Abort-mode banked stack (from the reset handler's literal).
+    sp_abt: int
+    #: The demand-pager frame pool: frame ``i`` is at ``frame_base + i*0x1000``.
+    frame_base: int
+    frame_count: int
+    #: The pager's eviction table: ``evict_table[idx]`` = the page VA resident in frame idx
+    #: (0 = free). The pager writes it when it maps a page in — we watch those writes to
+    #: stamp the hardware frame-usage clock (:meth:`AudioDma.touch_frame`).
+    evict_table: int
+    #: Eviction snapshot sites: ``(pc, va_reg, idx_reg)`` — at ``pc`` the frame still holds
+    #: the outgoing page whose VA is in ``va_reg`` and frame index in ``idx_reg`` (0 VA = free
+    #: frame). MT uses ``(R5, R4)`` at both sites; ZC3201's PROG-evict swaps them to ``(R4, R5)``.
+    evict_sites: tuple[tuple[int, int, int], ...]
+    #: The firmware's unified-TLB invalidate leaf (``mcr p15,0,rN,c8,c7,0`` then ``mov pc,lr``),
+    #: run after every page-table edit — we flush Unicorn's TLB here (its ARM926 ignores the op).
+    tlb_invalidate_leaf: int
+    #: Offset within the 0x04010000 block of the pager's per-frame usage-clock array
+    #: (:data:`~tt_emu.peripherals.audio.PAGER_FRAME_LRU_OFF`), read by the LRU victim scan.
+    usage_clock_off: int
+    #: PROG load base (= the demand window start) and the top of the demand-paged domain.
+    prog_load: int
+    demand_top: int
+    #: Where nandboot's exception vectors live (both gens: 0x08000000). The abort vectors are
+    #: ``vector_base + 0x0C/0x10`` (architectural); we jump to the vector and let its branch
+    #: route to the firmware's own handler.
+    vector_base: int = 0x0800_0000
+
+    @property
+    def pabt_vec(self) -> int:
+        return self.vector_base + PABT_VEC_OFF
+
+    @property
+    def dabt_vec(self) -> int:
+        return self.vector_base + DABT_VEC_OFF
+
+
+#: 2nd-gen MT (ZC3202N). The reference derivation — see ``firmware-re/mmu-prototype``.
+MT_MMU = MmuAnchors(
+    init2=0x0800_18D4,
+    init2_stack=0x0800_8400,
+    init2_sentinel=0x0800_7000,
+    pabt_ret=0x0800_0190,
+    dabt_ret=0x0800_01C4,
+    sp_abt=0x0800_6000,
+    frame_base=0x0800_9000,
+    frame_count=37,
+    evict_table=0x0800_7F8C + 0x800,  # SB base + 0x800
+    evict_sites=(
+        (0x0800_14F8, ac.UC_ARM_REG_R5, ac.UC_ARM_REG_R4),  # nandboot refiner capture
+        (0x0800_9634, ac.UC_ARM_REG_R5, ac.UC_ARM_REG_R4),  # PROG's own page-evict
+    ),
+    tlb_invalidate_leaf=0x0800_3310,
+    usage_clock_off=0x124,
+    prog_load=0x0800_9000,
+    demand_top=0x0840_0000,
+)
+
+#: 1st-gen ZC3201. Same boot architecture, different offsets + three structural deltas
+#: (frame_count 38, usage_clock_off 0x120, PROG-evict register convention swapped).
+ZC3201_MMU = MmuAnchors(
+    init2=0x0800_1F80,
+    init2_stack=0x0800_8000,
+    init2_sentinel=0x0800_6000,  # resident, clear of the SB globals 0x080070e0..0x08007578
+    pabt_ret=0x0800_01AC,
+    dabt_ret=0x0800_01E0,
+    sp_abt=0x0800_5000,
+    frame_base=0x0800_8000,
+    frame_count=38,
+    evict_table=0x0800_70E0 + 0x400,  # SB base + 0x400 (MT is +0x800)
+    evict_sites=(
+        (0x0800_1C1C, ac.UC_ARM_REG_R5, ac.UC_ARM_REG_R4),  # refiner capture (same convention)
+        (0x0800_8814, ac.UC_ARM_REG_R4, ac.UC_ARM_REG_R5),  # PROG's page-evict — VA/idx SWAPPED
+    ),
+    tlb_invalidate_leaf=0x0800_354C,
+    usage_clock_off=0x120,
+    prog_load=0x0800_8000,
+    demand_top=0x0820_0000,
+)
+
+
 class MmuBoot:
     """Runs nandboot's MMU builder, then services aborts + backs demand-paging.
 
     Instantiate after the artifacts and boot seeds are in place, call :meth:`setup`, then
-    seed PROG's entry state and run the machine normally. The abort handler is wired into
+    seed PROG's entry state and run the machine normally. ``anchors`` selects the firmware
+    (:data:`MT_MMU` / :data:`ZC3201_MMU`). The abort handler is wired into
     :class:`~tt_emu.machine.Machine` so the machine's single ``UC_HOOK_INTR`` still owns
     interrupt dispatch (SVC vs. abort).
     """
 
-    def __init__(self, machine: Machine, firmware: Firmware, audio: "AudioDma") -> None:
+    def __init__(
+        self,
+        machine: "Machine",
+        firmware: Firmware,
+        audio: "AudioDma",
+        anchors: MmuAnchors = MT_MMU,
+    ) -> None:
         self.m = machine
         self.uc = machine.uc
         self.audio = audio
+        self.a = anchors
         self.prog = firmware.prog.data
-        self.prog_hi = PROG_LOAD_ADDR + len(self.prog)
+        self.prog_hi = anchors.prog_load + len(self.prog)
 
         # Demand-paging backing store (romboot stand-in). The firmware pages evicted frames
         # out to NAND swap and back, but that round-trip does not reconstruct content under
@@ -164,85 +228,49 @@ class MmuBoot:
     def setup(self) -> None:
         """Run init2 (build tables + enable MMU), then install the abort machinery."""
         uc = self.uc
+        a = self.a
         # init2 runs with a low always-accessible stack and returns to a sentinel.
-        uc.reg_write(UC_ARM_REG_SP, INIT2_STACK)
-        uc.reg_write(UC_ARM_REG_LR, INIT2_SENTINEL)
+        uc.reg_write(UC_ARM_REG_SP, a.init2_stack)
+        uc.reg_write(UC_ARM_REG_LR, a.init2_sentinel)
         uc.reg_write(UC_ARM_REG_CPSR, 0x13)  # SVC
-        uc.emu_start(INIT2, INIT2_SENTINEL, count=3_000_000)
-        sctlr = uc.reg_read(UC_ARM_REG_CP_REG, (15, 0, 0, 1, 0, 0, 0))
+        uc.emu_start(a.init2, a.init2_sentinel, count=3_000_000)
+        sctlr = uc.reg_read(UC_ARM_REG_CP_REG, _SCTLR)
         if not sctlr & 1:
             raise RuntimeError(f"init2 did not enable the MMU (SCTLR={sctlr:#010x})")
         self.l1_base = uc.reg_read(UC_ARM_REG_CP_REG, _TTBR0) & 0xFFFF_C000
         log.info("MMU boot: init2 built the page table, SCTLR=%#010x TTBR0=%#010x",
                  sctlr, self.l1_base)
-        self._make_data_resident()
 
         # Seed the abort-mode banked stack the fault handlers push onto.
         cpsr = uc.reg_read(UC_ARM_REG_CPSR)
         uc.reg_write(UC_ARM_REG_CPSR, (cpsr & ~_CPSR_MODE_MASK) | _MODE_ABORT)
-        uc.reg_write(UC_ARM_REG_SP, SP_ABT)
+        uc.reg_write(UC_ARM_REG_SP, a.sp_abt)
         uc.reg_write(UC_ARM_REG_CPSR, cpsr)
 
         # Snapshot each page the instant it is evicted from its frame (scoped hooks). There
         # are two eviction sites that clear the frame's eviction-table entry and reuse it: the
-        # nandboot refiner's :data:`PAGER_REFINER_CAPTURE`, and PROG's own eviction routine at
-        # :data:`PAGER_PROG_EVICT` (0x08009634) — same register convention (r5=outgoing VA,
-        # r4=frame index). The refiner one alone leaves the PROG path's evictions uncaptured,
-        # dropping ~6 pages a run (incl. the heap allocator's free-list metadata → the media
-        # double-alloc crash). Capture at both.
-        for cap in (PAGER_REFINER_CAPTURE, PAGER_PROG_EVICT):
-            uc.hook_add(UC_HOOK_CODE, self._on_refiner_evict, begin=cap, end=cap)
+        # nandboot refiner and PROG's own eviction routine. Each carries the outgoing page's
+        # VA / frame index in its own register pair (``evict_sites``) — MT uses (r5, r4) at
+        # both; ZC3201's PROG-evict swaps them. Capturing at both is essential: the refiner
+        # one alone leaves the PROG path's evictions uncaptured (dropping the heap allocator's
+        # free-list metadata → the media double-alloc crash).
+        for pc, va_reg, idx_reg in a.evict_sites:
+            uc.hook_add(UC_HOOK_CODE, self._make_evict_hook(va_reg, idx_reg), begin=pc, end=pc)
         # Model the hardware per-frame usage clock: when the pager records a page
         # in a frame (eviction-table write), stamp that frame so its LRU victim
-        # scan (the 0x04010124 array) can rank frames instead of thrashing a few.
+        # scan (the usage-clock array) can rank frames instead of thrashing a few.
         uc.hook_add(UC_HOOK_MEM_WRITE, self._on_frame_map,
-                    begin=PAGER_EVICT_TABLE, end=PAGER_EVICT_TABLE + PAGER_FRAME_COUNT * 4 - 1)
+                    begin=a.evict_table, end=a.evict_table + a.frame_count * 4 - 1)
         # Restore page content at the handlers' return instructions (scoped hooks: they fire
         # only at these two PCs, so there is no per-instruction cost).
-        for ret in (PABT_RET, DABT_RET):
+        for ret in (a.pabt_ret, a.dabt_ret):
             uc.hook_add(UC_HOOK_CODE, self._on_handler_return, begin=ret, end=ret)
         # Honour the firmware's own TLB invalidate: flush Unicorn's stale translations when the
         # firmware runs its CP15 TLBIALL leaf (Unicorn's ARM926 ignores the op itself).
         uc.hook_add(UC_HOOK_CODE, self._on_tlb_invalidate,
-                    begin=TLB_INVALIDATE_LEAF, end=TLB_INVALIDATE_LEAF)
+                    begin=a.tlb_invalidate_leaf, end=a.tlb_invalidate_leaf)
         # The machine's UC_HOOK_INTR delegates prefetch/data aborts (intno 3/4) here.
         self.m.set_abort_handler(self._on_abort)
-
-    def _make_data_resident(self) -> None:
-        """No-op: let the firmware's own page table + demand-pager own the work/data region.
-
-        This used to pin ``[frame-threshold, dynamic-pool-base)`` resident (identity, AP=11),
-        on the theory that the loader keeps data resident and demand-pages only code. But the
-        firmware in fact **remaps pages in that window into its demand-paged frame pool** at
-        runtime (e.g. the audio player object at VA 0x081487a0 → a pool frame), so the identity
-        pin conflicts with the firmware's mapping: when such a page is evicted and re-faulted,
-        the pinned-vs-paged split corrupts its content and the object's live writes are lost.
-        That broke audio played from an idle chain (the AO's decoder source pointer was dropped
-        on eviction). Leaving these pages to the firmware's page table + the demand-paging
-        backing store is both more faithful (no intervention) and correct — it fixes the audio.
-        """
-        return
-
-    def _unused_pin_data_resident(self) -> None:  # kept for reference; see _make_data_resident
-        uc = self.uc
-        lo = struct.unpack("<I", uc.mem_read(ALLOC_THRESHOLD_LIT, 4))[0] & ~0xFFF
-        hi = struct.unpack("<I", uc.mem_read(ALLOC_POOL_START_LIT, 4))[0] & ~0xFFF
-        n = 0
-        for va in range(lo, hi, 0x1000):
-            l1e = struct.unpack("<I", uc.mem_read(self.l1_base + (va >> 20) * 4, 4))[0]
-            if (l1e & 3) != 1:  # only coarse-mapped pages have an L2 entry to flip
-                continue
-            l2a = (l1e & 0xFFFFFC00) + ((va >> 12) & 0xFF) * 4
-            uc.mem_write(l2a, struct.pack("<I", (va & 0xFFFFF000) | 0xFFE))  # identity, AP=11
-            if va < self.prog_hi:
-                off = va - PROG_LOAD_ADDR
-                uc.mem_write(va, self.prog[off:off + 0x1000].ljust(0x1000, b"\x00"))
-            n += 1
-        try:
-            uc.ctl_remove_cache(lo, hi)
-        except UcError:
-            pass
-        log.info("MMU boot: pinned %d data pages resident [%#010x, %#010x)", n, lo, hi)
 
     # --- page-table walk (read the firmware's live tables) ------------------------------
 
@@ -350,21 +378,24 @@ class MmuBoot:
 
     # --- abort handling + backing store -------------------------------------------------
 
-    def _on_refiner_evict(self, uc: object, _addr: int, _size: int, _ud: object) -> None:
-        """Snapshot the page the refiner is about to evict from its frame.
+    def _make_evict_hook(self, va_reg: int, idx_reg: int):
+        """A capture hook bound to one eviction site's ``(va_reg, idx_reg)`` convention.
 
-        Runs at :data:`PAGER_REFINER_CAPTURE`: r5 is the outgoing page's VA (0 if the frame
-        is free), r4 the frame index. The frame still holds that page's live content — copy
-        it into the shadow before the refiner reuses the frame. Keyed by the firmware's own
-        eviction record, so it needs no ownership tracking and has no capture-timing gap.
+        At the site the frame still holds the outgoing page's live content — copy it into the
+        shadow before the pager reuses the frame, keyed by the firmware's own eviction record
+        (VA in ``va_reg``, 0 if the frame is free; frame index in ``idx_reg``). Different sites
+        use different register pairs (MT: (r5,r4) at both; ZC3201's PROG-evict swaps them), so
+        each site gets its own bound hook.
         """
-        old_va = self.uc.reg_read(ac.UC_ARM_REG_R5)
-        if old_va != 0:
-            frame = PAGER_FRAME_BASE + self.uc.reg_read(ac.UC_ARM_REG_R4) * 0x1000
-            self.shadow[old_va & ~0xFFF] = bytes(self.uc.mem_read(frame, 0x1000))
-        # Stop-safe pace point: re-firing on resume just re-snapshots the same
-        # frame content (idempotent).
-        self.m.maybe_pace_stop()
+        def hook(_uc: object, _addr: int, _size: int, _ud: object) -> None:
+            old_va = self.uc.reg_read(va_reg)
+            if old_va != 0:
+                frame = self.a.frame_base + self.uc.reg_read(idx_reg) * 0x1000
+                self.shadow[old_va & ~0xFFF] = bytes(self.uc.mem_read(frame, 0x1000))
+            # Stop-safe pace point: re-firing on resume just re-snapshots the same
+            # frame content (idempotent).
+            self.m.maybe_pace_stop()
+        return hook
 
     def _on_tlb_invalidate(self, _uc: object, _addr: int, _size: int, _ud: object) -> None:
         """Flush Unicorn's softmmu TLB when the firmware executes its CP15 TLBIALL leaf.
@@ -390,7 +421,7 @@ class MmuBoot:
         ``idx``; that is exactly when the hardware frame-usage clock advances for
         that frame, so we forward it to :meth:`AudioDma.touch_frame`. Observation
         only — the firmware's own write proceeds unchanged."""
-        self.audio.touch_frame((addr - PAGER_EVICT_TABLE) // 4)
+        self.audio.touch_frame((addr - self.a.evict_table) // 4)
 
     def _on_abort(self, intno: int) -> None:
         """Vector a prefetch(3)/data(4) abort into nandboot's own handler.
@@ -403,10 +434,10 @@ class MmuBoot:
         cpsr = uc.reg_read(UC_ARM_REG_CPSR)
         if intno == 3:
             fault = pc
-            vec, lroff = PABT_VEC, 4
+            vec, lroff = self.a.pabt_vec, 4
         else:
             fault = self._fault_addr(pc, bool(cpsr & _CPSR_T))
-            vec, lroff = DABT_VEC, 8
+            vec, lroff = self.a.dabt_vec, 8
         self.pgstack.append(fault & ~0xFFF)
         uc.reg_write(UC_ARM_REG_CP_REG, _FAR + (fault,))
         uc.reg_write(UC_ARM_REG_CPSR, (cpsr & ~0x3F) | _MODE_ABORT | _CPSR_I)
@@ -428,14 +459,14 @@ class MmuBoot:
         else PROG's image for a code/data page. A page above the image with no shadow is a
         genuinely fresh runtime page — leave the refiner's zeros.
         """
-        if not (PROG_LOAD_ADDR <= vp < DEMAND_TOP):
+        if not (self.a.prog_load <= vp < self.a.demand_top):
             return
         pa = self._cur_pa(vp)
         if pa is None:
             return
         content = self.shadow.get(vp)
         if content is None and vp < self.prog_hi:
-            off = vp - PROG_LOAD_ADDR
+            off = vp - self.a.prog_load
             content = self.prog[off:off + 0x1000].ljust(0x1000, b"\x00")
         if content is not None:
             self.uc.mem_write(pa, content)
