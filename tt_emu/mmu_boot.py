@@ -241,7 +241,9 @@ class MmuBoot:
         log.info("MMU boot: init2 built the page table, SCTLR=%#010x TTBR0=%#010x",
                  sctlr, self.l1_base)
 
-        # Seed the abort-mode banked stack the fault handlers push onto.
+        # Seed the abort-mode banked stack the fault handlers push onto. (The IRQ-mode
+        # stack is the machine's job — it banks IRQ mode on delivery; see
+        # ``Machine.irq_stack_top`` for the per-firmware value.)
         cpsr = uc.reg_read(UC_ARM_REG_CPSR)
         uc.reg_write(UC_ARM_REG_CPSR, (cpsr & ~_CPSR_MODE_MASK) | _MODE_ABORT)
         uc.reg_write(UC_ARM_REG_SP, a.sp_abt)

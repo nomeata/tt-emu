@@ -34,9 +34,8 @@ from .loader import (
     PROG_ENTRY,
     PROG_LOAD_ADDR,
 )
-from .firmware.zc3201 import Zc3201DacPageMap
 from .machine import Machine, MachineConfig
-from .mmu_boot import MmuBoot
+from .mmu_boot import MmuBoot, ZC3201_MMU
 from .nand_image import NandImage, build_nand_image
 from .peripherals.audio import AudioDma
 from .peripherals.battery import BatteryAdc
@@ -345,18 +344,18 @@ def build_zc3201_machine(
     # ``profile.dac_port_dst``; its teardown swallow flag is a heap struct field
     # here (not a fixed global), so pass ``swallow_flag_addr=None`` — the short
     # teardown silence buffer is then captured (benign) rather than suppressed.
-    # The DAC is a physical bus master, but ZC3201 runs flat while its audio
-    # buffers use a non-identity page mapping (the codec decodes PCM to a virtual
-    # buffer the MMU maps to low physical RAM). So resolve the DAC source through
-    # the firmware's own page table (phys frame -> virtual page -> flat) — see
-    # Zc3201DacPageMap. The amp is GPIO9 (profile.gpio_amp_pin), no modelled mute.
-    dac_pagemap = Zc3201DacPageMap(machine)
+    # ZC3201 runs under its real MMU (below), so the DAC — a physical bus master —
+    # reads physical memory directly via machine.read_phys, exactly like MT: the
+    # codec's decoded PCM lands at the physical frame the DAC's source register
+    # names (no page-table inversion). The pager LRU array is 0x120/38 frames here
+    # (MT: 0x124/37). Amp is GPIO9 (profile.gpio_amp_pin), no modelled mute.
     audio = AudioDma(
         nfc, intc, syscon, gpio,
         dac_port_dst=profile.dac_port_dst, swallow_flag_addr=None,
-        src_translate=dac_pagemap.resolve,
         amp_pin=profile.gpio_amp_pin, mute_pin=None,
         rate_ref=profile.dac_rate_ref,
+        pager_lru_off=ZC3201_MMU.usage_clock_off,
+        pager_frame_count=ZC3201_MMU.frame_count,
     )
     machine.add_peripheral(audio)
     machine.audio = audio  # the scripting API reads audio.capture for Clip.pcm
@@ -415,6 +414,22 @@ def build_zc3201_machine(
         # fs_storage_mount_init bails before the map read (FUN_0800c208).
         dev_addr, geom = profile.nand_dev_geometry
         machine.write_bytes(dev_addr, geom)
+
+    # --- MMU handoff (authentic, same as MT): run ZC3201's nandboot init2 to build
+    # its page table + enable the MMU, then install abort-driven demand-paging + the
+    # romboot backing store. From here the firmware runs under its OWN MMU, so the
+    # DAC/DMA engines read physical memory directly (the audio buffers' non-identity
+    # VA->PA mapping is now the hardware's, not a Python inversion). Seeds above stand
+    # in for init1/init3 state MmuBoot doesn't replay; they live in the resident
+    # AP=11 low region, so they survive the MMU coming on.
+    mmu = MmuBoot(machine, firmware, audio, ZC3201_MMU)
+    mmu.setup()
+    machine.mmu = mmu
+    # The from-entry boot enters boot_task_main past the reset handler's per-mode stack
+    # setup, so the machine seeds the IRQ-mode stack on first delivery; ZC3201's authentic
+    # value (0x08008000) sits in the resident low region, unlike MT's default which would
+    # fault outside the 1st-gen demand window (§ Machine.irq_stack_top).
+    machine.irq_stack_top = 0x0800_8000
 
     # OID sensor: the two-wire bit-bang link, re-pointed to the ZC3201 pins /
     # capture-state byte (profile.oid_*). The firmware's own nandboot OID HAL

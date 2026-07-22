@@ -157,6 +157,8 @@ class AudioDma(L2NandBuffer):
         amp_pin: int = PIN_AMP_ENABLE,
         mute_pin: int | None = PIN_MUTE,
         rate_ref: tuple[int, int] = (_DIV_REF, _RATE_REF),
+        pager_lru_off: int = PAGER_FRAME_LRU_OFF,
+        pager_frame_count: int = PAGER_FRAME_COUNT,
     ) -> None:
         super().__init__(nfc)
         self._intc = intc
@@ -196,9 +198,13 @@ class AudioDma(L2NandBuffer):
         self.unresolved_submits = 0  #: DAC submits whose physical source mapped nowhere
         self.completions = 0       #: line-0 completion asserts delivered
         self.last_dac_submit_at = 0  #: machine clock of the last DAC submit
-        #: The pager per-frame usage clock (see :data:`PAGER_FRAME_LRU_OFF`).
+        #: The pager per-frame usage clock (see :data:`PAGER_FRAME_LRU_OFF`). The array
+        #: offset within the 0x04010000 block and the frame count are per-firmware: MT
+        #: 0x124/37, ZC3201 0x120/38 (its demand-pager scans 38 frames).
+        self._pager_lru_off = pager_lru_off
+        self._pager_frame_count = pager_frame_count
         self._frame_clock = 0
-        self._frame_lru = [0] * PAGER_FRAME_COUNT
+        self._frame_lru = [0] * pager_frame_count
 
     def attach(self, machine: Machine) -> None:
         super().attach(machine)
@@ -215,15 +221,15 @@ class AudioDma(L2NandBuffer):
         read back by the pager's LRU victim scan at ``PAGER_FRAME_LRU_OFF +
         index*4``. Models the hardware frame-usage tracker (observation only —
         no firmware state is written)."""
-        if 0 <= index < PAGER_FRAME_COUNT:
+        if 0 <= index < self._pager_frame_count:
             self._frame_clock += 1
             self._frame_lru[index] = self._frame_clock
 
     # --- register behaviour ----------------------------------------------------------------
 
     def read_reg(self, offset: int) -> int:
-        if PAGER_FRAME_LRU_OFF <= offset < PAGER_FRAME_LRU_OFF + PAGER_FRAME_COUNT * 4:
-            return self._frame_lru[(offset - PAGER_FRAME_LRU_OFF) // 4]
+        if self._pager_lru_off <= offset < self._pager_lru_off + self._pager_frame_count * 4:
+            return self._frame_lru[(offset - self._pager_lru_off) // 4]
         return super().read_reg(offset)
 
     def write_reg(self, offset: int, value: int) -> None:

@@ -274,6 +274,10 @@ class Machine:
         self._stop_reason: str | None = None
         self._fault: str | None = None
         self._irq_sp_initialized = False
+        #: IRQ-mode stack top seeded on first IRQ delivery (from-entry boot skips the blob's
+        #: per-mode stack setup). Defaults to MT's proven value; ZC3201's build overrides it
+        #: to an in-demand-window address (its authentic reset-handler IRQ stack).
+        self.irq_stack_top = IRQ_STACK_TOP
         self._neutralized_cp15: set[int] = set()
         #: Prefetch/data-abort handler (installed by the MMU-boot layer; see
         #: :meth:`set_abort_handler`). ``None`` leaves aborts to the default path.
@@ -945,8 +949,11 @@ class Machine:
         self.uc.reg_write(UC_ARM_REG_CPSR, (cpsr & ~0x3F) | MODE_IRQ | CPSR_I)
         self.uc.reg_write(UC_ARM_REG_SPSR, cpsr)
         if not self._irq_sp_initialized:
-            # The from-entry boot skips the blob's per-mode stack setup (§3).
-            self.uc.reg_write(UC_ARM_REG_SP, IRQ_STACK_TOP)
+            # The from-entry boot skips the blob's per-mode stack setup (§3), so seed the
+            # IRQ-mode stack here. Per-firmware (:attr:`irq_stack_top`): MT's emulator-chosen
+            # 0x083F0000 sits in its demand window; ZC3201 needs an in-window value (its real
+            # reset handler uses 0x08008000) or the first IRQ push faults out of its window.
+            self.uc.reg_write(UC_ARM_REG_SP, self.irq_stack_top)
             self._irq_sp_initialized = True
         self.uc.reg_write(UC_ARM_REG_LR, (interrupted_pc + 4) & 0xFFFFFFFF)
         self.uc.reg_write(UC_ARM_REG_PC, IRQ_VECTOR)
