@@ -32,6 +32,8 @@ from typing import TYPE_CHECKING, Callable, Protocol
 if TYPE_CHECKING:
     from .mmu_boot import MmuBoot
     from .nand_image import NandImage
+    from .peripherals.audio import AudioDma
+    from .peripherals.oid import OidSensor
 
 __all__ = ["Machine", "MachineConfig", "RunResult"]
 
@@ -260,6 +262,10 @@ class Machine:
         self.mmu: MmuBoot | None = None
         #: The NAND backing store (set by the machine builder, for inspection).
         self.nand: NandImage | None = None
+        #: The OID sensor + audio DMA peripherals (set by the ZC3201 machine builder,
+        #: for the scripting API's tap injection and off-the-DAC PCM capture).
+        self.oid: OidSensor | None = None
+        self.audio: AudioDma | None = None
 
         self._peripherals: list[Peripheral] = []
         self._ticking: list[Peripheral] = []  # peripherals that override tick()

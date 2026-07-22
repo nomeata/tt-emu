@@ -190,7 +190,7 @@ def _superblock_payload(reserve_blocks: int, a_sectors: int, b_sectors: int) -> 
     return bytes(p)
 
 
-def _place_page(img: NandImage, abs_page: int, data: bytes, oob: bytes) -> None:
+def _place_page(img: NandImage, abs_page: int, data: bytes | bytearray, oob: bytes) -> None:
     """Place one 512-byte page + its 16-byte OOB tag at ``abs_page`` (row-keyed)."""
     img.place(abs_page * ZC_PAGE, (bytes(data) + b"\xff" * ZC_PAGE)[:ZC_PAGE])
     img.set_tag(abs_page, (bytes(oob) + b"\xff" * ZC_OOB)[:ZC_OOB])

@@ -57,7 +57,7 @@ from unicorn.arm_const import (
     UC_ARM_REG_CP_REG,
 )
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .loader import Firmware
 
@@ -349,7 +349,7 @@ class MmuBoot:
     def _reg(self, name: str) -> int:
         return self.uc.reg_read(self._creg.get(name, 0))
 
-    def _scaled_index(self, idx: int, op: object) -> int:
+    def _scaled_index(self, idx: int, op: Any) -> int:
         """The index-register contribution of a memory operand, with its scale applied.
 
         A scaled-register offset (``[rN, rM, lsl #k]``) faults at ``rN + (rM<<k)``. This

@@ -1,18 +1,20 @@
 # tt-emu
 
-A hardware-level emulator of the **Ravensburger tiptoi® pen** (2nd generation, "MT" /
-Chomptech ZC3202N / Anyka AK1050 SoC).
+A hardware-level emulator of the **Ravensburger tiptoi® pen** (both hardware
+generations: the 1st-gen **ZC3201** and the 2nd-gen **"MT" / Chomptech ZC3202N /
+Anyka AK1050 SoC**).
 
 tt-emu boots the pen's **real, unmodified firmware** by emulating the pen's hardware —
-CPU, NAND, audio, the OID (optical) sensor, buttons, and so on — and runs the pen's
-`.gme` audio-book files either headless (for scripted testing) or through an interactive
-terminal UI where you "tap" OID codes and hear the audio in real time.
+the ARM CPU under its own MMU, NAND flash, the audio DAC, the OID (optical) sensor,
+buttons, and so on — and runs the pen's `.gme` audio-book files either headless (for
+scripted testing) or through an interactive terminal UI where you "tap" OID codes and
+hear the audio in real time.
 
-The **1st-generation ZC3201 pen** (`v0136 / 120117`) is supported too: its unmodified
-firmware boots and plays GMEs through the same scripting API (discover the `.gme` → mount
-it on a product-OID tap → play a content OID's media), **including the decoded audio** — a
-played clip carries real S16LE PCM (`clip.pcm` / `save_wav`), captured off the pen's own DAC
-just like on the 2nd-gen pen. It is recognized automatically from the `.upd` you pass.
+Both generations run the **same way through the same API** — discover the `.gme`, mount
+it on a product-OID tap, play a content OID's media, and capture the decoded **S16LE PCM**
+(`clip.pcm` / `save_wav`) off the pen's own DAC — and tt-emu recognizes which generation an
+image is automatically. (The only asymmetry is the TUI's rich firmware-aware debugger,
+which is currently mapped for the 2N "MT" build; see [The GME debugger](#the-gme-debugger).)
 
 ![The tt-emu TUI with the firmware-aware debugger open — live statechart, GME interpreter
 registers, and OID→script-line routing with symbolic names joined from a tttool
@@ -56,9 +58,11 @@ audio to a file.
 ## Usage
 
 You need the pen's firmware, but you don't have to hunt for it: **omit the firmware
-argument and tt-emu downloads the official `update3202MT.upd`** from Ravensburger's
-servers, verifies it against a pinned SHA-256, and caches it (reused offline afterwards).
-Pass a path to use your own `.upd` instead. (Games — `.gme` files — you supply yourself.)
+argument and tt-emu downloads the official 2N firmware (`update3202MT.upd`)** from
+Ravensburger's servers, verifies it against a pinned SHA-256, and caches it (reused
+offline afterwards). Pass a path to any `.upd` to use it instead — including the 1st-gen
+ZC3201 firmware (`update_zc3201.upd`, also pinned by SHA-256), which tt-emu recognizes
+automatically. (Games — `.gme` files — you supply yourself.)
 
 ```sh
 # interactive TUI (the default): tap OID codes and hear the audio live
@@ -72,7 +76,8 @@ tt-emu --headless --gme game.gme --tap product --tap 4716 --wav out.wav
 ```
 
 In the TUI, tap the game's **product code** first (the game mounts), then any content
-code. Audio plays at 22050 Hz. The TUI runs with **realtime pacing** by default: the pen
+code. Audio plays at the track's own sample rate (22050 Hz for 2N games). The TUI runs
+with **realtime pacing** by default: the pen
 boots in a few seconds and runs on its real timeline, with each sound produced ahead of
 real time and played from a small buffered lead. Pass `--pacing deterministic` for
 count-paced, bit-for-bit reproducible runs instead (roughly 10–20× slower than the pen —
@@ -82,9 +87,11 @@ timing-sensitive game behaviour; the captured audio is identical either way.
 
 ### The GME debugger
 
-When the loaded firmware is a **recognized build** (currently the 2N "MT" `N0038MT /
-20131009` image, identified by a byte-exact fingerprint), the TUI adds live debugger
-panels on top of the generic view — press **`d`** to toggle them:
+The TUI's rich, firmware-aware debugger panels are the one place the two pen generations
+differ: they are mapped for the 2N **"MT"** build (`N0038MT / 20131009`, identified by a
+byte-exact fingerprint), whose statechart, GME interpreter, and OID→script routing are
+fully reverse-engineered. When that image is loaded, the TUI adds these live panels on top
+of the generic view — press **`d`** to toggle them:
 
 - **Statechart** — the firmware's live QHsm state hierarchy (all 70 states named), active
   leaf highlighted;
@@ -97,8 +104,10 @@ panels on top of the generic view — press **`d`** to toggle them:
   actions the interpreter actually executed.
 
 It's all **hook-free**: the firmware runs unmodified and the debugger only polls emulator
-RAM (plus documented read-only watchpoints for the executed-action trace). Unrecognized
-firmware simply keeps the generic panels.
+RAM (plus documented read-only watchpoints for the executed-action trace). Other firmware
+— including the 1st-gen ZC3201 — runs the same emulation but keeps the generic TUI panels;
+the ZC3201 has its own hook-free live readers (statechart leaf, event ring), but they drive
+the scripting API rather than the TUI panels for now.
 
 With `--yaml book.yaml` (the tttool source of the loaded `.gme`, plus its sibling
 `book.codes.yaml` for the script→OID codes), the panels show **symbolic names**: registers

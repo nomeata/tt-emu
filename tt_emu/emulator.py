@@ -504,9 +504,11 @@ class Emulator:
         self._booted = None
         self.machine = machine
         # The 1st-gen DAC PCM path IS modelled: build_zc3201_machine wires an
-        # AudioDma retargeted to the ZC3201 DAC port with the page-table source
-        # resolver (Zc3201DacPageMap), so the same off-the-DAC capture MT uses
-        # yields real S16LE PCM here. Clip.pcm / save_wav therefore work.
+        # AudioDma retargeted to the ZC3201 DAC port; the firmware runs under its
+        # real MMU so the DAC reads physical memory directly, and the same
+        # off-the-DAC capture MT uses yields real S16LE PCM here (Clip.pcm /
+        # save_wav work). build_zc3201_machine always sets machine.audio/oid.
+        assert machine.audio is not None
         self._capture = machine.audio.capture
         self._oid_sensor = machine.oid
         self._zc_debugger = Zc3201Debugger(machine)

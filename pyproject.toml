@@ -32,6 +32,9 @@ packages = ["tt_emu"]
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+# scripts/ are ad-hoc RE/debug probes (dense one-liners on purpose), not shipped
+# package code — hold tt_emu/ and tests/ to the lint standard, not the throwaways.
+extend-exclude = ["scripts"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

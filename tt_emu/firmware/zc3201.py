@@ -22,7 +22,7 @@ On any other firmware :func:`recognize` fails and none of this is used.
 from __future__ import annotations
 
 import struct
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
