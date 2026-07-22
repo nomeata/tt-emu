@@ -39,7 +39,14 @@ from dataclasses import dataclass
 
 import unicorn.arm_const as ac
 from capstone import CS_ARCH_ARM, CS_MODE_ARM, CS_MODE_THUMB, Cs  # type: ignore[import-untyped]
-from capstone.arm_const import ARM_OP_MEM, ARM_OP_REG  # type: ignore[import-untyped]
+from capstone.arm_const import (  # type: ignore[import-untyped]
+    ARM_OP_MEM,
+    ARM_OP_REG,
+    ARM_SFT_ASR,
+    ARM_SFT_LSL,
+    ARM_SFT_LSR,
+    ARM_SFT_ROR,
+)
 from unicorn import UC_CTL_TLB_FLUSH, UC_HOOK_CODE, UC_HOOK_MEM_WRITE, UcError
 from unicorn.arm_const import (
     UC_ARM_REG_CPSR,
@@ -342,6 +349,31 @@ class MmuBoot:
     def _reg(self, name: str) -> int:
         return self.uc.reg_read(self._creg.get(name, 0))
 
+    def _scaled_index(self, idx: int, op: object) -> int:
+        """The index-register contribution of a memory operand, with its scale applied.
+
+        A scaled-register offset (``[rN, rM, lsl #k]``) faults at ``rN + (rM<<k)``. This
+        capstone build reports the shift in ``op.shift`` (type/value), NOT in
+        ``op.mem.lshift`` (which reads 0) — so decoding only ``op.mem.lshift`` drops the
+        scale and computes ``rN + rM``, i.e. the wrong page. The demand-pager then refines
+        that wrong page forever while the real one stays unmapped (an infinite refault, the
+        thrash that stuck the ZC3201 event pump; latent on any demand-paged store with a
+        scaled index — MT included). Honour ``op.shift`` when present, else ``op.mem.lshift``.
+        """
+        idx &= 0xFFFFFFFF
+        st, sv = op.shift.type, op.shift.value
+        if st == ARM_SFT_LSL:
+            return (idx << sv) & 0xFFFFFFFF
+        if st == ARM_SFT_LSR:
+            return idx >> sv
+        if st == ARM_SFT_ASR:
+            signed = idx - (1 << 32) if idx & 0x8000_0000 else idx
+            return (signed >> sv) & 0xFFFFFFFF
+        if st == ARM_SFT_ROR:
+            sv &= 31
+            return ((idx >> sv) | (idx << (32 - sv))) & 0xFFFFFFFF if sv else idx
+        return (idx << op.mem.lshift) & 0xFFFFFFFF
+
     def _read_insn(self, va: int) -> bytes:
         # uc.mem_read is physical; translate so we decode the instruction the CPU fetched,
         # not whatever shares the identical physical address on a VA != PA page.
@@ -359,7 +391,7 @@ class MmuBoot:
             if op.type == ARM_OP_MEM:
                 base = self._reg(insn.reg_name(op.mem.base)) if op.mem.base else 0
                 idx = self._reg(insn.reg_name(op.mem.index)) if op.mem.index else 0
-                addr = (base + op.mem.disp + (idx << op.mem.lshift)) & 0xFFFFFFFF
+                addr = (base + op.mem.disp + self._scaled_index(idx, op)) & 0xFFFFFFFF
                 return self._first_fault_page(addr, 8)
         # block transfers (push/pop/ldm/stm): fault page is somewhere in the reg-list range
         mn = insn.mnemonic
