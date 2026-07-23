@@ -423,6 +423,13 @@ def test_live_debugger_boot_book_tap() -> None:
         assert snap.debug.chain_names[-1] == "book"
         assert snap.debug.chain[0] == 3  # bottom of the stack: standby
 
+        # Book(13) is entered before the power-on welcome voice finishes; a tap during
+        # that book-entry jingle is discarded by the firmware (§7.3.2). The TUI does not
+        # gate taps (an early tap is honestly ignored, as on hardware), so wait for the
+        # welcome to drain — the pen has finished talking — before tapping, the way a
+        # person would.
+        wait_for("power-on welcome drained", lambda s: s.audio_settled, timeout=60.0)
+
         # Tap the product OID: the GME mounts, the register file loads.
         session.tap(42)
         snap = wait_for(
@@ -440,6 +447,11 @@ def test_live_debugger_boot_book_tap() -> None:
         assert debug.book_count == 1
         assert "GME" in debug.gme_path.upper()
         assert debug.register_names[2] == "$eingabe"
+
+        # Wait for the mount's welcome to finish before the content tap (same reason:
+        # the gate-less TUI would otherwise inject it into the just-mounted game's
+        # welcome, where the firmware discards it).
+        wait_for("mount welcome drained", lambda s: s.audio_settled, timeout=60.0)
 
         # Tap 'acht' (4716): $eingabe *= 10; $eingabe += 8 -> the register file
         # shows 8, and the OID routing names the tapped script.

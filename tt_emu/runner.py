@@ -89,10 +89,6 @@ QHSM_MAX_DEPTH = 6
 #: Current mounted product id — written by the tap-2 header parse
 #: (nand-image-layout.md §7.3: "current product → 0x081da08c"); 0 = none.
 CURRENT_PRODUCT_ADDR = 0x081D_A08C
-#: Book-entry tail PC: book entry plays the book-open voice and only then
-#: clears the pen-down flag and re-enables capture — this instruction is the
-#: "book entry finished" marker (nand-image-layout.md §7.3.2 item 2).
-BOOK_ENTRY_TAIL_PC = 0x0803_4850
 #: Game-context resume byte +0x24 (base 0x080089a4): latched by the early
 #: app-init as ``(GPIO11 == 1)`` — 1 on every power-on with the button still
 #: held (§7.3.1a); the first standby heartbeat then auto-descends into
@@ -137,38 +133,41 @@ def statechart_leaf(machine: Machine) -> int:
     return leaf
 
 
-def book_ready_for_tap(machine: Machine, book_tail_at: int | None) -> bool:
-    """Is the pen ready to receive a tap in/after book mode?
+#: Quiet window, in 20 ms ticks, the DAC must be silent before the pen counts as
+#: "settled". Long enough that "the DAC stopped" reliably means "the pen finished
+#: talking" — spanning both the OGG-decode gap *between* playlist items and the lag
+#: between the DAC going quiet and the firmware's own playback state settling. This is
+#: the proven value the milestone session driver has waited on: 1 s of silence.
+AUDIO_QUIET_TICKS = 50
 
-    The shared book-readiness gate (the ``_TapSession`` "book-wait" condition,
-    factored out so the interactive TUI worker and the synchronous scripting
-    :class:`~tt_emu.emulator.Emulator` gate taps identically rather than each
-    re-deriving it). A tap pressed during the book-entry jingle is captured and
-    silently discarded without mounting (``nand-image-layout.md`` §7.3.2), so a
-    product tap must wait until:
 
-    * the book-entry tail has run (``book_tail_at`` is set), and
-    * the statechart leaf is book(13), and
-    * the settle gap since book entry has elapsed, and
-    * the book-open jingle has drained (audio chain idle,
-      ``audio-dac-dma.md`` §3), and
-    * the AO event ring is drained (the pump is idle).
+def audio_settled(machine: Machine, instructions_per_tick: int) -> bool:
+    """Has the pen finished talking? — a purely hardware-boundary "ready" signal.
 
-    Once a product is mounted the pen is in-game, so content taps are receptive
-    immediately (the caller still spaces taps by the settle gap since the last
-    lift). Pure RAM reads — never writes firmware state.
+    True once the pen has produced audio and the DAC has since gone quiet: it has played
+    its power-on welcome (or a content clip) and drained. Observed at the DAC — a bus
+    master whose port writes we watch — not by reading firmware statechart/flag internals,
+    so the same signal serves both pen generations.
+
+    Why callers wait on it (rather than tapping the instant a leaf appears):
+
+    * **Boot readiness.** During the power-on book-entry jingle the firmware is still
+      descending into book mode and *does* discard taps (``nand-image-layout.md``
+      §7.3.2); waiting for that welcome to drain is the honest "the pen is up" signal.
+      (Once in book/in-game a tap during ordinary playback is fine — it interrupts the
+      audio and still registers — so this is not a general "busy" lock-out.)
+    * **Clean observation.** The scripting API waits on it so each :meth:`wait_for_audio`
+      sees the complete clip the *last* tap triggered, not a truncated earlier one.
+
+    ``dac_submits > 0`` distinguishes "drained after playing" from "idle because nothing
+    has started yet" (cold boot). Pure observation — never writes firmware state.
     """
-    if book_tail_at is None:
-        return False
-    if machine.read_u32(CURRENT_PRODUCT_ADDR) != 0:
-        return True  # a GME is mounted -> in-game, content taps are receptive
-    if statechart_leaf(machine) != STATE_BOOK:
-        return False
-    if machine.clock - book_tail_at < SETTLE_INSTRUCTIONS:
-        return False
-    if machine.read_u8(AUDIO_FLAGS_ADDR) & AUDIO_CHAIN_ACTIVE:
-        return False
-    return machine.read_u16(EVENT_RING_HEAD_ADDR) == machine.read_u16(EVENT_RING_TAIL_ADDR)
+    audio = machine.audio
+    if audio is None:
+        return True
+    if audio.dac_submits == 0:
+        return False  # nothing has played yet — the pen is still booting into book
+    return machine.clock - audio.last_dac_submit_at >= AUDIO_QUIET_TICKS * instructions_per_tick
 
 
 @dataclass
@@ -370,7 +369,6 @@ class _TapSession:
         booted: BootedMachine,
         taps: list[int],
         *,
-        settle_ticks: int = 8,
         quiet_ticks: int = 50,
         react_timeout_ticks: int = 250,
         standby_timeout_ticks: int = 2_000,
@@ -378,7 +376,6 @@ class _TapSession:
     ) -> None:
         self.booted = booted
         self.taps = taps
-        self.settle_ticks = settle_ticks
         self.quiet_ticks = quiet_ticks
         self.react_timeout_ticks = react_timeout_ticks
         self.standby_timeout_ticks = standby_timeout_ticks
@@ -400,16 +397,7 @@ class _TapSession:
         self._mounted_at_tap = 0
         self._gameplay_at_tap = 0
         self._standby_at: int | None = None
-        self._book_tail_at: int | None = None
         self._last_progress_log = 0
-        # PC marker: book entry's tail has run (§7.3.2 item 2). Observation
-        # only — the hook reads the clock, it never touches firmware state.
-        booted.machine.on_code(BOOK_ENTRY_TAIL_PC, self._on_book_tail)
-
-    def _on_book_tail(self, machine: Machine) -> None:
-        if self._book_tail_at is None:
-            log.info("session: book-entry tail reached (clock=%d)", machine.clock)
-        self._book_tail_at = machine.clock
 
     # -- helpers ------------------------------------------------------------------------
 
@@ -487,27 +475,13 @@ class _TapSession:
             self._standby_at = now
 
         if self._phase == "book-wait":
-            # Power-on descent (§7.3.1a): the firmware descends into book(13)
-            # on its own. Tap the product only once book entry has fully run
-            # (the §7.3.2 tail marker), its book-open voice drained (audio
-            # chain idle + capture quiet), the pump is idle, and the settle
-            # gap has elapsed — then the tap routes to the book handler's OID
-            # dispatch and mounts the GME.
-            book_tail_at = self._book_tail_at
-            if g == STATE_BOOK and book_tail_at is not None:
-                chain_active = machine.read_u8(AUDIO_FLAGS_ADDR) & AUDIO_CHAIN_ACTIVE
-                quiet_for = self._ticks(machine, now - max(
-                    self._cap_grew_at,
-                    self.booted.audio.last_dac_submit_at,
-                    book_tail_at,
-                ))
-                if (
-                    now - book_tail_at >= SETTLE_INSTRUCTIONS
-                    and quiet_for >= self.settle_ticks
-                    and not chain_active
-                    and self._pump_idle(machine)
-                ):
-                    self._press(machine)
+            # Power-on descent (§7.3.1a): the firmware descends into book(13) on its
+            # own and plays its book-open voice. Tap the product once that voice has
+            # drained at the DAC (audio_settled) — no firmware statechart/flag reads;
+            # then the tap routes to the book handler's OID dispatch and mounts the GME.
+            # (The standby/book timeouts below are failure diagnostics, not the gate.)
+            if audio_settled(machine, machine.config.instructions_per_tick):
+                self._press(machine)
             elif self._standby_at is None:
                 if self._ticks(machine, now) >= self.standby_timeout_ticks:
                     self._fail(machine, "standby entry action never ran (booklist head 0)")
@@ -515,9 +489,8 @@ class _TapSession:
                 resume = machine.read_u8(RESUME_BYTE_ADDR)
                 self._fail(
                     machine,
-                    f"power-on auto-descent never reached book(13) "
-                    f"(g_state={g}, book-entry tail "
-                    f"{'hit' if self._book_tail_at is not None else 'not hit'}, "
+                    f"power-on auto-descent never produced the book-open voice "
+                    f"(g_state={g}, DAC submits={self.booted.audio.dac_submits}, "
                     f"resume byte +0x24={resume} — expected 1 from the app-init "
                     f"GPIO11 power-button latch, nand-image-layout.md §7.3.1a)",
                 )

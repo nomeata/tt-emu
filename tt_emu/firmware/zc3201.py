@@ -410,32 +410,6 @@ class Zc3201Debugger:
                 return scripts
         return None
 
-    def ready_for_tap(self, *, oid_pending: bool, ipt: int) -> bool:
-        """The ZC3201 tap-readiness gate — the single source of truth shared by the TUI
-        worker and the scripting :class:`~tt_emu.emulator.Emulator` (the settle gap since
-        the last lift is the caller's concern). A tap is admitted once:
-
-        * the boot has reached the stable book-idle voice-player leaf
-          (``BOOK_IDLE_LEAF_PC``, seen in the append-only :attr:`leaves` — so the check
-          is implicitly monotonic, no latch needed);
-        * no OID frame is still armed/held (``oid_pending``); and
-        * the audio chain is idle (no DAC submit for ~2 ticks) — a content tap that lands
-          mid-playlist drops the remaining entries, since the shared GME interpreter
-          advances the playlist on audio completion.
-
-        Unlike MT there is no book-ready event gate: the ZC3201 event ring is a
-        continuously-cycling timer/event pump, so readiness keys on the book-idle leaf,
-        not a ring-quiet condition (``docs/zc3201-boot-feasibility.md`` Leg 26).
-        """
-        if not any(pc == BOOK_IDLE_LEAF_PC for _, pc in self.leaves):
-            return False
-        if oid_pending:
-            return False
-        audio = self.machine.audio
-        if audio is not None and self.machine.clock - audio.last_dac_submit_at < 2 * ipt:
-            return False
-        return True
-
     # --- transition log (leaf changes; the QF framework has no QHsm frame stack) ----------
     def poll_transition(self) -> Transition | None:
         """One statechart move since the last poll, or ``None``.

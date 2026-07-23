@@ -71,7 +71,6 @@ from .boot import BootedMachine, build_machine
 from .firmware import FirmwareSupport, support_for
 from .firmware import mt as fw_mt
 from .firmware import model as fw_model
-from .firmware import zc3201 as fw_zc3201
 from .firmware.symbols import GmeScripts, TttoolSymbols, derive_media_names, load_tttool_yaml
 from .firmware_fetch import FirmwareDownloadError, FirmwareIntegrityError, ensure_firmware
 from .loader import load_upd
@@ -79,7 +78,6 @@ from .machine import Machine, MachineConfig
 from .runner import (
     AUDIO_CHAIN_ACTIVE,
     AUDIO_FLAGS_ADDR,
-    BOOK_ENTRY_TAIL_PC,
     CHECKPOINTS,
     CURRENT_PRODUCT_ADDR,
     FATAL_ADDRS,
@@ -87,7 +85,7 @@ from .runner import (
     SESSION_INSTRUCTIONS_PER_TICK,
     SETTLE_INSTRUCTIONS,
     STATE_NAMES,
-    book_ready_for_tap,
+    audio_settled,
     gme_product_code,
     statechart_leaf,
 )
@@ -495,6 +493,12 @@ class EmuSnapshot:
     last_chunk_bytes: int = 0
     last_chunk_clock: int = 0
     taps_fired: int = 0
+    #: The pen has played and drained its audio (DAC quiet) — i.e. it has finished
+    #: talking. Informational only: the TUI never gates taps on it (a tap that lands
+    #: too early is honestly discarded by the firmware, as on hardware). It is the
+    #: hardware-boundary "ready" signal the scripting API waits on and a driver can
+    #: poll to tap after the power-on welcome, the way a person would.
+    audio_settled: bool = False
     firmware_label: str = ""  #: non-empty once a known firmware was recognized
     debug: fw_model.DebugSnapshot | None = None  #: rich debug view (recognized fw only)
 
@@ -594,7 +598,6 @@ class EmulatorSession:
         self._pending_taps: deque[int] = deque()
         self._held: tuple[int, int, int] | None = None  # (oid, press clock, gameplay base)
         self._last_lift = 0
-        self._book_tail_at: int | None = None  # set by the book-entry-tail hook
         self._button_releases: list[tuple[int, str, int]] = []  # (clock, name, pin)
         self._last_snapshot_wall = 0.0
         self._last_leaf = -1
@@ -670,13 +673,11 @@ class EmulatorSession:
                 and self._ipt == SESSION_INSTRUCTIONS_PER_TICK
             ):
                 self._ipt = self._support.default_instructions_per_tick
-            ipt = self._ipt  # the readiness gate's audio-idle window keys on it
-            # In deterministic (count-paced) mode chunk_instructions is pinned
-            # to the historical 2000: coarser deterministic chunks shift a held
-            # tap's first post-book-entry capture into the welcome-jingle window
-            # where the firmware discards it. In realtime mode chunks are
-            # wall-interval-paced (the default effective_chunk = 2 ms) and the
-            # shared book_ready_for_tap gate spaces the taps.
+            ipt = self._ipt
+            # In deterministic (count-paced) mode chunk_instructions is pinned to the
+            # historical 2000 for reproducible per-chunk observation/tap timing; in
+            # realtime mode chunks are wall-interval-paced (the default effective_chunk
+            # = 2 ms).
             config = MachineConfig(
                 instructions_per_tick=ipt,
                 chunk_instructions=(
@@ -725,10 +726,8 @@ class EmulatorSession:
                 f"{len(sym.scripts)} scripts, {len(sym.register_names)} registers, "
                 f"{len(sym.media_names)} media names)"
             )
-        # Boot-progress checkpoints + the book-entry-tail tap gate are keyed on MT
-        # PROG addresses (runner.py). ZC3201 has its own boot descent and tap-gate
-        # (keyed on the book-idle statechart leaf, see _ready_for_tap), so these are
-        # MT-only — under ZC3201 they would register hooks on PCs that never execute.
+        # Boot-progress checkpoints are keyed on MT PROG addresses (runner.py); under
+        # ZC3201 they would register hooks on PCs that never execute, so they are MT-only.
         if not self._is_zc3201:
             for addr, name in CHECKPOINTS.items():
                 booted.machine.on_code(addr, self._make_checkpoint(name))
@@ -736,10 +735,6 @@ class EmulatorSession:
                 booted.machine.on_code(
                     addr, self._make_checkpoint(f"FATAL: {name}", fatal=True)
                 )
-            booted.machine.on_code(
-                BOOK_ENTRY_TAIL_PC, self._make_checkpoint("book entry finished (§7.3.2)")
-            )
-            booted.machine.on_code(BOOK_ENTRY_TAIL_PC, self._note_book_tail)
         booted.audio.capture.listener = self._on_audio_chunk
 
         self.snapshot = replace(self.snapshot, power="running")
@@ -778,22 +773,6 @@ class EmulatorSession:
         clock = booted.machine.clock if booted is not None else 0
         self.post_event(f"[{clock:>12,}] {message}")
 
-    def _note_book_tail(self, machine: Machine) -> None:
-        """Record when book entry's tail ran (§7.3.2) — the earliest a tap mounts."""
-        if self._book_tail_at is None:
-            self._book_tail_at = machine.clock
-
-    def _ready_for_tap(self, machine: Machine, now: int) -> bool:
-        """Gate the product tap on book readiness — the shared
-        :func:`~tt_emu.runner.book_ready_for_tap` condition (a tap pressed
-        during the book-entry jingle is discarded without mounting; once a
-        product is mounted content taps proceed on the settle gap alone)."""
-        if isinstance(self.debugger, fw_zc3201.Zc3201Debugger):
-            # The ZC3201 gate lives on its debugger (shared with the scripting Emulator).
-            pending = self.booted is not None and self.booted.oid.pending
-            return self.debugger.ready_for_tap(oid_pending=pending, ipt=self._ipt)
-        return book_ready_for_tap(machine, self._book_tail_at)
-
     def _on_chunk(self, machine: Machine) -> None:
         """Per-chunk callback on the emulation thread: apply commands, observe."""
         if self._stop.is_set():
@@ -820,11 +799,12 @@ class EmulatorSession:
                 self._held = None
                 self._last_lift = now
                 self.post_event(f"[{now:>12,}] tap {oid}: never latched — pen lifted (timeout)")
-        elif (
-            self._pending_taps
-            and now - self._last_lift >= SETTLE_INSTRUCTIONS
-            and self._ready_for_tap(machine, now)
-        ):
+        elif self._pending_taps and now - self._last_lift >= SETTLE_INSTRUCTIONS:
+            # Inject a queued tap once the previous one's OID frame has cleared (the
+            # settle gap). No book-readiness gate: as on the real pen, a tap that lands
+            # too early — during the welcome jingle, before a product is mounted — is
+            # simply captured and discarded by the firmware. Honest, and the user hears
+            # the result (or silence) exactly as they would on hardware.
             oid = self._pending_taps.popleft()
             self._held = (oid, now, booted.oid.gameplay_frames_served)
             booted.oid.hold(oid)
@@ -931,6 +911,7 @@ class EmulatorSession:
             captured_chunks=len(capture.chunks),
             capture_rate=capture.wav_rate,
             dac_submits=booted.audio.dac_submits,
+            audio_settled=audio_settled(machine, self._ipt),
             last_chunk_bytes=len(last.data) if last else 0,
             last_chunk_clock=last.clock if last else 0,
             taps_fired=booted.oid.taps_served,

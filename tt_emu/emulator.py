@@ -8,9 +8,10 @@ thread): here every method *advances the emulation and returns*, so a test reads
 top-to-bottom.
 
 Nothing about the firmware is hooked or modified (the project's hook-free
-principle). Taps are injected through the authentic OID sensor model and gated
-on real book-readiness (the shared :func:`tt_emu.runner.book_ready_for_tap`
-condition); "what is playing" is read from the media index the firmware's own
+principle). Taps are injected through the authentic OID sensor model and gated at
+the hardware boundary — waiting for the pen's audio to drain at the DAC (the shared
+:func:`tt_emu.runner.audio_settled` condition), not on any firmware statechart/flag
+read; "what is playing" is read from the media index the firmware's own
 interpreter requested (the ``play_media`` / ``fwl_play_voice_by_id`` watchpoints
 of ``firmware-2n-mt.md`` §4.5), resolved to a name via the tttool YAML — the
 same signals the TUI debugger shows.
@@ -74,16 +75,11 @@ from .loader import load_upd
 from .machine import Machine, MachineConfig
 from .peripherals.oid import OidSensor
 from .runner import (
-    AUDIO_CHAIN_ACTIVE,
-    AUDIO_FLAGS_ADDR,
-    BOOK_ENTRY_TAIL_PC,
     CURRENT_PRODUCT_ADDR,
-    EVENT_RING_HEAD_ADDR,
-    EVENT_RING_TAIL_ADDR,
     SESSION_INSTRUCTIONS_PER_TICK,
     SETTLE_INSTRUCTIONS,
     STATE_NAMES,
-    book_ready_for_tap,
+    audio_settled,
     gme_product_code,
     statechart_leaf,
 )
@@ -423,7 +419,6 @@ class Emulator:
         self._zc_mount_baseline: int | None = None
         self._audio_events: list[_AudioEvent] = []
         self._transitions: list[Transition] = []
-        self._book_tail_at: int | None = None
         self._last_lift = 0
         self._last_play_action: tuple[int, int] | None = None
         self._halted: str | None = None
@@ -475,10 +470,9 @@ class Emulator:
                 read_mem=booted.mmu.read_va,
             )
 
-        # Read-only observation watchpoints (firmware unmodified): the
-        # book-entry tail marker and the media/voice "now playing" watches.
+        # Read-only observation watchpoints (firmware unmodified): the media/voice
+        # "now playing" watches for the transition/action trace.
         machine = self.machine
-        machine.on_code(BOOK_ENTRY_TAIL_PC, self._on_book_tail)
         machine.on_code(fw_mt.PC_GME_EXEC_COMMAND, self._on_exec_command)
         machine.on_code(fw_mt.PC_PLAY_MEDIA, self._on_play_media)
         machine.on_code(fw_mt.PC_PLAY_VOICE, self._on_play_voice)
@@ -581,10 +575,6 @@ class Emulator:
 
     # --- watchpoint sinks (observation only) -------------------------------------------
 
-    def _on_book_tail(self, machine: Machine) -> None:
-        if self._book_tail_at is None:
-            self._book_tail_at = machine.clock
-
     def _on_exec_command(self, machine: Machine) -> None:
         """Record the just-executed GME action's (opcode, operand) so the next
         ``play_media`` can resolve which playlist entry is being played."""
@@ -672,27 +662,19 @@ class Emulator:
             raise ScriptingError(f"unknown OID name {oid!r}; known scripts: {known}") from None
 
     def _ready_for_tap(self) -> bool:
-        """Book-readiness (shared gate) plus a clean audio boundary + settle gap.
-
-        Beyond :func:`tt_emu.runner.book_ready_for_tap` this also requires the
-        audio chain to be idle even after a game is mounted, so a scripted tap
-        never lands mid-playback and each :meth:`wait_for_audio` sees a clean new
-        clip. The settle gap since the last lift spaces taps as on real HW
-        (``nand-image-layout.md`` §7.3.2).
+        """Ready once the pen's audio has drained at the DAC and no OID frame is still
+        in flight — a hardware-boundary gate (:func:`tt_emu.runner.audio_settled`), the
+        same for both generations. The settle gap since the last lift spaces taps as on
+        real HW (``nand-image-layout.md`` §7.3.2); the DAC-quiet check keeps a scripted
+        tap off a still-playing welcome/playlist so each :meth:`wait_for_audio` sees a
+        clean new clip.
         """
         machine = self.machine
         if machine.clock - self._last_lift < SETTLE_INSTRUCTIONS:
             return False
-        if self._is_zc3201:
-            # The ZC3201 gate lives on its debugger (shared with the TUI worker).
-            assert self._zc_debugger is not None
-            pending = self._oid_sensor is not None and self._oid_sensor.pending
-            return self._zc_debugger.ready_for_tap(oid_pending=pending, ipt=self._ipt)
-        if not book_ready_for_tap(machine, self._book_tail_at):
-            return False
-        if machine.read_u8(AUDIO_FLAGS_ADDR) & AUDIO_CHAIN_ACTIVE:
-            return False  # a playback is still in progress -> not a clean boundary
-        return machine.read_u16(EVENT_RING_HEAD_ADDR) == machine.read_u16(EVENT_RING_TAIL_ADDR)
+        if self._oid_sensor is not None and self._oid_sensor.pending:
+            return False  # an OID frame is still being clocked in
+        return audio_settled(machine, self._ipt)
 
     def _mount_token(self) -> int:
         """The RAM word whose change signals "a game got mounted" for this
