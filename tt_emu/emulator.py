@@ -499,20 +499,18 @@ class Emulator:
                 dac_pacing=self._dac_pacing,
                 pacing=self._pacing,
             )
-        machine = build_zc3201_machine(firmware, config, b_files=self._b_files or None)
+        booted = build_zc3201_machine(firmware, config, b_files=self._b_files or None)
         self._is_zc3201 = True
-        self._booted = None
-        self.machine = machine
-        # The 1st-gen DAC PCM path IS modelled: build_zc3201_machine wires an
-        # AudioDma retargeted to the ZC3201 DAC port; the firmware runs under its
-        # real MMU so the DAC reads physical memory directly, and the same
-        # off-the-DAC capture MT uses yields real S16LE PCM here (Clip.pcm /
-        # save_wav work). build_zc3201_machine always sets machine.audio/oid.
-        assert machine.audio is not None
-        self._capture = machine.audio.capture
-        self._oid_sensor = machine.oid
+        self._booted = booted
+        self.machine = booted.machine
+        # The 1st-gen DAC PCM path IS modelled: the ZC3201 recipe wires an AudioDma
+        # retargeted to the ZC3201 DAC port; the firmware runs under its real MMU so
+        # the DAC reads physical memory directly, and the same off-the-DAC capture MT
+        # uses yields real S16LE PCM here (Clip.pcm / save_wav work).
+        self._capture = booted.audio.capture
+        self._oid_sensor = booted.oid
         self._zc_debugger = Zc3201Debugger(
-            machine,
+            booted.machine,
             gme_files=list(self._b_files.values()),
             symbols=self._symbols,
         )
@@ -521,7 +519,7 @@ class Emulator:
         # The GME play observable: voice_play_sample (r1=offset, r2=size) — the
         # same (offset, size) key the media-table join uses, so the MT media
         # watch is reused verbatim at the ZC3201 PC.
-        machine.on_code(fw_zc3201.PC_VOICE_PLAY_SAMPLE, self._on_play_media)
+        booted.machine.on_code(fw_zc3201.PC_VOICE_PLAY_SAMPLE, self._on_play_media)
 
     def __exit__(self, *exc: object) -> None:
         # Nothing to join (single-threaded); mark the machine stopped so a

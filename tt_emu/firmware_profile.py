@@ -186,6 +186,22 @@ class FirmwareProfile:
     #: ``0x08200000`` (above the ~``0x081e…`` heap top).
     svc_stack_top: int = 0x0840_0000
 
+    #: Initial IRQ-mode stack top the machine seeds on the first interrupt (the
+    #: from-entry boot skips the reset handler's per-mode stack setup). It must lie
+    #: in a resident, mapped window: MT's emulator-chosen ``0x083F0000`` (top of the
+    #: 4-MiB RAM, always identity-mapped); ZC3201's authentic reset-handler value
+    #: ``0x08008000`` (the MT default would fault outside the 1st-gen demand window
+    #: ``[0x08008000, 0x08200000)`` — see ``Machine.irq_stack_top``).
+    irq_stack_top: int = 0x083F_0000
+
+    #: Decouple the top-level and second-level timer interrupt latches in the
+    #: :class:`~tt_emu.peripherals.intc.IntcTimer` model. ZC3201's timer ISR acks the
+    #: top-level line-10 status before reading the second-level timer-fired bit, so
+    #: the two must latch independently or the HAL software-timer tick never fires
+    #: (``docs/zc3201-boot-feasibility.md``). MT's ISR reads them together, so it
+    #: keeps the coupled default.
+    intc_timer_ack_decouple: bool = False
+
     #: SoC chip-ID constant read at ``0x04000000`` (SysCon REG_CHIP_ID). Per-
     #: generation: 2N-MT ``0x30393031`` ("1090"), ZC3201 ``0x33323931`` ("1923").
     #: The firmware's FAT/MtdLib version gate (``fw_version_ref`` 0x0802c880 /
@@ -432,6 +448,8 @@ ZC3201 = FirmwareProfile(
     # all < 0x08200000) intact, exactly as on hardware. (Leg 21 saw perturbation only
     # because the B: partition was unmountable then — see nand_image_zc3201.)
     svc_stack_top=0x0820_0000,
+    irq_stack_top=0x0800_8000,  # authentic reset-handler value (in the resident low region)
+    intc_timer_ack_decouple=True,  # ZC3201 timer ISR acks top-level before 2nd-level bit
     soc_chip_id=0x3332_3931,  # "1923" — the ZC3201 SoC chip-ID (FS version gate)
     nand_small_page=True,     # Samsung K9F5608: 512-B page + 16-B OOB, 32 pages/block
     nand_page_size=512,

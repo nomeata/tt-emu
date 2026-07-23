@@ -67,7 +67,7 @@ from textual.widgets import Button, Footer, Header, Input, OptionList, RichLog, 
 from textual.widgets.option_list import Option
 
 from .audio_capture import DEFAULT_RATE, FRAME_BYTES, CapturedChunk
-from .boot import BootedMachine, build_machine, build_zc3201_machine
+from .boot import BootedMachine, build_machine
 from .firmware import detect as detect_firmware
 from .firmware import mt as fw_mt
 from .firmware import zc3201 as fw_zc3201
@@ -684,25 +684,10 @@ class EmulatorSession:
                 dac_pacing=self._dac_pacing,
                 pacing=self._pacing,
             )
-            if self._is_zc3201:
-                # 1st-gen substrate: build_zc3201_machine returns a bare Machine
-                # (its own MMU + peripherals attached as attributes); wrap it in a
-                # BootedMachine so the shared worker plumbing is generation-agnostic.
-                # It has no ZC90B auth chip (zc90b=None).
-                machine = build_zc3201_machine(
-                    firmware, config, b_files=self._b_files or None
-                )
-                assert machine.mmu is not None
-                assert machine.nand is not None
-                assert machine.oid is not None
-                assert machine.audio is not None
-                assert machine.gpio is not None
-                booted = BootedMachine(
-                    machine, firmware, None, machine.nand,
-                    machine.oid, machine.audio, machine.gpio, machine.mmu,
-                )
-            else:
-                booted = build_machine(firmware, config, b_files=self._b_files or None)
+            # One generation-agnostic entry point: build_machine detects the firmware
+            # and returns a BootedMachine for either generation (the ZC3201 recipe has
+            # no ZC90B auth chip; its per-gen cadence is already baked into `config`).
+            booted = build_machine(firmware, config, b_files=self._b_files or None)
         except Exception as exc:  # noqa: BLE001 — surface any build failure in the UI
             self.snapshot = replace(self.snapshot, power=f"failed: {exc}")
             self.post_event(f"FAILED to build the machine: {exc}")

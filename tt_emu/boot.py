@@ -26,16 +26,14 @@ from __future__ import annotations
 import logging
 import struct
 
-from .firmware_profile import ZC3201, FirmwareProfile
+from .firmware_profile import MT, ZC3201, FirmwareProfile, detect
 from .loader import (
     Firmware,
     NANDBOOT_ALIAS_ADDR,
     NANDBOOT_LOAD_ADDR,
-    PROG_ENTRY,
-    PROG_LOAD_ADDR,
 )
 from .machine import Machine, MachineConfig
-from .mmu_boot import MmuBoot, ZC3201_MMU
+from .mmu_boot import MT_MMU, MmuAnchors, MmuBoot, ZC3201_MMU
 from .nand_image import NandImage, build_nand_image
 from .peripherals.audio import AudioDma
 from .peripherals.battery import BatteryAdc
@@ -136,39 +134,118 @@ class BootedMachine:
         self.oid.tap(oid)
 
 
+def _finish(
+    machine: Machine,
+    firmware: Firmware,
+    profile: FirmwareProfile,
+    *,
+    nand: NandImage,
+    oid: OidSensor,
+    audio: AudioDma,
+    gpio: GpioBlock,
+    zc90b: Zc90bAuth | None,
+    anchors: MmuAnchors,
+) -> BootedMachine:
+    """The shared boot tail (both generations): hand off to the firmware's own MMU,
+    seed the IRQ stack + CPU entry state, publish the peripheral handles, and wrap.
+
+    Running nandboot ``init2`` builds the page table and enables the MMU; from here the
+    firmware runs under its real MMU and the DMA engines read physical memory directly
+    (no page-table inversion). CPU-visible reads (``read_u*``) route through the MMU so
+    inspection sees firmware globals at their real (often non-identity) frames.
+    """
+    mmu = MmuBoot(machine, firmware, audio, anchors)
+    mmu.setup()
+    machine.mmu = mmu
+    # From-entry boot enters the boot task past the reset handler's per-mode stack
+    # setup, so the machine seeds the IRQ stack on first delivery (per-firmware).
+    machine.irq_stack_top = profile.irq_stack_top
+    machine.nand = nand
+    machine.oid = oid
+    machine.audio = audio
+    machine.gpio = gpio
+    machine.set_entry_state(profile.prog_entry, profile.svc_stack_top, CPSR_SVC_IRQS_ON)
+    return BootedMachine(machine, firmware, zc90b, nand, oid, audio, gpio, mmu)
+
+
 def build_machine(
     firmware: Firmware,
     config: MachineConfig | None = None,
     *,
+    profile: FirmwareProfile | None = None,
     override_hal_timer_leaf: bool = True,
     nand_image: NandImage | None = None,
     a_files: dict[str, bytes] | None = None,
     b_files: dict[str, bytes] | None = None,
     oid_answer_status_polls: bool = False,
+    provision: bool = False,
 ) -> BootedMachine:
-    """Build a machine, load the firmware, register peripherals, and seed boot state.
+    """Assemble a machine for ``firmware`` and seed it to its from-entry boot state.
 
-    ``override_hal_timer_leaf`` plants the return-1 stub at 0x07FFE740 (§5.4
-    item 2); leave it on unless the timer model is made cycle-faithful.
+    The single generation-agnostic entry point: the firmware's own fingerprint selects
+    its :class:`~tt_emu.firmware_profile.FirmwareProfile` (pass ``profile`` to override),
+    and the matching boot recipe assembles the peripherals, loads the artifacts, hands
+    off to the real MMU, and returns a :class:`BootedMachine`. Both generations share the
+    MMU/entry/wrap tail (:func:`_finish`); they differ in their peripheral set and the
+    from-entry RAM seeds that stand in for the boot-ROM steps a from-entry boot skips.
 
-    ``nand_image`` supplies a pre-built NAND image; by default one is built
-    from the firmware artifacts per ``nand-image-layout.md`` §6, with
-    ``a_files``/``b_files`` as the host content of the A: (system) and B:
-    (user ``.gme``) partitions.
+    ``nand_image`` supplies a pre-built NAND image; by default one is built from the
+    firmware artifacts (``nand-image-layout.md`` §6) with ``a_files``/``b_files`` as the
+    A: (system) and B: (user ``.gme``) partition contents. The remaining keywords are
+    recipe-specific (``override_hal_timer_leaf``/``oid_answer_status_polls`` for MT,
+    ``provision`` for ZC3201) and ignored by the other generation.
+    """
+    if profile is None:
+        profile = detect(firmware.prog.data, firmware.boot_generation) or MT
+    if profile.key == ZC3201.key:
+        return build_zc3201_machine(
+            firmware, config, profile=profile,
+            nand_image=nand_image, a_files=a_files, b_files=b_files, provision=provision,
+        )
+    return _build_mt(
+        firmware, config, profile=profile,
+        override_hal_timer_leaf=override_hal_timer_leaf,
+        nand_image=nand_image, a_files=a_files, b_files=b_files,
+        oid_answer_status_polls=oid_answer_status_polls,
+    )
+
+
+def _build_mt(
+    firmware: Firmware,
+    config: MachineConfig | None,
+    *,
+    profile: FirmwareProfile,
+    override_hal_timer_leaf: bool,
+    nand_image: NandImage | None,
+    a_files: dict[str, bytes] | None,
+    b_files: dict[str, bytes] | None,
+    oid_answer_status_polls: bool,
+) -> BootedMachine:
+    """The 2N "MT" boot recipe (``memory-map-and-boot.md`` §5).
+
+    ``override_hal_timer_leaf`` plants the return-1 stub at 0x07FFE740 (§5.4 item 2);
+    leave it on unless the timer model is made cycle-faithful.
     """
     machine = Machine(config)
 
     # --- storage: NAND image + controller trio (nand-and-nfc-controller.md §10) -----
     nand = nand_image or build_nand_image(firmware, a_files=a_files, b_files=b_files)
     ecc = EccEngine()
-    nfc = NfcController(nand, ecc)
+    nfc = NfcController(
+        nand, ecc, sram_window=profile.nand_sram_window, read_id=profile.nand_read_id,
+        small_page=profile.nand_small_page, page_size=profile.nand_page_size,
+    )
 
     # --- peripherals ---------------------------------------------------------------
-    gpio = GpioBlock()
-    intc = IntcTimer(gpio)
+    gpio = GpioBlock(in_idle=profile.gpio_in_idle, amp_pin=profile.gpio_amp_pin)
+    intc = IntcTimer(gpio, zc3201_timer_ack=profile.intc_timer_ack_decouple)
     zc90b = Zc90bAuth(gpio)
-    syscon = SysCon()
-    oid = OidSensor(gpio, answer_status_polls=oid_answer_status_polls)
+    syscon = SysCon(chip_id=profile.soc_chip_id)
+    oid = OidSensor(
+        gpio, pin_clock=profile.oid_pin_clock, pin_data=profile.oid_pin_data,
+        bit_count_addr=profile.oid_bit_count_addr,
+        answer_status_polls=oid_answer_status_polls,
+    )
     audio = AudioDma(nfc, intc, syscon, gpio)
     machine.add_peripheral(syscon)
     machine.add_peripheral(intc)
@@ -186,14 +263,30 @@ def build_machine(
     machine.intc = intc
 
     # --- load artifacts (§5.1) -----------------------------------------------------
-    machine.write_bytes(PROG_LOAD_ADDR, firmware.prog.data)
-    machine.write_bytes(NANDBOOT_LOAD_ADDR, firmware.nandboot.data)
-    machine.write_bytes(NANDBOOT_ALIAS_ADDR, firmware.nandboot.data)
+    machine.write_bytes(profile.prog_load, firmware.prog.data)
+    machine.write_bytes(profile.nandboot_load, firmware.nandboot.data)
+    if profile.nandboot_alias is not None:
+        machine.write_bytes(profile.nandboot_alias, firmware.nandboot.data)
 
     # ZC90B S-boxes live in the loaded PROG image (zc90b-auth.md §4).
     zc90b.load_tables(machine.read_bytes)
 
-    # --- boot-time RAM seeds (§5.6) ------------------------------------------------
+    _seed_mt(machine, override_hal_timer_leaf=override_hal_timer_leaf)
+
+    log.info(
+        "loaded %s (build %s, boot gen %s): PROG %#x bytes @ %#010x, nandboot %#x bytes",
+        firmware.path.name, firmware.build_id, firmware.boot_generation,
+        firmware.prog.size, profile.prog_load, firmware.nandboot.size,
+    )
+    return _finish(
+        machine, firmware, profile,
+        nand=nand, oid=oid, audio=audio, gpio=gpio, zc90b=zc90b, anchors=MT_MMU,
+    )
+
+
+def _seed_mt(machine: Machine, *, override_hal_timer_leaf: bool) -> None:
+    """The MT from-entry RAM seeds (§5.6): the only state the skipped boot stages
+    would have produced. (ZC3201 has its own, different seed recipe, in-line below.)"""
     machine.write_u8(QHSM_FRAME_ADDR, QHSM_FRAME_VALUE)
     machine.write_bytes(NAND_GEOMETRY_ADDR, NAND_GEOMETRY_BYTES)
     # DOC GAP (see report): the doc's 96-byte seed is a *post-boot* live-pen dump
@@ -211,29 +304,6 @@ def build_machine(
     if override_hal_timer_leaf:
         machine.write_bytes(HAL_LEAF_TIMER_ADDR, _RETURN_ONE_STUB)
 
-    # --- MMU handoff: run nandboot init2 to build the page table + enable the MMU,
-    # and install the abort-driven demand-paging + romboot backing store (mmu_boot).
-    # The DMA engines then read physical memory directly (no page-table inversion).
-    mmu = MmuBoot(machine, firmware, audio)
-    mmu.setup()
-    # From here the firmware runs under its own MMU; route CPU-visible reads (read_u*) through
-    # it so inspection sees firmware globals at their real (often non-identity) frames.
-    machine.mmu = mmu
-
-    # --- CPU entry state (§5.2): PROG's pre-init entry, now under the MMU ----------
-    machine.set_entry_state(PROG_ENTRY, SVC_STACK_TOP, CPSR_SVC_IRQS_ON)
-
-    log.info(
-        "loaded %s (build %s, boot gen %s): PROG %#x bytes @ %#010x, nandboot %#x bytes",
-        firmware.path.name,
-        firmware.build_id,
-        firmware.boot_generation,
-        firmware.prog.size,
-        PROG_LOAD_ADDR,
-        firmware.nandboot.size,
-    )
-    return BootedMachine(machine, firmware, zc90b, nand, oid, audio, gpio, mmu)
-
 
 def build_zc3201_machine(
     firmware: Firmware,
@@ -244,15 +314,16 @@ def build_zc3201_machine(
     a_files: dict[str, bytes] | None = None,
     b_files: dict[str, bytes] | None = None,
     provision: bool = False,
-) -> Machine:
-    """Assemble a ZC3201 machine and seed it to its real boot-task entry.
+) -> BootedMachine:
+    """The 1st-gen ZC3201 boot recipe (``docs/zc3201-boot-feasibility.md``).
 
-    The 1st-gen bring-up substrate (``docs/zc3201-boot-feasibility.md`` "Leg 3").
-    Unlike the MT recipe (:func:`build_machine`), ZC3201 needs **no demand-paging
-    MMU** — the whole :mod:`tt_emu.mmu_boot` layer is absent here; PROG is loaded
-    **flat at its true link base ``0x08008000``** (``profile.prog_load``) so every
-    absolute reference resolves as linked (``memory-map-and-boot.md`` §1.3.1). The
-    nandboot blob is mapped at ``0x07ff8000`` **and** aliased at ``0x08000000``
+    Reached through :func:`build_machine` (which detects the generation), or called
+    directly. Like MT it runs the firmware under its **own demand-paging MMU** (the
+    shared :func:`_finish` tail runs nandboot ``init2`` + installs the pager); the two
+    recipes differ only in their peripheral set and from-entry seeds. PROG is loaded at
+    its true link base ``0x08008000`` (``profile.prog_load``) so every absolute
+    reference resolves as linked (``memory-map-and-boot.md`` §1.3.1); the nandboot blob
+    is mapped at ``0x07ff8000`` **and** aliased at ``0x08000000``
     (``profile.nandboot_alias``) exactly like MT, because PROG's HAL veneers call
     ``0x0800xxxx`` (``= 0x07ffxxxx + 0x8000``).
 
@@ -415,22 +486,6 @@ def build_zc3201_machine(
         dev_addr, geom = profile.nand_dev_geometry
         machine.write_bytes(dev_addr, geom)
 
-    # --- MMU handoff (authentic, same as MT): run ZC3201's nandboot init2 to build
-    # its page table + enable the MMU, then install abort-driven demand-paging + the
-    # romboot backing store. From here the firmware runs under its OWN MMU, so the
-    # DAC/DMA engines read physical memory directly (the audio buffers' non-identity
-    # VA->PA mapping is now the hardware's, not a Python inversion). Seeds above stand
-    # in for init1/init3 state MmuBoot doesn't replay; they live in the resident
-    # AP=11 low region, so they survive the MMU coming on.
-    mmu = MmuBoot(machine, firmware, audio, ZC3201_MMU)
-    mmu.setup()
-    machine.mmu = mmu
-    # The from-entry boot enters boot_task_main past the reset handler's per-mode stack
-    # setup, so the machine seeds the IRQ-mode stack on first delivery; ZC3201's authentic
-    # value (0x08008000) sits in the resident low region, unlike MT's default which would
-    # fault outside the 1st-gen demand window (§ Machine.irq_stack_top).
-    machine.irq_stack_top = 0x0800_8000
-
     # OID sensor: the two-wire bit-bang link, re-pointed to the ZC3201 pins /
     # capture-state byte (profile.oid_*). The firmware's own nandboot OID HAL
     # (hal_oid_shift_in 0x08005d80, 40 ms poll callback 0x08005f48 armed at the
@@ -444,15 +499,21 @@ def build_zc3201_machine(
     )
     machine.add_peripheral(oid)
 
-    machine.set_entry_state(profile.prog_entry, profile.svc_stack_top, CPSR_SVC_IRQS_ON)
-    machine.nand = nand
-    machine.oid = oid
-    machine.gpio = gpio  # so the interactive TUI can drive button pins
+    # Hand off to the firmware's own MMU (authentic, same as MT): _finish runs ZC3201's
+    # nandboot init2 to build its page table + enable the MMU, installs abort-driven
+    # demand-paging + the romboot backing store, then seeds the IRQ stack (profile's
+    # 0x08008000, in the resident low region) and the CPU entry state. From there the
+    # firmware runs under its OWN MMU, so the DAC/DMA engines read physical memory
+    # directly. The seeds above stand in for init1/init3 state MmuBoot doesn't replay;
+    # they live in the resident AP=11 low region, so they survive the MMU coming on.
     log.info(
         "zc3201 machine for %s (%s): PROG @ %#010x, boot-task entry %#010x",
         profile.label, firmware.boot_generation, profile.prog_load, profile.prog_entry,
     )
-    return machine
+    return _finish(
+        machine, firmware, profile,
+        nand=nand, oid=oid, audio=audio, gpio=gpio, zc90b=None, anchors=ZC3201_MMU,
+    )
 
 
 def build_bare_machine(

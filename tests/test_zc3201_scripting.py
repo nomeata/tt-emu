@@ -67,7 +67,7 @@ def _build(gme: bytes):
     # the flat values to cover the same overhead.
     machine = build_zc3201_machine(
         fw, MachineConfig(instructions_per_tick=100_000), b_files={"example.gme": gme}
-    )
+    ).machine
     plays: list[tuple[int, int]] = []
     read = _reg_reader(machine)
 

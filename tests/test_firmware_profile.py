@@ -135,7 +135,7 @@ def test_zc3201_boots_through_app_init_to_storage() -> None:
     from tt_emu.machine import MachineConfig
 
     fw = load_upd(str(ZC_PATH))
-    machine = build_zc3201_machine(fw, MachineConfig(instructions_per_tick=20_000))
+    machine = build_zc3201_machine(fw, MachineConfig(instructions_per_tick=20_000)).machine
     reached: set[str] = set()
     milestones = {
         ZC3201.symbols["app_init_main"]: "app_init",
@@ -201,7 +201,7 @@ def test_zc3201_fatlib_mount_completes() -> None:
     from unicorn.arm_const import UC_ARM_REG_R0
 
     fw = load_upd(str(ZC_PATH))
-    machine = build_zc3201_machine(fw, MachineConfig(instructions_per_tick=100_000))
+    machine = build_zc3201_machine(fw, MachineConfig(instructions_per_tick=100_000)).machine
 
     divisors: list[int] = []
     reached_lookup = {"v": False}
@@ -252,7 +252,7 @@ def test_zc3201_codepage_index_reaches_statechart() -> None:
     from tt_emu.machine import MachineConfig
 
     fw = load_upd(str(ZC_PATH))
-    machine = build_zc3201_machine(fw, MachineConfig(instructions_per_tick=20_000))
+    machine = build_zc3201_machine(fw, MachineConfig(instructions_per_tick=20_000)).machine
 
     hit = {"spin": False, "init": 0, "dispatch": 0}
 
@@ -304,7 +304,7 @@ def test_zc3201_statechart_advances_init_to_standby() -> None:
 
     fw = load_upd(str(ZC_PATH))
     assert fw_zc.recognize(fw.prog.data), "ZC3201 firmware recognition failed"
-    machine = build_zc3201_machine(fw, MachineConfig(instructions_per_tick=20_000))
+    machine = build_zc3201_machine(fw, MachineConfig(instructions_per_tick=20_000)).machine
     dbg = fw_zc.Zc3201Debugger(machine)
     dbg.attach_watches()
     machine.run(40_000_000)
@@ -341,7 +341,7 @@ def test_zc3201_standby_descends_past_gpio_pin0_wait() -> None:
 
     fw = load_upd(str(ZC_PATH))
     assert ZC3201.gpio_in_idle == 0x0000_3200, "ZC3201 idle word must clear GPIO bit0"
-    machine = build_zc3201_machine(fw, MachineConfig(instructions_per_tick=100_000))
+    machine = build_zc3201_machine(fw, MachineConfig(instructions_per_tick=100_000)).machine
     dbg = fw_zc.Zc3201Debugger(machine)
     dbg.attach_watches()
     machine.run(200_000_000)
@@ -391,7 +391,7 @@ def test_zc3201_oid_tap_captured_and_dispatched() -> None:
     from tt_emu.machine import MachineConfig
 
     fw = load_upd(str(ZC_PATH))
-    machine = build_zc3201_machine(fw, MachineConfig(instructions_per_tick=100_000))
+    machine = build_zc3201_machine(fw, MachineConfig(instructions_per_tick=100_000)).machine
 
     poll_cb = {"n": 0}
     machine.on_code(0x0800_5F48, lambda _m: poll_cb.__setitem__("n", poll_cb["n"] + 1))
