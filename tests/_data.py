@@ -73,9 +73,10 @@ def firmware_path_zc3201() -> Path | None:
     return None
 
 
-#: Legacy local path to the 1st-gen ZC3201 test game (product 42, OIDs 8065-8067).
+#: Legacy local path to the 1st-gen ZC3201 test game (product 42, OIDs 8065-8067),
+#: in the retired-and-archived RE workspace. Overridable via $TT_EMU_GME_ZC3201.
 _LEGACY_GME_ZC3201 = Path(
-    "/home/jojo/tiptoi/firmware-re/tools/ttemu/content/B/example.gme"
+    "/home/jojo/tiptoi/firmware-re-ARCHIVE/tools/ttemu/content/B/example.gme"
 )
 
 

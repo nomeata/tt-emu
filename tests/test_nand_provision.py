@@ -19,7 +19,11 @@ from tt_emu.firmware_profile import MT
 from tt_emu.loader import load_upd
 from tt_emu.nand_provision import WritableNand, run_producer
 
-_REF_IMG = Path("/home/jojo/tiptoi/firmware-re/fw/2N-update3202MT/data/producer_nand.img")
+# Legacy reference image from the (retired) RE workspace, now archived. Skipif-guarded
+# on existence, so a fresh checkout without it just skips this comparison test.
+_REF_IMG = Path(
+    "/home/jojo/tiptoi/firmware-re-ARCHIVE/fw/2N-update3202MT/data/producer_nand.img"
+)
 
 
 def test_writable_nand_cache_roundtrip() -> None:
