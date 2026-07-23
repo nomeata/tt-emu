@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Callable
 
 from unicorn.arm_const import UC_ARM_REG_R0, UC_ARM_REG_R1, UC_ARM_REG_R2, UC_ARM_REG_R3
 
+from ..firmware_profile import ZC3201 as _PROFILE
 from .mt import (
     MtDebugSnapshot,
     OidRouting,
@@ -36,6 +37,14 @@ from .mt import (
     render_condition,
 )
 from .symbols import GmeScripts, TttoolSymbols
+
+#: The reverse-engineered symbol table for this build is the single source of truth
+#: for firmware addresses (``firmware_profile.ZC3201.symbols``); the watchpoint and
+#: handle constants below are *derived* from it rather than re-literalled, so a
+#: lift/rebase correction in one place can't drift out of sync (that is exactly how
+#: ``play_chomp_voice`` once ended up 0x8000 low). Addresses with no matching symbol,
+#: or whose symbol name is a known-stale label (see ``PC_VOICE_POLL``), stay literal.
+_SYM = _PROFILE.symbols
 
 if TYPE_CHECKING:
     from ..machine import Machine
@@ -102,13 +111,13 @@ PC_TIMER_TICK = 0x0800_6D38          # HAL software-timer tick (per 20 ms IRQ)
 #: media table stores, so a play resolves to a media index by that key (the same
 #: observable the ``firmware-re`` lab ``zc3201_emu.py`` validates against, and the
 #: twin of MT's ``PC_PLAY_MEDIA``).
-PC_VOICE_PLAY_SAMPLE = 0x0809_F068
+PC_VOICE_PLAY_SAMPLE = _SYM["voice_play_sample"]  # 0x0809F068
 
 #: ``p_filehandle_current_gme``: the file handle of the currently-mounted ``.gme``,
 #: written by ``gme_mount_check_product`` (``0x080297dc``) when a product-OID tap
 #: matches a discovered game. It changes from its book-idle value once a game is
 #: mounted, so a change is the hook-free "a game got mounted" signal (Leg 22).
-CURRENT_GME_HANDLE = 0x080D_20A0
+CURRENT_GME_HANDLE = _SYM["gme_file_handle_ptr"]  # 0x080D20A0
 
 #: OID sensor nandboot HAL (Leg 20). The two-wire bit-bang: clock GPIO7, data /
 #: attention GPIO16, capture-state struct ``0x08007BF8`` (``+1`` = ``bit_count``,
@@ -244,7 +253,7 @@ XOR_ACTIVE_ADDR = 0x0800_7BE8  # u8, 1 = GME media (vs system voice)
 
 #: akoid_buf (OID-routing struct): base = ``*(gb_app_context + 0x40)``. The low fields
 #: match MT; the play/jump fields sit at ZC-specific offsets (mid-struct layout differs).
-AKOID_PTR_ADDR = 0x0800_77DC        # = gb_app_context(0x0800779C) + 0x40
+AKOID_PTR_ADDR = _SYM["gb_app_context"] + 0x40  # 0x080077DC
 AKOID_LAST_OID = 0x04               # u32 (OID fits 16 bits)
 AKOID_LAST_CONTENT = 0x1A           # u16
 AKOID_OID_MIN = 0x1C                # u16 mounted GME's first content OID
@@ -256,10 +265,10 @@ AKOID_JUMP_PENDING = 0xD80          # u8
 AKOID_JUMP_TARGET = 0xD82           # u16
 
 #: Interpreter watchpoints (twins of MT's): the executed-action trace and "now playing".
-PC_GME_EXEC_COMMAND = 0x0804_C6E4   # r0..r3 = register, opcode, is-const, operand
-PC_PLAY_CHOMP_VOICE = 0x0809_F374   # system-voice play (Chomp_Voice.bin); reveng
-                                    # 0x08097374 lifted +PROG_BASE_FIX (0x8000) to
-                                    # its runtime PC, like PC_VOICE_PLAY_SAMPLE above
+PC_GME_EXEC_COMMAND = _SYM["gme_exec_command"]   # 0x0804C6E4; r0..r3 = reg, opcode,
+                                                 # is-const, operand
+PC_PLAY_CHOMP_VOICE = _SYM["play_chomp_voice"]   # 0x0809F374; system-voice play
+                                                 # (Chomp_Voice.bin)
 _OPCODE_PLAY = 0xFFE8               # GME "Play n" action opcode
 MAX_REGISTERS = 256                 # display clamp
 
