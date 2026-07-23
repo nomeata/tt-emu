@@ -28,10 +28,10 @@ from typing import TYPE_CHECKING, Callable
 from unicorn.arm_const import UC_ARM_REG_R0, UC_ARM_REG_R1, UC_ARM_REG_R2, UC_ARM_REG_R3
 
 from ..firmware_profile import ZC3201 as _PROFILE
-from .mt import (
-    MtDebugSnapshot,
-    OidRouting,
+from .model import (
     PRODUCT_OID_MAX,
+    DebugSnapshot,
+    OidRouting,
     Transition,
     render_action,
     render_condition,
@@ -410,6 +410,32 @@ class Zc3201Debugger:
                 return scripts
         return None
 
+    def ready_for_tap(self, *, oid_pending: bool, ipt: int) -> bool:
+        """The ZC3201 tap-readiness gate — the single source of truth shared by the TUI
+        worker and the scripting :class:`~tt_emu.emulator.Emulator` (the settle gap since
+        the last lift is the caller's concern). A tap is admitted once:
+
+        * the boot has reached the stable book-idle voice-player leaf
+          (``BOOK_IDLE_LEAF_PC``, seen in the append-only :attr:`leaves` — so the check
+          is implicitly monotonic, no latch needed);
+        * no OID frame is still armed/held (``oid_pending``); and
+        * the audio chain is idle (no DAC submit for ~2 ticks) — a content tap that lands
+          mid-playlist drops the remaining entries, since the shared GME interpreter
+          advances the playlist on audio completion.
+
+        Unlike MT there is no book-ready event gate: the ZC3201 event ring is a
+        continuously-cycling timer/event pump, so readiness keys on the book-idle leaf,
+        not a ring-quiet condition (``docs/zc3201-boot-feasibility.md`` Leg 26).
+        """
+        if not any(pc == BOOK_IDLE_LEAF_PC for _, pc in self.leaves):
+            return False
+        if oid_pending:
+            return False
+        audio = self.machine.audio
+        if audio is not None and self.machine.clock - audio.last_dac_submit_at < 2 * ipt:
+            return False
+        return True
+
     # --- transition log (leaf changes; the QF framework has no QHsm frame stack) ----------
     def poll_transition(self) -> Transition | None:
         """One statechart move since the last poll, or ``None``.
@@ -487,17 +513,17 @@ class Zc3201Debugger:
             playlist=playlist, source=source or "",
         )
 
-    # --- the full snapshot (the shared MtDebugSnapshot the TUI panels render) --------------
-    def snapshot(self) -> MtDebugSnapshot:
+    # --- the full snapshot (the shared DebugSnapshot the TUI panels render) --------------
+    def snapshot(self) -> DebugSnapshot:
         """One immutable debug view; all-RAM, never raises (empty on any torn read)."""
         try:
             return self._snapshot()
         except Exception:  # noqa: BLE001
-            return MtDebugSnapshot()
+            return DebugSnapshot()
 
-    def _snapshot(self) -> MtDebugSnapshot:
+    def _snapshot(self) -> DebugSnapshot:
         if not self.ready:
-            return MtDebugSnapshot(ready=False)
+            return DebugSnapshot(ready=False)
         chain = (self.leaf_pc,) if self.leaf_pc else ()
         chain_names = (state_name(self.leaf_pc),) if self.leaf_pc else ()
         registers = self.registers()
@@ -535,7 +561,7 @@ class Zc3201Debugger:
                 if symbols is not None:
                     deferred_label = symbols.oid_label(deferred) or ""
 
-        return MtDebugSnapshot(
+        return DebugSnapshot(
             ready=True,
             chain=chain,
             chain_names=chain_names,

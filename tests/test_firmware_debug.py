@@ -22,7 +22,7 @@ import pytest
 from _data import firmware_path, game_dir
 from _pilot import run_app, wait_for
 
-from tt_emu.firmware import detect, mt
+from tt_emu.firmware import detect, model, mt
 from tt_emu.firmware.symbols import (
     GmeScripts,
     derive_media_names,
@@ -219,7 +219,7 @@ class _FakeDebugSession:
         self.snapshot = EmuSnapshot(
             power="running",
             leaf=13,
-            debug=mt.MtDebugSnapshot(
+            debug=model.DebugSnapshot(
                 ready=True,
                 chain=(3, 12, 13),
                 chain_names=tuple(mt.state_name(s) for s in (3, 12, 13)),
@@ -241,7 +241,7 @@ class _FakeDebugSession:
                 oid_first=4716,
                 oid_last=4743,
                 last_oid=4716,
-                routing=mt.OidRouting(
+                routing=model.OidRouting(
                     oid=4716,
                     label="acht",
                     kind="content",

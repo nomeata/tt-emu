@@ -62,9 +62,11 @@ from .audio_capture import (
     AudioStats,
 )
 from .boot import BootedMachine, build_machine, build_zc3201_machine
+from .firmware import FirmwareSupport, support_for
 from .firmware import mt as fw_mt
 from .firmware import zc3201 as fw_zc3201
-from .firmware.mt import MtDebugger, Transition
+from .firmware.model import Transition
+from .firmware.mt import MtDebugger
 from .firmware.zc3201 import Zc3201Debugger
 from .firmware.symbols import GmeScripts, TttoolSymbols, derive_media_names, load_tttool_yaml
 from .firmware_fetch import ensure_firmware
@@ -98,18 +100,8 @@ __all__ = [
 #: 20 ms timer period is the pacing unit).
 _TICK_MS = 20
 
-#: ZC3201's emulation cadence under its real MMU (``docs/zc3201-boot-feasibility.md``
-#: Leg 26). The 1st-gen firmware demand-pages heavily, so a large share of executed
-#: instructions are the abort-handler/refiner overhead of servicing faults — work
-#: that does not exist on real silicon (hardware paging is ~free). To keep the
-#: instruction-counted timer firing in step with *real* firmware progress (as it
-#: does on hardware and in the flat model), one 20 ms tick is ~100k instructions,
-#: not the flat build's 20k. At 20k the timer fires far too often relative to
-#: fault-slowed progress and the timer-gated boot descent never reaches book mode
-#: (the firmware stalls in standby). Used for ZC3201 when the caller left the
-#: pacing at the MT default. (Distinct from the ``MmuBoot._fault_addr`` scaled-index
-#: bug — the *thrash* root cause — which 100k had merely masked; see Leg 26.)
-_ZC3201_INSTRUCTIONS_PER_TICK = 100_000
+#: The ZC3201 session cadence lives on its FirmwareSupport bundle
+#: (:data:`tt_emu.firmware._ZC3201_INSTRUCTIONS_PER_TICK`).
 
 #: Pen buttons (``gpio-buttons-led.md`` §2/§3): name -> (pin, active level).
 _BUTTONS: dict[str, tuple[int, int]] = {
@@ -420,6 +412,8 @@ class Emulator:
         self._booted: BootedMachine | None = None
         self.machine: Machine = None  # type: ignore[assignment]
         self._capture: AudioCapture | None = None
+        #: The recognized firmware's support bundle (resolved once in ``__enter__``).
+        self._support: FirmwareSupport | None = None
         self._debugger: MtDebugger | None = None
         #: ZC3201-only: the 1st-gen debugger + firmware flag + OID sensor + the
         #: current-gme handle observed at book idle (the mount baseline).
@@ -427,7 +421,6 @@ class Emulator:
         self._is_zc3201 = False
         self._oid_sensor: OidSensor | None = None  # MT: booted.oid; ZC3201: machine.oid
         self._zc_mount_baseline: int | None = None
-        self._zc_book_reached = False
         self._audio_events: list[_AudioEvent] = []
         self._transitions: list[Transition] = []
         self._book_tail_at: int | None = None
@@ -446,11 +439,13 @@ class Emulator:
             dac_pacing=self._dac_pacing,
             pacing=self._pacing,
         )
-        # Select the machine build + debugger by firmware. The 1st-gen ZC3201
-        # image gets its own substrate (:func:`build_zc3201_machine`, no MMU) and
-        # the :class:`Zc3201Debugger`; every other image is driven through the MT
-        # recipe (unchanged). Both expose the same scripted surface below.
-        if fw_zc3201.recognize(firmware.prog.data):
+        # Resolve the firmware once. The 1st-gen ZC3201 image gets its own boot
+        # substrate + the Zc3201Debugger and its media watches; every other image is
+        # driven through the MT recipe (the fallback for unrecognized images too). Both
+        # expose the same scripted surface below.
+        self._support = support_for(firmware)
+        self._is_zc3201 = self._support is not None and self._support.is_zc3201
+        if self._is_zc3201:
             self._enter_zc3201(firmware, config)
         else:
             self._enter_mt(firmware, config)
@@ -489,18 +484,18 @@ class Emulator:
         machine.on_code(fw_mt.PC_PLAY_VOICE, self._on_play_voice)
 
     def _enter_zc3201(self, firmware, config: MachineConfig) -> None:
-        # ZC3201's timer/OID-poll timing is calibrated at 20k insn/tick; if the
-        # caller left the MT session cadence in place, switch to the proven ZC3201
-        # one (its budgets/timeouts convert through self._ipt).
+        # ZC3201's fault-slowed boot descent needs a coarser tick; if the caller left
+        # the MT session cadence in place, switch to the proven ZC3201 one from the
+        # support bundle (its budgets/timeouts convert through self._ipt).
+        assert self._support is not None and self._support.default_instructions_per_tick
         if self._ipt == SESSION_INSTRUCTIONS_PER_TICK:
-            self._ipt = _ZC3201_INSTRUCTIONS_PER_TICK
+            self._ipt = self._support.default_instructions_per_tick
             config = MachineConfig(
                 instructions_per_tick=self._ipt,
                 dac_pacing=self._dac_pacing,
                 pacing=self._pacing,
             )
         booted = build_zc3201_machine(firmware, config, b_files=self._b_files or None)
-        self._is_zc3201 = True
         self._booted = booted
         self.machine = booted.machine
         # The 1st-gen DAC PCM path IS modelled: the ZC3201 recipe wires an AudioDma
@@ -689,42 +684,15 @@ class Emulator:
         if machine.clock - self._last_lift < SETTLE_INSTRUCTIONS:
             return False
         if self._is_zc3201:
-            return self._zc_ready_for_tap()
+            # The ZC3201 gate lives on its debugger (shared with the TUI worker).
+            assert self._zc_debugger is not None
+            pending = self._oid_sensor is not None and self._oid_sensor.pending
+            return self._zc_debugger.ready_for_tap(oid_pending=pending, ipt=self._ipt)
         if not book_ready_for_tap(machine, self._book_tail_at):
             return False
         if machine.read_u8(AUDIO_FLAGS_ADDR) & AUDIO_CHAIN_ACTIVE:
             return False  # a playback is still in progress -> not a clean boundary
         return machine.read_u16(EVENT_RING_HEAD_ADDR) == machine.read_u16(EVENT_RING_TAIL_ADDR)
-
-    def _zc_ready_for_tap(self) -> bool:
-        """The ZC3201 twin of the readiness gate (settle gap already checked).
-
-        The boot has descended to the stable book-idle leaf (``voice_player`` —
-        entered ~22 M insn in and held), no OID frame is still armed/held, and the
-        audio chain is idle. The ZC3201 event ring is a continuously-cycling
-        timer/event pump (rarely momentarily drained), so — unlike MT — readiness
-        keys on the book leaf, not a ring-quiet condition. The audio-idle check
-        (no DAC submit for a settle gap) is what keeps a content tap from landing
-        mid-playlist: a product tap returns as soon as its welcome *starts*, but
-        that welcome is often a multi-media playlist, and interrupting it before it
-        finishes drops the remaining entries (the shared GME interpreter advances
-        the playlist on audio completion).
-        """
-        assert self._zc_debugger is not None
-        if not self._zc_book_reached:
-            if any(pc == fw_zc3201.BOOK_IDLE_LEAF_PC for _, pc in self._zc_debugger.leaves):
-                self._zc_book_reached = True
-            else:
-                return False
-        if self._oid_sensor is not None and self._oid_sensor.pending:
-            return False
-        # Audio idle: no DAC submit for ~2 ticks (a playback in progress submits
-        # buffers continuously; a finished playlist stops). machine.audio is the
-        # AudioDma wired by build_zc3201_machine.
-        audio = getattr(self.machine, "audio", None)
-        if audio is not None and self.machine.clock - audio.last_dac_submit_at < 2 * self._ipt:
-            return False
-        return True
 
     def _mount_token(self) -> int:
         """The RAM word whose change signals "a game got mounted" for this
