@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 import time
 from pathlib import Path
@@ -27,9 +28,16 @@ from tt_emu.firmware_fetch import ensure_firmware  # noqa: E402
 from tt_emu.tui import EmulatorSession, TtEmuApp  # noqa: E402
 
 _ROOT = Path(__file__).resolve().parent.parent
-_DEFAULT_GAME = Path("/home/jojo/tiptoi/tiptoi-taschenrechner/taschenrechner.gme")
-_DEFAULT_YAML = Path("/home/jojo/tiptoi/tiptoi-taschenrechner/taschenrechner.yaml")
 _DEFAULT_OUT = _ROOT / "docs" / "tui-screenshot.svg"
+
+
+def _default_game() -> tuple[Path | None, Path | None]:
+    """The game's ``.gme``/``.yaml`` from ``$TT_EMU_GAME_DIR`` (a dir holding both), or
+    ``(None, None)`` — pass ``--gme``/``--yaml`` instead. No machine-specific default."""
+    d = os.environ.get("TT_EMU_GAME_DIR")
+    if not d:
+        return None, None
+    return next(Path(d).glob("*.gme"), None), next(Path(d).glob("*.yaml"), None)
 
 
 async def _drive(firmware: str, game: Path, yaml: Path | None, out: Path, timeout: float) -> None:
@@ -69,12 +77,16 @@ async def _drive(firmware: str, game: Path, yaml: Path | None, out: Path, timeou
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Generate the README TUI screenshot (SVG).")
+    default_gme, default_yaml = _default_game()
     parser.add_argument("--firmware", default=None, help="path to the .upd (default: auto-download)")
-    parser.add_argument("--gme", type=Path, default=_DEFAULT_GAME)
-    parser.add_argument("--yaml", type=Path, default=_DEFAULT_YAML)
+    parser.add_argument("--gme", type=Path, default=default_gme,
+                        help="game .gme (default: from $TT_EMU_GAME_DIR)")
+    parser.add_argument("--yaml", type=Path, default=default_yaml)
     parser.add_argument("--out", type=Path, default=_DEFAULT_OUT)
     parser.add_argument("--timeout", type=float, default=120.0)
     args = parser.parse_args(argv)
+    if args.gme is None:
+        parser.error("no game: pass --gme PATH or set $TT_EMU_GAME_DIR")
 
     firmware = str(ensure_firmware(args.firmware))
     yaml = args.yaml if args.yaml and args.yaml.exists() else None

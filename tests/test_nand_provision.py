@@ -10,20 +10,15 @@ seam MT and ZC3201 share.
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
-from _data import firmware_path
+from _data import firmware_path, ref_nand_image
 
 from tt_emu.firmware_profile import MT
 from tt_emu.loader import load_upd
 from tt_emu.nand_provision import WritableNand, run_producer
 
-# Legacy reference image from the (retired) RE workspace, now archived. Skipif-guarded
-# on existence, so a fresh checkout without it just skips this comparison test.
-_REF_IMG = Path(
-    "/home/jojo/tiptoi/firmware-re-ARCHIVE/fw/2N-update3202MT/data/producer_nand.img"
-)
+#: Reference provisioned NAND image (a local fixture; resolved via _data, skip if absent).
+_REF_IMG = ref_nand_image()
 
 
 def test_writable_nand_cache_roundtrip() -> None:
@@ -57,13 +52,14 @@ def test_mt_producer_formats_metadata() -> None:
 
 
 @pytest.mark.skipif(
-    firmware_path() is None or not _REF_IMG.exists(),
-    reason="MT firmware / firmware-re reference producer_nand.img not available",
+    firmware_path() is None or _REF_IMG is None,
+    reason="MT firmware / reference producer_nand.img not available",
 )
 def test_mt_producer_matches_reference_image() -> None:
-    """The port reproduces firmware-re's reference producer image byte-for-byte."""
+    """The port reproduces the reference producer image byte-for-byte."""
     upd = firmware_path()
     assert upd is not None
+    assert _REF_IMG is not None
     fw = load_upd(str(upd))
     assert MT.producer is not None
     nand = run_producer(fw.producer.data, upd.read_bytes(), MT.producer, b_mb=64)

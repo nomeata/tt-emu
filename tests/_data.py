@@ -1,15 +1,23 @@
 """Portable test-artifact resolution.
 
-The boot / play integration tests need two artifacts that live outside the repo:
+The boot / play integration tests need artifacts that live outside the repo:
 
 * the firmware ``.upd`` — auto-downloadable from the Ravensburger CDN
   (SHA-verified, cached) via :func:`tt_emu.firmware_fetch.ensure_firmware`;
-* a real tiptoi game directory (``.gme`` + tttool ``.yaml``) — *not* shipped.
+* a real tiptoi game directory (``.gme`` + tttool ``.yaml``) — *not* shipped;
+* a couple of hand-built local fixtures (the ZC3201 ``example.gme``, a reference
+  provisioned NAND image).
 
-These helpers resolve both from the environment first, then from the legacy
-local paths on the original author's machine, so the same tests run on CI (with
-``$TT_EMU_DOWNLOAD_FIRMWARE`` set) and on a developer box, and skip cleanly
-elsewhere. Tests gate on ``firmware_path() is None`` / ``game_dir() is None``.
+Each helper resolves an artifact in this order, and tests skip cleanly when it
+returns ``None`` (they gate on ``firmware_path() is None`` / ``game_dir() is None``):
+
+1. the artifact's ``$TT_EMU_*`` environment variable, if set;
+2. a path from an **optional, untracked** ``tests/_data_local.py`` (gitignored) —
+   so no machine-specific path ever lives in this public repo. Copy
+   ``tests/_data_local.example.py`` to ``tests/_data_local.py`` and edit it to make
+   the local-artifact tests run on your box without exporting env vars;
+3. for the firmware, a fresh SHA-verified download — only when
+   ``$TT_EMU_DOWNLOAD_FIRMWARE`` is set (so a plain offline ``pytest`` never fetches).
 """
 
 from __future__ import annotations
@@ -17,29 +25,26 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-#: Legacy local paths on the original author's machine.
-_LEGACY_FIRMWARE = Path("/home/jojo/tiptoi/update3202MT.upd")
-_LEGACY_GAME_DIR = Path("/home/jojo/tiptoi/tiptoi-taschenrechner")
-#: Legacy local path to the 1st-gen ZC3201 firmware container.
-_LEGACY_FIRMWARE_ZC3201 = Path("/home/jojo/tiptoi/update.upd")
+try:  # optional, gitignored dev-box overrides (see module docstring)
+    import _data_local as _local  # type: ignore[import-not-found]
+except ImportError:
+    _local = None  # type: ignore[assignment]
+
+
+def _local_path(name: str) -> Path | None:
+    """A path from the untracked ``tests/_data_local.py`` (or ``None`` if absent)."""
+    value = getattr(_local, name, None) if _local is not None else None
+    return Path(value) if value else None
 
 
 def firmware_path() -> Path | None:
-    """Resolve the firmware ``.upd``, or ``None`` if unavailable.
-
-    Resolution order:
-
-    1. ``$TT_EMU_FIRMWARE`` if set (used verbatim);
-    2. the legacy local path if it exists;
-    3. a fresh download via :func:`ensure_firmware` — **only** when
-       ``$TT_EMU_DOWNLOAD_FIRMWARE`` is set (so a plain offline ``pytest``
-       never fetches ~11 MB); returns ``None`` if the download fails.
-    """
+    """Resolve the firmware ``.upd``, or ``None`` if unavailable."""
     env = os.environ.get("TT_EMU_FIRMWARE")
     if env:
         return Path(env)
-    if _LEGACY_FIRMWARE.exists():
-        return _LEGACY_FIRMWARE
+    local = _local_path("FIRMWARE")
+    if local is not None and local.exists():
+        return local
     if os.environ.get("TT_EMU_DOWNLOAD_FIRMWARE"):
         from tt_emu.firmware_fetch import ensure_firmware
 
@@ -51,17 +56,13 @@ def firmware_path() -> Path | None:
 
 
 def firmware_path_zc3201() -> Path | None:
-    """Resolve the 1st-gen ZC3201 firmware ``.upd``, or ``None`` if unavailable.
-
-    ``$TT_EMU_FIRMWARE_ZC3201`` if set (verbatim), else the legacy local path if
-    it exists, else a fresh SHA-verified download via :func:`ensure_firmware`
-    (ZC3201 profile) — **only** when ``$TT_EMU_DOWNLOAD_FIRMWARE`` is set.
-    """
+    """Resolve the 1st-gen ZC3201 firmware ``.upd``, or ``None`` if unavailable."""
     env = os.environ.get("TT_EMU_FIRMWARE_ZC3201")
     if env:
         return Path(env)
-    if _LEGACY_FIRMWARE_ZC3201.exists():
-        return _LEGACY_FIRMWARE_ZC3201
+    local = _local_path("FIRMWARE_ZC3201")
+    if local is not None and local.exists():
+        return local
     if os.environ.get("TT_EMU_DOWNLOAD_FIRMWARE"):
         from tt_emu.firmware_fetch import ensure_firmware
         from tt_emu.firmware_profile import ZC3201
@@ -73,37 +74,52 @@ def firmware_path_zc3201() -> Path | None:
     return None
 
 
-#: Legacy local path to the 1st-gen ZC3201 test game (product 42, OIDs 8065-8067),
-#: in the retired-and-archived RE workspace. Overridable via $TT_EMU_GME_ZC3201.
-_LEGACY_GME_ZC3201 = Path(
-    "/home/jojo/tiptoi/firmware-re-ARCHIVE/tools/ttemu/content/B/example.gme"
-)
-
-
 def gme_zc3201() -> Path | None:
     """Resolve the ZC3201 test ``.gme`` (``example.gme``), or ``None``.
 
-    ``$TT_EMU_GME_ZC3201`` if set and it exists, else the legacy local path if it
-    exists, else ``None``. This is a small hand-built game (product 42, content
-    OIDs 8065-8067) used for the 1st-gen discover → mount → OID-tap → play test.
+    A small hand-built game (product 42, content OIDs 8065-8067) used for the
+    1st-gen discover → mount → OID-tap → play test; not downloadable.
     """
     env = os.environ.get("TT_EMU_GME_ZC3201")
     if env and Path(env).exists():
         return Path(env)
-    if _LEGACY_GME_ZC3201.exists():
-        return _LEGACY_GME_ZC3201
+    local = _local_path("GME_ZC3201")
+    if local is not None and local.exists():
+        return local
     return None
 
 
 def game_dir() -> Path | None:
-    """Resolve a tiptoi game directory (``.gme`` + ``.yaml``), or ``None``.
-
-    ``$TT_EMU_GAME_DIR`` if set and it exists, else the legacy local path if it
-    exists, else ``None``.
-    """
+    """Resolve a tiptoi game directory (``.gme`` + ``.yaml``), or ``None``."""
     env = os.environ.get("TT_EMU_GAME_DIR")
     if env and Path(env).exists():
         return Path(env)
-    if _LEGACY_GAME_DIR.exists():
-        return _LEGACY_GAME_DIR
+    local = _local_path("GAME_DIR")
+    if local is not None and local.exists():
+        return local
+    return None
+
+
+def gme2() -> Path | None:
+    """Resolve a second, more complex ``.gme`` for cross-checks, or ``None`` (not shipped)."""
+    env = os.environ.get("TT_EMU_GME2")
+    if env and Path(env).exists():
+        return Path(env)
+    local = _local_path("GME2")
+    if local is not None and local.exists():
+        return local
+    return None
+
+
+def ref_nand_image() -> Path | None:
+    """Resolve the reference provisioned NAND image (``producer_nand.img``), or ``None``.
+
+    A local fixture the NAND-provisioning test compares its output against; not shipped.
+    """
+    env = os.environ.get("TT_EMU_REF_NAND_IMG")
+    if env and Path(env).exists():
+        return Path(env)
+    local = _local_path("REF_NAND_IMG")
+    if local is not None and local.exists():
+        return local
     return None

@@ -12,13 +12,12 @@ This is a slow test: a full boot → mount → tap → play chain on the emulate
 
 from __future__ import annotations
 
-import os
 import struct
 import wave
 from pathlib import Path
 
 import pytest
-from _data import firmware_path, firmware_path_zc3201, game_dir, gme_zc3201
+from _data import firmware_path, firmware_path_zc3201, game_dir, gme2, gme_zc3201
 
 from tt_emu import Clip, Emulator, ExpectationError
 from tt_emu.audio_capture import FRAME_BYTES, SAMPLE_BYTES
@@ -261,13 +260,9 @@ def _raw_tap(pen, code: int, *, latch: int = 25_000_000, play: int = 160_000_000
 
 
 def _second_gme() -> Path | None:
-    """A second, more complex GME to cross-check the bug, or ``None``. Resolved from
-    ``$TT_EMU_GME2`` or a local ``WWW Bauernhof.gme`` (neither shipped)."""
-    env = os.environ.get("TT_EMU_GME2")
-    if env and Path(env).exists():
-        return Path(env)
-    local = Path("/home/jojo/tiptoi/gmes/WWW Bauernhof.gme")
-    return local if local.exists() else None
+    """A second, more complex GME to cross-check the bug, or ``None`` (not shipped;
+    resolved via :func:`_data.gme2` from ``$TT_EMU_GME2`` / ``tests/_data_local.py``)."""
+    return gme2()
 
 
 @mt_only

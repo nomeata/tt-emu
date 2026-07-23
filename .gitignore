@@ -29,6 +29,14 @@ result-*
 *.bin.tmp
 tests/firmware/build/
 
+# Local, machine-specific test-artifact paths (see tests/_data_local.example.py)
+tests/_data_local.py
+
+# ZC3201 bring-up dev probes (local scratch — reference local firmware dumps, not
+# runnable from a clean checkout; the bring-up itself lives in tt_emu/ + docs/).
+scripts/zc3201_*.py
+scripts/zc_*.py
+
 # Emulator scratch output
 /scratch/
 *.wav
