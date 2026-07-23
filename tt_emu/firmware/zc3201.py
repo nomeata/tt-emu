@@ -257,7 +257,9 @@ AKOID_JUMP_TARGET = 0xD82           # u16
 
 #: Interpreter watchpoints (twins of MT's): the executed-action trace and "now playing".
 PC_GME_EXEC_COMMAND = 0x0804_C6E4   # r0..r3 = register, opcode, is-const, operand
-PC_PLAY_CHOMP_VOICE = 0x0809_7374   # system-voice play (Chomp_Voice.bin)
+PC_PLAY_CHOMP_VOICE = 0x0809_F374   # system-voice play (Chomp_Voice.bin); reveng
+                                    # 0x08097374 lifted +PROG_BASE_FIX (0x8000) to
+                                    # its runtime PC, like PC_VOICE_PLAY_SAMPLE above
 _OPCODE_PLAY = 0xFFE8               # GME "Play n" action opcode
 MAX_REGISTERS = 256                 # display clamp
 
